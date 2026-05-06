@@ -1,0 +1,42 @@
+{
+  "ViTPose": {
+    "base": [
+      {
+        "timestamp": "2026-05-05T17:03:34",
+        "config": "/local/home/nkoefarago/mmpose/configs/body_2d_keypoint/topdown_heatmap/coco/td-hm_ViTPose-base_8xb64-210e_coco-256x192.py",
+        "checkpoint": "/local/home/nkoefarago/mmpose/https:/download.openmmlab.com/mmpose/v1/body_2d_keypoint/topdown_heatmap/coco/td-hm_ViTPose-base_8xb64-210e_coco-256x192-216eae50_20230314.pth",
+        "metrics": {
+          "coco/AP": 0.7794524420020772,
+          "coco/AP .5": 0.9357719062396208,
+          "coco/AP .75": 0.8581687859423044,
+          "coco/AP (M)": 0.7562573849411054,
+          "coco/AP (L)": 0.8242940350950723,
+          "coco/AR": 0.8081076826196474,
+          "coco/AR .5": 0.9494647355163728,
+          "coco/AR .75": 0.8721662468513854,
+          "coco/AR (M)": 0.7765637803878722,
+          "coco/AR (L)": 0.8566703827573393
+        }
+      }
+    ],
+    "huge": [
+      {
+        "timestamp": "2026-05-05T17:16:09",
+        "config": "/local/home/nkoefarago/mmpose/configs/body_2d_keypoint/topdown_heatmap/coco/td-hm_ViTPose-huge_8xb64-210e_coco-256x192.py",
+        "checkpoint": "/local/home/nkoefarago/mmpose/https:/download.openmmlab.com/mmpose/v1/body_2d_keypoint/topdown_heatmap/coco/td-hm_ViTPose-huge_8xb64-210e_coco-256x192-e32adcd4_20230314.pth",
+        "metrics": {
+          "coco/AP": 0.8140005598871907,
+          "coco/AP .5": 0.9463220080340448,
+          "coco/AP .75": 0.8806625508238431,
+          "coco/AP (M)": 0.7852647214194162,
+          "coco/AP (L)": 0.8593431333307828,
+          "coco/AR": 0.8398614609571788,
+          "coco/AR .5": 0.9593828715365239,
+          "coco/AR .75": 0.8982997481108312,
+          "coco/AR (M)": 0.806391696257853,
+          "coco/AR (L)": 0.8912300260126349
+        }
+      }
+    ]
+  }
+}
