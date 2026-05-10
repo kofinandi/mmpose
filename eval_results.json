@@ -38,5 +38,64 @@
         }
       }
     ]
+  },
+  "PCT": {
+    "base": [
+      {
+        "timestamp": "2026-05-10T16:03:06",
+        "config": "/local/home/nkoefarago/mmpose/configs/body_2d_keypoint/topdown_regression/coco/td-reg_pct-base_coco-256x256.py",
+        "checkpoint": "/local/home/nkoefarago/mmpose/external/PCT/weights/pct/swin_base.pth",
+        "metrics": {
+          "coco/AP": 0.7867667996419095,
+          "coco/AP .5": 0.9363911342468786,
+          "coco/AP .75": 0.8614392902776236,
+          "coco/AP (M)": 0.7634550648867572,
+          "coco/AP (L)": 0.829944325496638,
+          "coco/AR": 0.8113979848866497,
+          "coco/AR .5": 0.9448992443324937,
+          "coco/AR .75": 0.8735831234256927,
+          "coco/AR (M)": 0.7802786124009833,
+          "coco/AR (L)": 0.8600520252694167
+        }
+      }
+    ],
+    "large": [
+      {
+        "timestamp": "2026-05-10T16:09:59",
+        "config": "/local/home/nkoefarago/mmpose/configs/body_2d_keypoint/topdown_regression/coco/td-reg_pct-large_coco-256x256.py",
+        "checkpoint": "/local/home/nkoefarago/mmpose/external/PCT/weights/pct/swin_large.pth",
+        "metrics": {
+          "coco/AP": 0.7997400365184705,
+          "coco/AP .5": 0.9369025935047361,
+          "coco/AP .75": 0.871930504888119,
+          "coco/AP (M)": 0.7748055592626263,
+          "coco/AP (L)": 0.8437622402662567,
+          "coco/AR": 0.8223079345088161,
+          "coco/AR .5": 0.9485201511335013,
+          "coco/AR .75": 0.8844458438287154,
+          "coco/AR (M)": 0.7907948647910406,
+          "coco/AR (L)": 0.872166480862133
+        }
+      }
+    ],
+    "huge": [
+      {
+        "timestamp": "2026-05-10T16:19:49",
+        "config": "/local/home/nkoefarago/mmpose/configs/body_2d_keypoint/topdown_regression/coco/td-reg_pct-huge_coco-256x256.py",
+        "checkpoint": "/local/home/nkoefarago/mmpose/external/PCT/weights/pct/swin_huge.pth",
+        "metrics": {
+          "coco/AP": 0.8080551470150765,
+          "coco/AP .5": 0.9467215558635974,
+          "coco/AP .75": 0.8818305611863952,
+          "coco/AP (M)": 0.7825233308795142,
+          "coco/AP (L)": 0.851716124826701,
+          "coco/AR": 0.8316120906801008,
+          "coco/AR .5": 0.9526133501259446,
+          "coco/AR .75": 0.8924748110831234,
+          "coco/AR (M)": 0.8004370390603661,
+          "coco/AR (L)": 0.8808992939427723
+        }
+      }
+    ]
   }
 }
