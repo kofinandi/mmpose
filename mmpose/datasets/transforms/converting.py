@@ -23,12 +23,21 @@ class KeypointConverter(BaseTransform):
 
     Args:
         num_keypoints (int): The number of keypoints in target dataset.
+            Required when ``mapping`` is provided explicitly; inferred
+            automatically when ``src`` and ``dst`` are used instead.
         mapping (list): A list containing mapping indexes. Each element has
-            format (source_index, target_index)
+            format (source_index, target_index).  Mutually exclusive with
+            ``src``/``dst``.
+        src (str): Source dataset convention name (key in
+            :data:`mmpose.datasets.transforms.keypoint_registry.KEYPOINTS`).
+            When provided together with ``dst``, ``num_keypoints`` and
+            ``mapping`` are derived automatically by matching keypoint names.
+        dst (str): Destination dataset convention name.  Must be provided
+            together with ``src``.
 
     Example:
         >>> import numpy as np
-        >>> # case 1: 1-to-1 mapping
+        >>> # case 1: 1-to-1 mapping (explicit)
         >>> # (0, 0) means target[0] = source[0]
         >>> self = KeypointConverter(
         >>>     num_keypoints=3,
@@ -44,7 +53,7 @@ class KeypointConverter(BaseTransform):
         >>> assert np.equal(results['keypoints_visible'],
         >>>                 np.arange(34).reshape(2, 3, 2) % 2).all()
         >>>
-        >>> # case 2: 2-to-1 mapping
+        >>> # case 2: 2-to-1 mapping (explicit)
         >>> # ((1, 2), 0) means target[0] = (source[1] + source[2]) / 2
         >>> self = KeypointConverter(
         >>>     num_keypoints=3,
@@ -55,11 +64,37 @@ class KeypointConverter(BaseTransform):
         >>>     keypoints=np.arange(34).reshape(2, 3, 2),
         >>>     keypoints_visible=np.arange(34).reshape(2, 3, 2) % 2)
         >>> results = self(results)
+        >>>
+        >>> # case 3: auto-mapping from dataset convention names
+        >>> self = KeypointConverter(src='mpii', dst='coco')
     """
 
-    def __init__(self, num_keypoints: int,
+    def __init__(self,
+                 num_keypoints: int = None,
                  mapping: Union[List[Tuple[int, int]], List[Tuple[Tuple,
-                                                                  int]]]):
+                                                                  int]]] = None,
+                 src: str = None,
+                 dst: str = None):
+        if src is not None and dst is not None:
+            from .keypoint_registry import get_keypoints, get_mapping as _get_mapping
+            if num_keypoints is not None or mapping is not None:
+                raise ValueError(
+                    'KeypointConverter: provide either (src, dst) for '
+                    'automatic mapping or (num_keypoints, mapping) for '
+                    'explicit mapping, not both.')
+            dst_names = get_keypoints(dst) if isinstance(dst, str) else dst
+            num_keypoints = len(dst_names)
+            mapping = _get_mapping(src, dst)
+        elif src is not None or dst is not None:
+            raise ValueError(
+                'KeypointConverter: src and dst must be provided together.')
+        elif num_keypoints is None or mapping is None:
+            raise ValueError(
+                'KeypointConverter: either (src, dst) or '
+                '(num_keypoints, mapping) must be provided.')
+
+        self.src = src
+        self.dst = dst
         self.num_keypoints = num_keypoints
         self.mapping = mapping
         if len(mapping):
@@ -156,8 +191,12 @@ class KeypointConverter(BaseTransform):
             str: Formatted string.
         """
         repr_str = self.__class__.__name__
-        repr_str += f'(num_keypoints={self.num_keypoints}, '\
-                    f'mapping={self.mapping})'
+        if self.src is not None and self.dst is not None:
+            repr_str += f'(src={self.src!r}, dst={self.dst!r}, '\
+                        f'num_keypoints={self.num_keypoints})'
+        else:
+            repr_str += f'(num_keypoints={self.num_keypoints}, '\
+                        f'mapping={self.mapping})'
         return repr_str
 
 
