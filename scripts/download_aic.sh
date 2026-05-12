@@ -26,7 +26,8 @@ echo "Note: requires 'openxlab login' to be completed beforehand."
 
 OPENXLAB_DATASET="OpenDataLab/AI_Challenger"
 OPENXLAB_RAW_FILE="raw/AI_Challenger.tar.gz"
-ARCHIVE="$BASE_DIR/AI_Challenger.tar.gz"
+# openxlab saves to <target>/<repo-slug>/<source-path>
+ARCHIVE="$BASE_DIR/OpenDataLab___AI_Challenger/raw/AI_Challenger.tar.gz"
 
 openxlab dataset download \
     --dataset-repo "$OPENXLAB_DATASET" \
@@ -37,6 +38,7 @@ echo "------------------------------------------------"
 echo "Extracting Images (~34 GB)..."
 tar -xzf "$ARCHIVE" -C "$BASE_DIR"
 rm "$ARCHIVE"
+rmdir -p "$BASE_DIR/OpenDataLab___AI_Challenger/raw" 2>/dev/null || true
 
 echo "------------------------------------------------"
 echo "Done! AIC dataset is ready in $BASE_DIR"
