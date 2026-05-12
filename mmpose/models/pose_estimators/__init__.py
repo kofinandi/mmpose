@@ -2,9 +2,10 @@
 from .bottomup import BottomupPoseEstimator
 from .pct_wrapper import PCTPoseEstimator
 from .pose_lifter import PoseLifter
+from .sapiens2_wrapper import Sapiens2PoseEstimator
 from .topdown import TopdownPoseEstimator
 
 __all__ = [
     'TopdownPoseEstimator', 'BottomupPoseEstimator', 'PoseLifter',
-    'PCTPoseEstimator'
+    'PCTPoseEstimator', 'Sapiens2PoseEstimator'
 ]

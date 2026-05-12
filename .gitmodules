@@ -1,3 +1,6 @@
 [submodule "external/PCT"]
 	path = external/PCT
 	url = https://github.com/Gengzigang/PCT.git
+[submodule "external/sapiens2"]
+	path = external/sapiens2
+	url = https://github.com/facebookresearch/sapiens2.git
