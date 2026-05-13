@@ -149,10 +149,14 @@ def process_split(data_root, split, out_dir):
     annotations = []
     img_id_counter = 0
     ann_id_counter = 0
+    track_id_counter = 0
 
     # Map (seq_name, frame_idx) -> image_id to deduplicate image entries when
     # multiple actors share the same frame.
     img_key_to_id = {}
+    # Map (seq_name, actor_idx) -> track_id; each actor in a sequence is a
+    # single persistent track across all frames.
+    track_key_to_id = {}
 
     for pkl_name in pkl_files:
         pkl_path = osp.join(seq_dir, pkl_name)
@@ -170,6 +174,13 @@ def process_split(data_root, split, out_dir):
 
         for actor_idx in range(n_actors):
             actor_kpts = poses2d_list[actor_idx]  # (n_frames, 3, 18)
+
+            # Assign a globally unique track ID for this (sequence, actor).
+            track_key = (seq_name, actor_idx)
+            if track_key not in track_key_to_id:
+                track_id_counter += 1
+                track_key_to_id[track_key] = track_id_counter
+            track_id = track_key_to_id[track_key]
 
             for frame_idx in range(n_frames):
 
@@ -228,6 +239,7 @@ def process_split(data_root, split, out_dir):
                     'image_id': image_id,
                     'category_id': 1,
                     'iscrowd': 0,
+                    'track_id': track_id,
                     'bbox': [round(v, 2) for v in bbox],
                     'area': round(bbox[2] * bbox[3], 2),
                     'num_keypoints': num_visible,
@@ -257,8 +269,10 @@ def process_split(data_root, split, out_dir):
             import json
             json.dump(coco_json, f)
 
+    n_tracks = len(track_key_to_id)
     print(f'[{split}] {len(images):6d} images, '
-          f'{len(annotations):7d} annotations -> {out_path}')
+          f'{len(annotations):7d} annotations, '
+          f'{n_tracks:4d} tracks -> {out_path}')
 
 
 def main():
