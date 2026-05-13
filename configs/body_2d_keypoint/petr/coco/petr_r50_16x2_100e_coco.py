@@ -1,0 +1,189 @@
+_base_ = '../../../_base_/default_runtime.py'
+
+# Override train_cfg from default_runtime to allow test-only execution.
+train_cfg = None
+
+# PETR R-50 evaluation on COCO keypoints.
+# Model: end-to-end multi-person pose estimation (CVPR 2022).
+# Original paper: https://arxiv.org/abs/2201.02315
+# Original repo: https://github.com/hikvision-research/opera
+#
+# This config is for evaluation only (no training).
+# Expected performance: ~68.8 AP on COCO val2017.
+
+# model
+model = dict(
+    type='PETRPoseEstimator',
+    petr_root='external/PETR',
+    petr_model_cfg=dict(
+        type='opera.PETR',
+        backbone=dict(
+            type='mmdet.ResNet',
+            depth=50,
+            num_stages=4,
+            out_indices=(1, 2, 3),
+            frozen_stages=1,
+            norm_cfg=dict(type='BN', requires_grad=False),
+            norm_eval=True,
+            style='pytorch'),
+        neck=dict(
+            type='mmdet.ChannelMapper',
+            in_channels=[512, 1024, 2048],
+            kernel_size=1,
+            out_channels=256,
+            act_cfg=None,
+            norm_cfg=dict(type='GN', num_groups=32),
+            num_outs=4),
+        bbox_head=dict(
+            type='opera.PETRHead',
+            num_query=300,
+            num_classes=1,
+            in_channels=2048,
+            num_keypoints=17,
+            sync_cls_avg_factor=True,
+            with_kpt_refine=True,
+            as_two_stage=True,
+            transformer=dict(
+                type='opera.PETRTransformer',
+                encoder=dict(
+                    type='mmcv.DetrTransformerEncoder',
+                    num_layers=6,
+                    transformerlayers=dict(
+                        type='mmcv.BaseTransformerLayer',
+                        attn_cfgs=dict(
+                            type='mmcv.MultiScaleDeformableAttention',
+                            embed_dims=256),
+                        feedforward_channels=1024,
+                        ffn_dropout=0.1,
+                        operation_order=('self_attn', 'norm', 'ffn',
+                                         'norm'))),
+                decoder=dict(
+                    type='opera.PetrTransformerDecoder',
+                    num_layers=3,
+                    return_intermediate=True,
+                    transformerlayers=dict(
+                        type='mmcv.DetrTransformerDecoderLayer',
+                        attn_cfgs=[
+                            dict(
+                                type='mmcv.MultiheadAttention',
+                                embed_dims=256,
+                                num_heads=8,
+                                dropout=0.1),
+                            dict(
+                                type='opera.MultiScaleDeformablePoseAttention',
+                                embed_dims=256)
+                        ],
+                        feedforward_channels=1024,
+                        ffn_dropout=0.1,
+                        operation_order=('self_attn', 'norm', 'cross_attn',
+                                         'norm', 'ffn', 'norm'))),
+                hm_encoder=dict(
+                    type='mmcv.DetrTransformerEncoder',
+                    num_layers=1,
+                    transformerlayers=dict(
+                        type='mmcv.BaseTransformerLayer',
+                        attn_cfgs=dict(
+                            type='mmcv.MultiScaleDeformableAttention',
+                            embed_dims=256,
+                            num_levels=1),
+                        feedforward_channels=1024,
+                        ffn_dropout=0.1,
+                        operation_order=('self_attn', 'norm', 'ffn',
+                                         'norm'))),
+                refine_decoder=dict(
+                    type='mmcv.DeformableDetrTransformerDecoder',
+                    num_layers=2,
+                    return_intermediate=True,
+                    transformerlayers=dict(
+                        type='mmcv.DetrTransformerDecoderLayer',
+                        attn_cfgs=[
+                            dict(
+                                type='mmcv.MultiheadAttention',
+                                embed_dims=256,
+                                num_heads=8,
+                                dropout=0.1),
+                            dict(
+                                type='mmcv.MultiScaleDeformableAttention',
+                                embed_dims=256,
+                                num_levels=4,
+                                im2col_step=128)
+                        ],
+                        feedforward_channels=1024,
+                        ffn_dropout=0.1,
+                        operation_order=('self_attn', 'norm', 'cross_attn',
+                                         'norm', 'ffn', 'norm')))),
+            positional_encoding=dict(
+                type='mmcv.SinePositionalEncoding',
+                num_feats=128,
+                normalize=True,
+                offset=-0.5),
+            loss_cls=dict(
+                type='mmdet.FocalLoss',
+                use_sigmoid=True,
+                gamma=2.0,
+                alpha=0.25,
+                loss_weight=2.0),
+            loss_kpt=dict(type='mmdet.L1Loss', loss_weight=70.0),
+            loss_kpt_rpn=dict(type='mmdet.L1Loss', loss_weight=70.0),
+            loss_oks=dict(type='opera.OKSLoss', loss_weight=2.0),
+            loss_hm=dict(type='opera.CenterFocalLoss', loss_weight=4.0),
+            loss_kpt_refine=dict(type='mmdet.L1Loss', loss_weight=80.0),
+            loss_oks_refine=dict(type='opera.OKSLoss', loss_weight=3.0)),
+        train_cfg=dict(
+            assigner=dict(
+                type='opera.PoseHungarianAssigner',
+                cls_cost=dict(type='mmdet.FocalLossCost', weight=2.0),
+                kpt_cost=dict(type='opera.KptL1Cost', weight=70.0),
+                oks_cost=dict(type='opera.OksCost', weight=7.0)),
+            sampler=dict(type='mmdet.PseudoSampler')),
+        test_cfg=dict(max_per_img=100)),
+    data_preprocessor=dict(
+        type='PoseDataPreprocessor',
+        mean=[123.675, 116.28, 103.53],
+        std=[58.395, 57.12, 57.375],
+        bgr_to_rgb=True,
+        pad_size_divisor=1),
+)
+
+# data pipeline
+data_mode = 'bottomup'
+data_root = 'data/'
+
+val_pipeline = [
+    dict(type='LoadImage'),
+    dict(
+        type='BottomupRandomChoiceResize',
+        scales=[(800, 1333)],
+        keep_ratio=True),
+    dict(
+        type='PackPoseInputs',
+        meta_keys=('id', 'img_id', 'img_path', 'ori_shape', 'img_shape',
+                   'scale_factor', 'flip', 'flip_direction')),
+]
+
+val_dataloader = dict(
+    batch_size=1,
+    num_workers=2,
+    persistent_workers=True,
+    pin_memory=True,
+    drop_last=False,
+    sampler=dict(type='DefaultSampler', shuffle=False, round_up=False),
+    dataset=dict(
+        type='CocoDataset',
+        data_root=data_root,
+        data_mode=data_mode,
+        ann_file='coco/annotations/person_keypoints_val2017.json',
+        data_prefix=dict(img='coco/val2017/'),
+        test_mode=True,
+        pipeline=val_pipeline,
+    ))
+test_dataloader = val_dataloader
+
+# evaluator
+val_evaluator = dict(
+    type='CocoMetric',
+    ann_file=data_root + 'coco/annotations/person_keypoints_val2017.json',
+    score_mode='bbox',
+    nms_mode='none',
+)
+test_evaluator = val_evaluator

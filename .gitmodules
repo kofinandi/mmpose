@@ -4,3 +4,6 @@
 [submodule "external/sapiens2"]
 	path = external/sapiens2
 	url = https://github.com/facebookresearch/sapiens2.git
+[submodule "external/PETR"]
+	path = external/PETR
+	url = https://github.com/hikvision-research/opera.git
