@@ -103,4 +103,8 @@ test_evaluator = [
     dict(type='PCKAccuracy', thr=0.1, prefix='threedpw_pck10'),
     dict(type='AUC', prefix='threedpw'),
     dict(type='EPE', prefix='threedpw'),
+    dict(type='MPJVE', prefix='threedpw'),
+    dict(type='MPJAE', prefix='threedpw'),
+    dict(type='MPJVE', norm_item=['bbox', 'torso'], prefix='threedpw'),
+    dict(type='MPJAE', norm_item=['bbox', 'torso'], prefix='threedpw'),
 ]
