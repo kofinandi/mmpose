@@ -140,6 +140,32 @@ class PCTPoseEstimator(BaseModel):
     # Predict
     # ------------------------------------------------------------------
 
+    def _inference_forward(self, inputs: torch.Tensor,
+                           img_metas: list) -> dict:
+        """Run the PCT neural network and return raw prediction results.
+
+        This method contains *only* the model forward pass and is the target
+        patched by the :class:`~mmpose.evaluation.metrics.FPS` metric for
+        accurate inference-time measurement (excluding ``InstanceData``
+        construction and ``PoseDataSample`` packing).
+
+        Args:
+            inputs (Tensor): Pre-processed image batch ``(N, C, H, W)``.
+            img_metas (list[dict]): Per-image metadata dicts in the format
+                expected by PCT's ``forward_test``.
+
+        Returns:
+            dict: Raw prediction dict from PCT (contains ``'preds'`` with
+            shape ``(N, K, 3)``).
+        """
+        return self.pct_model(
+            inputs,
+            joints_3d=None,
+            joints_3d_visible=None,
+            img_metas=img_metas,
+            return_loss=False,
+        )
+
     def predict(self, inputs: torch.Tensor,
                 data_samples: SampleList) -> SampleList:
         """Run inference and return predictions as PoseDataSample objects.
@@ -191,13 +217,7 @@ class PCTPoseEstimator(BaseModel):
                 m['bbox_id'] = idx
 
         with torch.no_grad():
-            results = self.pct_model(
-                inputs,
-                joints_3d=None,
-                joints_3d_visible=None,
-                img_metas=img_metas,
-                return_loss=False,
-            )
+            results = self._inference_forward(inputs, img_metas)
 
         # results['preds']: (N, K, 3) – (x, y) in original image space + score
         all_preds = results['preds']  # numpy (N, K, 3)

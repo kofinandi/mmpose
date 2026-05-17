@@ -107,4 +107,5 @@ test_evaluator = [
     dict(type='MPJAE', prefix='threedpw'),
     dict(type='MPJVE', norm_item=['bbox', 'torso'], prefix='threedpw'),
     dict(type='MPJAE', norm_item=['bbox', 'torso'], prefix='threedpw'),
+    dict(type='FPS', warmup_batches=5, prefix='threedpw'),
 ]

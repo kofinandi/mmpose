@@ -211,6 +211,27 @@ class Sapiens2PoseEstimator(BaseModel):
     # Predict
     # ------------------------------------------------------------------
 
+    def _inference_forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        """Run the sapiens2 neural network and return raw heatmaps.
+
+        This method contains *only* the GPU forward pass and is the target
+        patched by the :class:`~mmpose.evaluation.metrics.FPS` metric for
+        accurate inference-time measurement (excluding heatmap decoding and
+        coordinate post-processing).
+
+        Args:
+            inputs (Tensor): Pre-processed image batch ``(N, C, H, W)``.
+                Float32 or float16 depending on ``self.fp16``.
+
+        Returns:
+            Tensor: Raw heatmaps ``(N, 308, H_hm, W_hm)`` in float32.
+        """
+        model_inputs = inputs.half() if self.fp16 else inputs
+        heatmaps = self.sapiens2_model(model_inputs)
+        if self.fp16:
+            heatmaps = heatmaps.float()
+        return heatmaps
+
     def predict(self, inputs: torch.Tensor,
                 data_samples: SampleList) -> SampleList:
         """Run inference and return predictions as ``PoseDataSample`` objects.
@@ -234,10 +255,7 @@ class Sapiens2PoseEstimator(BaseModel):
         """
         with torch.no_grad():
             # (B, 308, H_hm, W_hm)
-            model_inputs = inputs.half() if self.fp16 else inputs
-            all_heatmaps = self.sapiens2_model(model_inputs)
-            if self.fp16:
-                all_heatmaps = all_heatmaps.float()
+            all_heatmaps = self._inference_forward(inputs)
 
         # Select target keypoint channels: (B, K_target, H_hm, W_hm)
         all_heatmaps = all_heatmaps[:, self.src_indices, :, :]

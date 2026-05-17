@@ -134,6 +134,34 @@ class PETRPoseEstimator(BaseModel):
     # Predict
     # ------------------------------------------------------------------
 
+    def _inference_forward(self, inputs: torch.Tensor,
+                           img_metas: list) -> list:
+        """Run the PETR neural network and return raw detection results.
+
+        This method contains *only* the model forward pass (iterating over
+        images one at a time as required by ``PETR.simple_test``) and is the
+        target patched by the :class:`~mmpose.evaluation.metrics.FPS` metric
+        for accurate inference-time measurement (excluding keypoint packing
+        and ``InstanceData`` construction).
+
+        Args:
+            inputs (Tensor): Pre-processed image batch ``(N, C, H, W)``.
+            img_metas (list[dict]): Per-image metadata dicts in the mmdet v2
+                format expected by ``PETR.simple_test``.
+
+        Returns:
+            list[tuple]: One ``(bbox_result, kpt_result)`` tuple per image.
+        """
+        batch_size = inputs.shape[0]
+        all_results = []
+        for i in range(batch_size):
+            single_img = inputs[i:i + 1]
+            single_meta = [img_metas[i]]
+            res = self.petr_model.simple_test(
+                single_img, single_meta, rescale=True)
+            all_results.append(res[0])  # (bbox_result, kpt_result)
+        return all_results
+
     def predict(self, inputs: torch.Tensor,
                 data_samples: SampleList) -> SampleList:
         """Run PETR inference and populate pred_instances.
@@ -186,14 +214,7 @@ class PETRPoseEstimator(BaseModel):
             img_metas.append(img_meta_dict)
 
         with torch.no_grad():
-            # PETR.simple_test only supports batch_size == 1
-            all_results = []
-            for i in range(batch_size):
-                single_img = inputs[i:i + 1]
-                single_meta = [img_metas[i]]
-                res = self.petr_model.simple_test(
-                    single_img, single_meta, rescale=True)
-                all_results.append(res[0])  # (bbox_result, kpt_result)
+            all_results = self._inference_forward(inputs, img_metas)
 
         for i, (data_sample, result) in enumerate(
                 zip(data_samples, all_results)):

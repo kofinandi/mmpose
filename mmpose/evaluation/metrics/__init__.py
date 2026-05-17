@@ -1,6 +1,7 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 from .coco_metric import CocoMetric
 from .coco_wholebody_metric import CocoWholeBodyMetric
+from .fps_metric import FPS
 from .hand_metric import InterHandMetric
 from .keypoint_2d_metrics import (AUC, EPE, NME, JhmdbPCKAccuracy,
                                   MpiiPCKAccuracy, PCKAccuracy)
@@ -14,5 +15,5 @@ __all__ = [
     'CocoMetric', 'PCKAccuracy', 'MpiiPCKAccuracy', 'JhmdbPCKAccuracy', 'AUC',
     'EPE', 'NME', 'PoseTrack18Metric', 'CocoWholeBodyMetric',
     'KeypointPartitionMetric', 'MPJPE', 'InterHandMetric', 'SimpleMPJPE',
-    'MPJVE', 'MPJAE'
+    'MPJVE', 'MPJAE', 'FPS'
 ]
