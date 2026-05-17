@@ -21,6 +21,8 @@ _METAINFO_FILES: Dict[str, str] = {
     'ochuman':      'configs/_base_/datasets/ochuman.py',
     'posetrack18':  'configs/_base_/datasets/posetrack18.py',
     'coco_wholebody': 'configs/_base_/datasets/coco_wholebody.py',
+    'threedpw': 'configs/_base_/datasets/threedpw.py',
+    'ubody': 'configs/_base_/datasets/ubody2d.py',
 }
 
 # Lazy-loaded cache: convention name → list of keypoint name strings
@@ -59,6 +61,24 @@ def get_keypoints(convention: str) -> List[str]:
              for i in range(meta['num_keypoints'])]
     _cache[convention] = names
     return names
+
+
+def get_flip_indices(convention: str) -> Optional[List[int]]:
+    """Return the flip index list for *convention*, or ``None`` if unavailable.
+
+    Args:
+        convention (str): A key in :data:`_METAINFO_FILES`.
+
+    Returns:
+        list[int] or None: ``flip_indices[i]`` is the index of the keypoint
+        that is symmetric to keypoint *i*.
+    """
+    if convention not in _METAINFO_FILES:
+        return None
+
+    from mmpose.datasets.datasets.utils import parse_pose_metainfo
+    meta = parse_pose_metainfo(dict(from_file=_METAINFO_FILES[convention]))
+    return meta.get('flip_indices', None)
 
 
 def get_mapping(

@@ -76,7 +76,8 @@ class KeypointConverter(BaseTransform):
                  src: str = None,
                  dst: str = None):
         if src is not None and dst is not None:
-            from .keypoint_registry import get_keypoints, get_mapping as _get_mapping
+            from .keypoint_registry import (get_flip_indices, get_keypoints,
+                                            get_mapping as _get_mapping)
             if num_keypoints is not None or mapping is not None:
                 raise ValueError(
                     'KeypointConverter: provide either (src, dst) for '
@@ -85,10 +86,14 @@ class KeypointConverter(BaseTransform):
             dst_names = get_keypoints(dst) if isinstance(dst, str) else dst
             num_keypoints = len(dst_names)
             mapping = _get_mapping(src, dst)
+            self.dst_flip_indices = get_flip_indices(dst) \
+                if isinstance(dst, str) else None
         elif src is not None or dst is not None:
             raise ValueError(
                 'KeypointConverter: src and dst must be provided together.')
-        elif num_keypoints is None or mapping is None:
+        else:
+            self.dst_flip_indices = None
+        if num_keypoints is None or mapping is None:
             raise ValueError(
                 'KeypointConverter: either (src, dst) or '
                 '(num_keypoints, mapping) must be provided.')
@@ -139,7 +144,8 @@ class KeypointConverter(BaseTransform):
         # Initialize output arrays
         keypoints = np.zeros((num_instances, self.num_keypoints, 3))
         keypoints_visible = np.zeros((num_instances, self.num_keypoints))
-        key = 'keypoints_3d' if 'keypoints_3d' in results else 'keypoints'
+        key = 'keypoints_3d' \
+            if results.get('keypoints_3d') is not None else 'keypoints'
         c = results[key].shape[-1]
 
         flip_indices = results.get('flip_indices', None)
@@ -175,12 +181,15 @@ class KeypointConverter(BaseTransform):
         results['keypoints'] = keypoints[..., :2]
         results['keypoints_visible'] = np.stack(
             [keypoints_visible, keypoints_visible_weights], axis=2)
-        if 'keypoints_3d' in results:
+        if results.get('keypoints_3d') is not None:
             results['keypoints_3d'] = keypoints
             results['lifting_target'] = keypoints[results['target_idx']]
             results['lifting_target_visible'] = keypoints_visible[
                 results['target_idx']]
-        results['flip_indices'] = flip_indices
+        if self.dst_flip_indices is not None:
+            results['flip_indices'] = self.dst_flip_indices
+        else:
+            results['flip_indices'] = flip_indices
 
         return results
 
