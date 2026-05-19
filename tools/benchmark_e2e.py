@@ -117,6 +117,49 @@ def build_unique_image_list(
     return list(seen.items())
 
 
+def build_gt_bbox_image_list(
+    pose_cfg: Config,
+    num_frames: Optional[int] = None,
+) -> List[Tuple[int, str, np.ndarray, np.ndarray]]:
+    """Return GT bbox info from the test dataset, one entry per unique image.
+
+    Returns a list of (img_id, img_path, bboxes_xyxy, bbox_scores) where
+    bboxes_xyxy has shape (N, 4) and bbox_scores has shape (N,) with all
+    values set to 1.0 (GT annotations carry no detector confidence).
+    """
+    _init_scope(pose_cfg)
+    ds_cfg = pose_cfg.test_dataloader.dataset.to_dict()
+    ds_cfg['pipeline'] = []
+    dataset = DATASETS.build(ds_cfg)
+
+    # Group all instances by img_id while preserving insertion order.
+    img_paths: dict = {}
+    img_bboxes: dict = {}
+
+    for idx in range(len(dataset)):
+        item = dataset[idx]
+        img_id = item['img_id']
+        if img_id not in img_paths:
+            img_paths[img_id] = item['img_path']
+            img_bboxes[img_id] = []
+            if num_frames is not None and len(img_paths) > num_frames:
+                # Drop the last entry we just added – we hit the cap.
+                del img_paths[img_id]
+                del img_bboxes[img_id]
+                break
+        if img_id in img_bboxes:
+            # 'bbox' is already xyxy, shape (1, 4)
+            img_bboxes[img_id].append(item['bbox'].reshape(4))
+
+    result = []
+    for img_id, img_path in img_paths.items():
+        boxes = np.stack(img_bboxes[img_id], axis=0).astype(np.float32)
+        scores = np.ones(len(boxes), dtype=np.float32)
+        result.append((img_id, img_path, boxes, scores))
+
+    return result
+
+
 def prefetch_images(
     img_list: List[Tuple[int, str]],
 ) -> List[Tuple[int, np.ndarray]]:
@@ -290,6 +333,69 @@ def run_bottomup(
 
 
 # ── Topdown pipeline ───────────────────────────────────────────────────────
+
+def _mock_detector_producer(
+    prefetched_images: List[Tuple[int, np.ndarray]],
+    gt_bboxes_per_frame: Dict[int, Tuple[np.ndarray, np.ndarray]],
+    det_batch_size: int,
+    bbox_queue: queue.Queue,
+    log_interval: int,
+    # shared output containers (written only by this thread)
+    frame_start_times: dict,
+    frame_end_times: dict,
+    zero_det_frames: dict,
+) -> None:
+    """Producer: push GT BBoxItems into bbox_queue without running a detector.
+
+    Mirrors the structure of _detector_producer so the downstream consumer
+    and timing containers work identically, but det_timings is never written
+    (detector timing metrics will therefore report 0 in the output).
+    """
+    n = len(prefetched_images)
+    n_batches = -(-n // det_batch_size)
+
+    for batch_start in range(0, n, det_batch_size):
+        batch_end = min(batch_start + det_batch_size, n)
+        batch = prefetched_images[batch_start:batch_end]
+
+        wall_start = time.perf_counter()
+        for fid in range(batch_start, batch_end):
+            frame_start_times[fid] = wall_start
+
+        batch_idx = batch_start // det_batch_size
+        if (batch_idx + 1) % log_interval == 0 or (batch_idx + 1) == n_batches:
+            print(f'  [mock-detector] batch {batch_idx + 1}/{n_batches} '
+                  f'| frames processed: {batch_end}')
+
+        wall_after = time.perf_counter()
+
+        for rel, (img_id, img) in enumerate(batch):
+            frame_id = batch_start + rel
+            h, w = img.shape[:2]
+
+            bboxes_xyxy, scores = gt_bboxes_per_frame.get(
+                frame_id, (np.zeros((0, 4), dtype=np.float32),
+                            np.zeros(0, dtype=np.float32)))
+
+            n_bboxes = len(bboxes_xyxy)
+
+            if n_bboxes == 0:
+                zero_det_frames[frame_id] = (img_id, (h, w))
+                frame_end_times[frame_id] = wall_after
+            else:
+                for bbox, score in zip(bboxes_xyxy, scores):
+                    bbox_queue.put(BBoxItem(
+                        frame_id=frame_id,
+                        img_id=img_id,
+                        img=img,
+                        bbox_xyxy=bbox,
+                        det_score=float(score),
+                        n_bboxes_in_frame=n_bboxes,
+                        frame_start_wall=wall_start,
+                    ))
+
+    bbox_queue.put(_SENTINEL)
+
 
 def _detector_producer(
     detector,
@@ -530,8 +636,13 @@ def run_topdown(
     warmup_batches: int,
     pose_cfg: Config,
     log_interval: int = 100,
+    gt_bboxes_per_frame: Optional[Dict[int, Tuple[np.ndarray, np.ndarray]]] = None,
 ) -> Tuple[dict, dict]:
-    """Run topdown async producer/consumer benchmark."""
+    """Run topdown async producer/consumer benchmark.
+
+    When gt_bboxes_per_frame is provided the real detector is bypassed and
+    GT bboxes are fed directly into the queue (mock-detector mode).
+    """
     _init_scope(pose_cfg)
     kp_pipeline = Compose(pose_cfg.test_dataloader.dataset.pipeline)
     dataset_meta = kp_model.dataset_meta
@@ -548,13 +659,23 @@ def run_topdown(
     frame_counts: dict = {}
     zero_det_frames: dict = {}
 
-    producer = threading.Thread(
-        target=_detector_producer,
-        args=(det_model, prefetched_images, det_batch_size, bbox_thr, nms_thr,
-              det_cat_id, bbox_queue, warmup_batches, log_interval,
-              det_timings, frame_start_times, frame_end_times, zero_det_frames),
-        daemon=True,
-    )
+    if gt_bboxes_per_frame is not None:
+        producer = threading.Thread(
+            target=_mock_detector_producer,
+            args=(prefetched_images, gt_bboxes_per_frame, det_batch_size,
+                  bbox_queue, log_interval,
+                  frame_start_times, frame_end_times, zero_det_frames),
+            daemon=True,
+        )
+    else:
+        producer = threading.Thread(
+            target=_detector_producer,
+            args=(det_model, prefetched_images, det_batch_size, bbox_thr,
+                  nms_thr, det_cat_id, bbox_queue, warmup_batches,
+                  log_interval, det_timings, frame_start_times,
+                  frame_end_times, zero_det_frames),
+            daemon=True,
+        )
     consumer = threading.Thread(
         target=_keypoint_consumer,
         args=(kp_model, kp_pipeline, kp_batch_size, queue_strategy,
@@ -729,11 +850,15 @@ def _parse_args():
                    help='Pose model config file (bottomup or topdown)')
     p.add_argument('pose_checkpoint', help='Pose model checkpoint')
 
-    grp = p.add_argument_group('Topdown mode (requires both flags)')
+    grp = p.add_argument_group('Topdown mode')
     grp.add_argument('--det-config', default=None,
                      help='Detector config (topdown mode)')
     grp.add_argument('--det-checkpoint', default=None,
                      help='Detector checkpoint (topdown mode)')
+    grp.add_argument('--mock-detector', action='store_true',
+                     help='Skip the real detector and seed the queue with GT '
+                          'bboxes from the test dataset (topdown mode only). '
+                          'Mutually exclusive with --det-config/--det-checkpoint.')
 
     p.add_argument('--det-batch-size', type=int, default=4,
                    help='Detector batch size (topdown mode, default: 4)')
@@ -786,34 +911,58 @@ def main():
     _init_scope(pose_cfg)
     MMLogger.get_current_instance()  # ensure logger is initialised
 
-    is_topdown = bool(args.det_config and args.det_checkpoint)
+    use_real_detector = bool(args.det_config and args.det_checkpoint)
+    is_topdown = args.mock_detector or use_real_detector
     model_type = pose_cfg.model.get('type', '')
     if 'Bottomup' in model_type and is_topdown:
         raise ValueError(
             'The pose config uses a BottomupPoseEstimator but --det-config '
-            'was also provided.  Bottomup models do not need a detector.')
+            'or --mock-detector was also provided. '
+            'Bottomup models do not need a detector.')
+    if args.mock_detector and use_real_detector:
+        raise ValueError(
+            '--mock-detector and --det-config/--det-checkpoint are mutually '
+            'exclusive.')
 
     # ── Topdown mode ───────────────────────────────────────────────────────
     if is_topdown:
-        if not HAS_MMDET:
-            raise ImportError(
-                'mmdet is required for topdown mode. '
-                'Install it with: pip install mmdet')
-
         print(f'\nMode: topdown  |  strategy: {args.queue_strategy}')
-        print(f'  Detector : {args.det_config}')
-        print(f'  KP model : {args.pose_config}\n')
 
-        detector = init_detector(
-            args.det_config, args.det_checkpoint, device=args.device)
-        detector.cfg = adapt_mmdet_pipeline(detector.cfg)
+        detector = None
+        gt_bboxes_per_frame = None
+
+        if args.mock_detector:
+            print('  Detector : MOCK (GT bboxes from dataset)')
+            print(f'  KP model : {args.pose_config}\n')
+
+            print('Building GT bbox image list...')
+            img_list_with_bbox = build_gt_bbox_image_list(
+                pose_cfg, args.num_frames)
+            img_list = [(iid, p) for iid, p, _, _ in img_list_with_bbox]
+            gt_bboxes_per_frame = {
+                fid: (bb, sc)
+                for fid, (_, _, bb, sc) in enumerate(img_list_with_bbox)
+            }
+        else:
+            if not HAS_MMDET:
+                raise ImportError(
+                    'mmdet is required for topdown mode. '
+                    'Install it with: pip install mmdet')
+
+            print(f'  Detector : {args.det_config}')
+            print(f'  KP model : {args.pose_config}\n')
+
+            detector = init_detector(
+                args.det_config, args.det_checkpoint, device=args.device)
+            detector.cfg = adapt_mmdet_pipeline(detector.cfg)
+
+            print('Building image list...')
+            img_list = build_unique_image_list(pose_cfg, args.num_frames)
 
         kp_model = init_model(
             args.pose_config, args.pose_checkpoint, device=args.device)
         evaluator = build_evaluator(pose_cfg, kp_model.dataset_meta)
 
-        print('Building image list...')
-        img_list = build_unique_image_list(pose_cfg, args.num_frames)
         prefetched = prefetch_images(img_list)
 
         quality, perf = run_topdown(
@@ -831,8 +980,10 @@ def main():
             warmup_batches=args.warmup_batches,
             pose_cfg=pose_cfg,
             log_interval=args.log_interval,
+            gt_bboxes_per_frame=gt_bboxes_per_frame,
         )
-        mode = f'topdown (strategy={args.queue_strategy})'
+        mode_suffix = 'mock-detector' if args.mock_detector else args.queue_strategy
+        mode = f'topdown (strategy={mode_suffix})'
 
     # ── Bottomup mode ──────────────────────────────────────────────────────
     else:
