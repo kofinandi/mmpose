@@ -35,7 +35,7 @@ from mmengine.registry import init_default_scope
 import mmpose.datasets       # noqa: F401
 import mmpose.evaluation     # noqa: F401
 import mmpose.models         # noqa: F401
-from mmengine.registry import DATASETS, METRICS
+from mmengine.registry import DATASETS, METRICS, TRANSFORMS
 from mmpose.apis import init_model
 from mmpose.evaluation.functional import nms
 from mmpose.structures import PoseDataSample, merge_data_samples
@@ -120,21 +120,38 @@ def build_unique_image_list(
 def build_gt_bbox_image_list(
     pose_cfg: Config,
     num_frames: Optional[int] = None,
-) -> List[Tuple[int, str, np.ndarray, np.ndarray]]:
+) -> List[Tuple[int, str, np.ndarray, np.ndarray, list]]:
     """Return GT bbox info from the test dataset, one entry per unique image.
 
-    Returns a list of (img_id, img_path, bboxes_xyxy, bbox_scores) where
-    bboxes_xyxy has shape (N, 4) and bbox_scores has shape (N,) with all
-    values set to 1.0 (GT annotations carry no detector confidence).
+    Returns a list of
+    ``(img_id, img_path, bboxes_xyxy, bbox_scores, gt_instances_list)``
+    where:
+
+    - ``bboxes_xyxy`` has shape ``(N, 4)``
+    - ``bbox_scores`` has shape ``(N,)`` with all values set to 1.0
+    - ``gt_instances_list`` is a list of per-instance dicts with keys
+      ``keypoints``, ``keypoints_visible``, ``bbox_scale``, ``area``,
+      ``category_id``, and ``id``.  If the test pipeline contains a
+      ``KeypointConverter``, it is applied to each raw item so keypoints
+      arrive in the target order (e.g. COCO) for metric evaluation.
     """
     _init_scope(pose_cfg)
     ds_cfg = pose_cfg.test_dataloader.dataset.to_dict()
     ds_cfg['pipeline'] = []
     dataset = DATASETS.build(ds_cfg)
 
+    # Look for a KeypointConverter step in the test pipeline.  Apply it
+    # to raw items so GT keypoints arrive in the converter's target order.
+    kp_converter = None
+    for step in pose_cfg.test_dataloader.dataset.pipeline:
+        if isinstance(step, dict) and step.get('type') == 'KeypointConverter':
+            kp_converter = TRANSFORMS.build(step)
+            break
+
     # Group all instances by img_id while preserving insertion order.
     img_paths: dict = {}
     img_bboxes: dict = {}
+    img_gt_instances: dict = {}
 
     for idx in range(len(dataset)):
         item = dataset[idx]
@@ -142,20 +159,51 @@ def build_gt_bbox_image_list(
         if img_id not in img_paths:
             img_paths[img_id] = item['img_path']
             img_bboxes[img_id] = []
+            img_gt_instances[img_id] = []
             if num_frames is not None and len(img_paths) > num_frames:
                 # Drop the last entry we just added – we hit the cap.
                 del img_paths[img_id]
                 del img_bboxes[img_id]
+                del img_gt_instances[img_id]
                 break
         if img_id in img_bboxes:
             # 'bbox' is already xyxy, shape (1, 4)
             img_bboxes[img_id].append(item['bbox'].reshape(4))
 
+            # Apply KeypointConverter so GT keypoints match the model output
+            if kp_converter is not None:
+                item = kp_converter(item)
+
+            # Prefer the original annotation area (mask-based for COCO,
+            # or heuristic for MPII).  Using the pipeline-derived bbox_scale
+            # area would inflate OKS because bbox_scale includes padding.
+            raw_ann = item.get('raw_ann_info')
+            if raw_ann is not None and isinstance(raw_ann, dict):
+                orig_area = raw_ann.get('area', None)
+            elif raw_ann is not None and isinstance(raw_ann, list) and raw_ann:
+                orig_area = raw_ann[0].get('area', None)
+            else:
+                orig_area = None
+            if orig_area is None:
+                # MPII and similar: use the per-instance area already computed
+                _a = item.get('area')
+                orig_area = float(_a.flat[0]) if _a is not None else None
+
+            img_gt_instances[img_id].append({
+                'keypoints': item.get('keypoints'),
+                'keypoints_visible': item.get('keypoints_visible'),
+                'bbox_scale': item.get('bbox_scale'),
+                'orig_area': orig_area,
+                'category_id': item.get('category_id', 1),
+                'id': item.get('id'),
+            })
+
     result = []
     for img_id, img_path in img_paths.items():
         boxes = np.stack(img_bboxes[img_id], axis=0).astype(np.float32)
         scores = np.ones(len(boxes), dtype=np.float32)
-        result.append((img_id, img_path, boxes, scores))
+        result.append((img_id, img_path, boxes, scores,
+                        img_gt_instances[img_id]))
 
     return result
 
@@ -294,12 +342,26 @@ def _make_topdown_data_sample(
     bbox_results: list,
     det_scores: List[float],
     ori_shape: Tuple[int, int],
+    gt_instances_data: Optional[list] = None,
 ) -> PoseDataSample:
     """Merge per-bbox PoseDataSamples into a single per-image PoseDataSample.
 
     Sets ``id`` as a list so ``CocoMetric._sort_and_unique_bboxes`` skips
     deduplication (matching bottomup convention) and all N detected persons
     are preserved.
+
+    Args:
+        img_id: Image identifier.
+        bbox_results: Per-bbox ``PoseDataSample`` outputs from the keypoint
+            model.
+        det_scores: Detector confidence score for each bbox.
+        ori_shape: ``(height, width)`` of the original image.
+        gt_instances_data: Optional list of per-GT-instance dicts, each with
+            keys ``keypoints``, ``keypoints_visible``, ``bbox_scale``,
+            ``area``, ``category_id``, and ``id``.  When provided the GT
+            data is written onto ``merged.gt_instances`` so that metrics
+            with ``gt_from_samples=True`` (e.g. :class:`CocoMetric`) can
+            synthesize ground-truth annotations without an ``ann_file``.
     """
     from mmengine.structures import InstanceData
 
@@ -342,7 +404,73 @@ def _make_topdown_data_sample(
         'category_id': 1,
         'ori_shape': ori_shape,
     })
+
+    # Attach GT instances so that CocoMetric with gt_from_samples=True can
+    # synthesize COCO-format ground-truth annotations.
+    if gt_instances_data:
+        _attach_gt_instances(merged, gt_instances_data, img_id)
+
     return merged
+
+
+def _attach_gt_instances(
+    data_sample: PoseDataSample,
+    gt_instances_data: list,
+    img_id: int,
+) -> None:
+    """Write stacked GT keypoint/bbox arrays into data_sample.gt_instances.
+
+    Args:
+        data_sample: The merged per-image ``PoseDataSample``.  Its
+            ``gt_instances`` is updated in-place.
+        gt_instances_data: List of per-GT-instance dicts as produced by
+            :func:`build_gt_bbox_image_list`.
+        img_id: Image identifier used as a fallback for generating unique
+            annotation ids when the GT dicts don't carry an ``id`` field.
+    """
+    n = len(gt_instances_data)
+    if n == 0:
+        return
+
+    def _stack(key):
+        arrays = [g.get(key) for g in gt_instances_data]
+        if any(a is None for a in arrays):
+            return None
+        return np.concatenate([np.atleast_2d(a) for a in arrays], axis=0)
+
+    gt_inst = data_sample.gt_instances
+
+    # keypoints: each item is (1, K, 2) → stack to (N, K, 2)
+    kpts = _stack('keypoints')
+    if kpts is not None:
+        gt_inst.keypoints = kpts.astype(np.float32)
+
+    # keypoints_visible: each item is (1, K) or (1, K, 2) → (N, K) or (N, K, 2)
+    kv = _stack('keypoints_visible')
+    if kv is not None:
+        gt_inst.keypoints_visible = kv.astype(np.float32)
+
+    # bbox_scale: each item is (1, 2) → (N, 2)
+    bs = _stack('bbox_scale')
+    if bs is not None:
+        gt_inst.bbox_scales = bs.astype(np.float32)
+
+    # Original per-instance annotation area (mask-based for COCO, heuristic
+    # for MPII).  Store as a (N,) float array so the metric can use the
+    # correct area for OKS computation instead of the padded bbox_scale area.
+    orig_areas = [g.get('orig_area') for g in gt_instances_data]
+    if all(a is not None for a in orig_areas):
+        gt_inst.orig_areas = np.array(orig_areas, dtype=np.float32)
+
+    # Override the sample's id with the GT instance ids so that
+    # CocoMetric._synthesize_raw_ann_info produces unique annotation ids that
+    # match the original dataset's per-instance identifiers.
+    gt_ids = [g.get('id') for g in gt_instances_data]
+    if all(x is not None for x in gt_ids):
+        data_sample.set_metainfo({'id': [int(x) for x in gt_ids]})
+    else:
+        data_sample.set_metainfo(
+            {'id': list(range(img_id * 10000, img_id * 10000 + n))})
 
 
 # ── Bottomup pipeline ──────────────────────────────────────────────────────
@@ -710,6 +838,7 @@ def run_topdown(
     log_interval: int = 100,
     gt_bboxes_per_frame: Optional[Dict[int, Tuple[np.ndarray, np.ndarray]]] = None,
     det_evaluator: Optional[Evaluator] = None,
+    gt_instances_per_frame: Optional[Dict[int, list]] = None,
 ) -> Tuple[dict, dict]:
     """Run topdown async producer/consumer benchmark.
 
@@ -717,7 +846,15 @@ def run_topdown(
     GT bboxes are fed directly into the queue (mock-detector mode).
     """
     _init_scope(pose_cfg)
-    kp_pipeline = Compose(pose_cfg.test_dataloader.dataset.pipeline)
+    # Filter out GT-only transforms that require keypoints in the input dict
+    # (e.g. KeypointConverter).  During inference the consumer only provides
+    # image + bbox, so these steps would raise KeyError on 'keypoints'.
+    _GT_ONLY_TYPES = {'KeypointConverter'}
+    kp_pipeline_cfg = [
+        s for s in pose_cfg.test_dataloader.dataset.pipeline
+        if not (isinstance(s, dict) and s.get('type') in _GT_ONLY_TYPES)
+    ]
+    kp_pipeline = Compose(kp_pipeline_cfg)
     dataset_meta = kp_model.dataset_meta
 
     # Bounded queue provides back-pressure so the producer does not run too
@@ -768,8 +905,10 @@ def run_topdown(
     n_images = len(prefetched_images)
     for frame_id, (img_id, img) in enumerate(prefetched_images):
         h, w = img.shape[:2]
+        gt_inst_data = (gt_instances_per_frame or {}).get(frame_id)
         if frame_id in zero_det_frames:
-            ds = _make_topdown_data_sample(img_id, [], [], (h, w))
+            ds = _make_topdown_data_sample(
+                img_id, [], [], (h, w), gt_inst_data)
         elif frame_id in frame_results:
             res_scores = frame_results[frame_id]
             ds = _make_topdown_data_sample(
@@ -777,6 +916,7 @@ def run_topdown(
                 [r for r, _ in res_scores],
                 [s for _, s in res_scores],
                 (h, w),
+                gt_inst_data,
             )
         else:
             # Frame was neither processed by detector nor had results (shouldn't
@@ -1040,6 +1180,7 @@ def main():
 
         detector = None
         gt_bboxes_per_frame = None
+        gt_instances_per_frame = None
 
         if args.mock_detector:
             print('  Detector : MOCK (GT bboxes from dataset)')
@@ -1048,10 +1189,14 @@ def main():
             print('Building GT bbox image list...')
             img_list_with_bbox = build_gt_bbox_image_list(
                 pose_cfg, args.num_frames)
-            img_list = [(iid, p) for iid, p, _, _ in img_list_with_bbox]
+            img_list = [(iid, p) for iid, p, _, _, _ in img_list_with_bbox]
             gt_bboxes_per_frame = {
                 fid: (bb, sc)
-                for fid, (_, _, bb, sc) in enumerate(img_list_with_bbox)
+                for fid, (_, _, bb, sc, _) in enumerate(img_list_with_bbox)
+            }
+            gt_instances_per_frame = {
+                fid: gt_insts
+                for fid, (_, _, _, _, gt_insts) in enumerate(img_list_with_bbox)
             }
         else:
             if not HAS_MMDET:
@@ -1096,6 +1241,7 @@ def main():
             log_interval=args.log_interval,
             gt_bboxes_per_frame=gt_bboxes_per_frame,
             det_evaluator=det_evaluator,
+            gt_instances_per_frame=gt_instances_per_frame,
         )
         mode_suffix = 'mock-detector' if args.mock_detector else args.queue_strategy
         mode = f'topdown (strategy={mode_suffix})'

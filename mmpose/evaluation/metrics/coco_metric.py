@@ -93,6 +93,14 @@ class CocoMetric(BaseMetric):
     """
     default_prefix: Optional[str] = 'coco'
 
+    # Default COCO sigmas used when gt_from_samples=True and dataset_meta
+    # sigmas don't match the actual prediction keypoint count (e.g. MPII
+    # dataset paired with a COCO-trained model via KeypointConverter).
+    _COCO_SIGMAS = np.array([
+        0.026, 0.025, 0.025, 0.035, 0.035, 0.079, 0.079, 0.072, 0.072,
+        0.062, 0.062, 0.107, 0.107, 0.087, 0.087, 0.089, 0.089
+    ])
+
     def __init__(self,
                  ann_file: Optional[str] = None,
                  use_area: bool = True,
@@ -106,9 +114,11 @@ class CocoMetric(BaseMetric):
                  gt_converter: Dict = None,
                  outfile_prefix: Optional[str] = None,
                  collect_device: str = 'cpu',
-                 prefix: Optional[str] = None) -> None:
+                 prefix: Optional[str] = None,
+                 gt_from_samples: bool = False) -> None:
         super().__init__(collect_device=collect_device, prefix=prefix)
         self.ann_file = ann_file
+        self.gt_from_samples = gt_from_samples
         # initialize coco helper with the annotation json file
         # if ann_file is not specified, initialize with the converted dataset
         if ann_file is not None:
@@ -167,7 +177,7 @@ class CocoMetric(BaseMetric):
             dataset_meta['num_keypoints'] = len(dataset_meta['sigmas'])
         self._dataset_meta = dataset_meta
 
-        if self.coco is None:
+        if self.coco is None and not self.gt_from_samples:
             message = MessageHub.get_current_instance()
             ann_file = message.get_info(
                 f"{dataset_meta['dataset_name']}_ann_file", None)
@@ -217,7 +227,20 @@ class CocoMetric(BaseMetric):
 
             pred['keypoints'] = keypoints
             pred['keypoint_scores'] = keypoint_scores
-            pred['category_id'] = data_sample.get('category_id', 1)
+            # Normalize category_id to a plain int.  Some datasets (e.g. MPII)
+            # store it as a list; xtcocotools requires a hashable scalar.
+            _cat_id = data_sample.get('category_id', 1)
+            try:
+                _ndim = getattr(_cat_id, 'ndim', -1)
+                if _ndim == 0:
+                    _cat_id = int(_cat_id)
+                elif len(_cat_id) > 0:
+                    _cat_id = int(_cat_id[0])
+                else:
+                    _cat_id = 1
+            except TypeError:
+                pass
+            pred['category_id'] = int(_cat_id)
             if 'bboxes' in data_sample['pred_instances']:
                 pred['bbox'] = bbox_xyxy2xywh(
                     data_sample['pred_instances']['bboxes'])
@@ -254,14 +277,186 @@ class CocoMetric(BaseMetric):
                         '`crowd_index` is required when `self.iou_type` is ' \
                         '`keypoints_crowd`'
                     gt['crowd_index'] = data_sample['crowd_index']
-                assert 'raw_ann_info' in data_sample, \
-                    'The row ground truth annotations are required for ' \
-                    'evaluation when `ann_file` is not provided'
-                anns = data_sample['raw_ann_info']
-                gt['raw_ann_info'] = anns if isinstance(anns, list) else [anns]
+                if self.gt_from_samples:
+                    # Always synthesize when gt_from_samples=True so that
+                    # missing fields (e.g. 'area' absent in CrowdPose
+                    # raw_ann_info) are filled in from gt_instances.
+                    gt['raw_ann_info'] = self._synthesize_raw_ann_info(
+                        data_sample)
+                elif 'raw_ann_info' in data_sample:
+                    anns = data_sample['raw_ann_info']
+                    gt['raw_ann_info'] = (
+                        anns if isinstance(anns, list) else [anns])
+                else:
+                    assert False, \
+                        'The row ground truth annotations are required for ' \
+                        'evaluation when `ann_file` is not provided'
 
             # add converted result to the results list
             self.results.append((pred, gt))
+
+    def _synthesize_raw_ann_info(self, data_sample: dict) -> list:
+        """Build COCO-format raw_ann_info dicts from gt_instances + metainfo.
+
+        Used when ``gt_from_samples=True`` and the dataset does not set
+        ``raw_ann_info`` on each sample (e.g. MPII, which uses its own
+        annotation format).  The synthesized dicts contain all fields
+        required by :meth:`gt_to_coco_json`.
+
+        Args:
+            data_sample (dict): A single data sample produced by the model
+                test step.  Must carry ``gt_instances`` (with ``bboxes``,
+                optionally ``bbox_scales``, ``keypoints``,
+                ``keypoints_visible``) and top-level metainfo keys ``img_id``,
+                ``id``, ``category_id``, and ``ori_shape``.
+
+        Returns:
+            list[dict]: One COCO annotation dict per GT instance.
+        """
+        gt_instances = data_sample['gt_instances']
+        img_id = int(data_sample['img_id'])
+
+        # ``id`` may be a scalar or a list (benchmark_e2e merges per-image)
+        sample_ids = data_sample['id']
+        if not isinstance(sample_ids, (list, tuple)):
+            sample_ids = [sample_ids]
+        sample_ids = [int(x) for x in sample_ids]
+
+        # category_id: may be scalar, 0-d numpy array, or a sequence
+        cat_id = data_sample.get('category_id', 1)
+        try:
+            _ndim = getattr(cat_id, 'ndim', -1)
+            if _ndim == 0:
+                cat_id = int(cat_id)
+            elif len(cat_id) > 0:
+                cat_id = int(cat_id[0])
+            else:
+                cat_id = 1
+        except TypeError:
+            cat_id = int(cat_id)
+
+        # After Evaluator.to_dict(), gt_instances is a plain dict; use .get().
+        if isinstance(gt_instances, dict):
+            bboxes = gt_instances.get('bboxes')
+            bbox_scales = gt_instances.get('bbox_scales')
+            keypoints = gt_instances.get('keypoints')
+            kpts_vis = gt_instances.get('keypoints_visible')
+            orig_areas = gt_instances.get('orig_areas')
+        else:
+            bboxes = getattr(gt_instances, 'bboxes', None)
+            bbox_scales = getattr(gt_instances, 'bbox_scales', None)
+            keypoints = getattr(gt_instances, 'keypoints', None)
+            kpts_vis = getattr(gt_instances, 'keypoints_visible', None)
+            orig_areas = getattr(gt_instances, 'orig_areas', None)
+
+        # Area from raw_ann_info (e.g. COCO segmentation-mask area).
+        # Takes priority over all other fallbacks so COCO keeps its exact area.
+        _raw_ann = data_sample.get('raw_ann_info')
+        if _raw_ann is not None:
+            if isinstance(_raw_ann, dict):
+                _raw_ann = [_raw_ann]
+            raw_ann_areas: list = [
+                float(r['area']) for r in _raw_ann if 'area' in r
+            ]
+            if not raw_ann_areas:
+                raw_ann_areas = None
+        else:
+            raw_ann_areas = None
+
+        # Per-sample area from PackPoseInputs meta_keys (e.g. MPII's
+        # item['area'] = 0.53 * bbox_area).  This provides a dataset-native
+        # area for pipelines that don't set orig_areas on gt_instances (i.e.
+        # tools/test.py), keeping it consistent with tools/benchmark_e2e.py.
+        _sample_area = data_sample.get('area')
+        if _sample_area is not None:
+            _sa_ndim = getattr(_sample_area, 'ndim', -1)
+            if _sa_ndim == 0 or not hasattr(_sample_area, '__len__'):
+                sample_areas: list = [float(_sample_area)]
+            else:
+                sample_areas = [float(a) for a in _sample_area]
+        else:
+            sample_areas = None
+
+        n = 0
+        if bboxes is not None:
+            n = len(bboxes)
+        elif keypoints is not None:
+            n = len(keypoints)
+
+        if n == 0:
+            return []
+
+        # If fewer IDs were supplied than instances, extend with unique values.
+        while len(sample_ids) < n:
+            sample_ids.append(sample_ids[-1] + 1)
+
+        if raw_ann_areas is not None:
+            while len(raw_ann_areas) < n:
+                raw_ann_areas.append(raw_ann_areas[-1])
+        if sample_areas is not None:
+            while len(sample_areas) < n:
+                sample_areas.append(sample_areas[-1])
+
+        anns = []
+        for i in range(n):
+            ann_id = sample_ids[i]
+
+            # bbox in COCO xywh format
+            if bboxes is not None:
+                bbox_xywh = bbox_xyxy2xywh(
+                    bboxes[i:i + 1])[0].tolist()
+            else:
+                bbox_xywh = [0., 0., 1., 1.]
+
+            # area priority:
+            #   1. orig_areas     – set by benchmark_e2e from item['area']
+            #   2. raw_ann_areas  – from raw_ann_info (e.g. COCO mask area)
+            #   3. sample_areas   – from PackPoseInputs meta_key 'area'
+            #                       (e.g. MPII's 0.53×bbox area via test.py)
+            #   4. bbox_scales product – padded area
+            #   5. bbox w×h
+            if orig_areas is not None:
+                area = float(orig_areas[i])
+            elif raw_ann_areas is not None:
+                area = raw_ann_areas[i]
+            elif sample_areas is not None:
+                area = sample_areas[i]
+            elif bbox_scales is not None:
+                area = float(np.prod(bbox_scales[i]))
+            else:
+                area = float(bbox_xywh[2] * bbox_xywh[3])
+
+            # Flatten keypoints to COCO format [x, y, v, x, y, v, ...]
+            kpts_flat = []
+            num_visible = 0
+            if keypoints is not None:
+                kp_xy = keypoints[i]  # (K, 2)
+                if kpts_vis is not None:
+                    kv = kpts_vis[i]  # (K,) or (K, 2)
+                    if kv.ndim > 1:
+                        kv = kv[:, 0]  # first channel = visibility
+                    kv = np.round(kv).clip(0, 1).astype(np.int32)
+                else:
+                    kv = np.ones(len(kp_xy), dtype=np.int32)
+                num_visible = int(np.sum(kv > 0))
+                kpts_flat = np.stack(
+                    [kp_xy[:, 0], kp_xy[:, 1],
+                     kv.astype(np.float32)],
+                    axis=1).flatten().tolist()
+
+            ann = dict(
+                id=ann_id,
+                image_id=img_id,
+                category_id=cat_id,
+                bbox=bbox_xywh,
+                keypoints=kpts_flat,
+                num_keypoints=num_visible,
+                iscrowd=0,
+                area=area,
+            )
+            anns.append(ann)
+
+        return anns
 
     def gt_to_coco_json(self, gt_dicts: Sequence[dict],
                         outfile_prefix: str) -> str:
@@ -350,13 +545,28 @@ class CocoMetric(BaseMetric):
                 annotations.append(annotation)
                 ann_ids.append(ann['id'])
 
+        categories = self.dataset_meta.get('CLASSES')
+        if categories is None:
+            # Synthesize a minimal COCO-style category entry when the dataset
+            # does not supply one (e.g. MPII).
+            kp_names = list(
+                self.dataset_meta.get('keypoint_id2name', {}).values())
+            skeleton = self.dataset_meta.get('skeleton_links', [])
+            categories = [{
+                'id': 1,
+                'name': 'person',
+                'supercategory': 'person',
+                'keypoints': kp_names,
+                'skeleton': [[s + 1, e + 1] for s, e in skeleton],
+            }]
+
         info = dict(
             date_created=str(datetime.datetime.now()),
             description='Coco json file converted by mmpose CocoMetric.')
         coco_json = dict(
             info=info,
             images=image_infos,
-            categories=self.dataset_meta['CLASSES'],
+            categories=categories,
             licenses=None,
             annotations=annotations,
         )
@@ -378,6 +588,37 @@ class CocoMetric(BaseMetric):
 
         # split prediction and gt list
         preds, gts = zip(*results)
+
+        if self.gt_from_samples:
+            # When synthesizing GT from samples, the dataset's metainfo may
+            # describe a different keypoint set than the model produces (e.g.
+            # MPII dataset_meta with 16 keypoints used alongside a COCO model
+            # that outputs 17 keypoints after KeypointConverter).  Detect and
+            # fix the mismatch here so that NMS scoring and JSON serialization
+            # use the correct keypoint count.
+            for p in preds:
+                kpts = p.get('keypoints')
+                if kpts is not None and len(kpts) > 0:
+                    actual_n = kpts.shape[1]  # (N_instances, K, 2)
+                    meta_n = self.dataset_meta.get('num_keypoints', actual_n)
+                    if actual_n != meta_n:
+                        logger.info(
+                            f'gt_from_samples: overriding num_keypoints '
+                            f'{meta_n} → {actual_n} to match predictions.')
+                        self.dataset_meta['num_keypoints'] = actual_n
+                        current_sigmas = np.array(
+                            self.dataset_meta.get('sigmas', []))
+                        if len(current_sigmas) != actual_n:
+                            if actual_n == len(self._COCO_SIGMAS):
+                                new_sigmas = self._COCO_SIGMAS
+                            else:
+                                new_sigmas = np.full(actual_n, 0.025)
+                            logger.info(
+                                f'gt_from_samples: replacing sigmas '
+                                f'(len={len(current_sigmas)}) with '
+                                f'len={actual_n} sigmas.')
+                            self.dataset_meta['sigmas'] = new_sigmas
+                    break
 
         tmp_dir = None
         if self.outfile_prefix is None:
