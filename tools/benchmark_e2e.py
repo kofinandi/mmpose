@@ -221,6 +221,74 @@ def build_evaluator(pose_cfg: Config, dataset_meta: dict) -> Evaluator:
     return Evaluator(metrics)
 
 
+def build_det_evaluator(pose_cfg: Config) -> Evaluator:
+    """COCO bbox AP/AR for the person (human) class only.
+
+    Uses the annotation file referenced by the pose config, so no extra paths
+    are needed.  Restricts evaluation to the images that were actually
+    processed (important when --num-frames is set).
+    """
+    if not HAS_MMDET:
+        raise ImportError(
+            'mmdet is required for --det-metrics. '
+            'Install it with: pip install mmdet')
+
+    from mmdet.evaluation.metrics import CocoMetric as _CocoMetric
+
+    class _SubsetCocoMetric(_CocoMetric):
+        """CocoMetric that evaluates only on the images seen during process().
+
+        Standard CocoMetric uses every image in the annotation file as the
+        denominator for recall.  When only a subset of frames is benchmarked
+        (--num-frames), that would unfairly depress AR.  This subclass tracks
+        which img_ids were actually processed and restricts COCOeval to those.
+        """
+
+        def process(self, data_batch, data_samples):
+            if not hasattr(self, '_seen_img_ids'):
+                self._seen_img_ids: set = set()
+            for ds in data_samples:
+                self._seen_img_ids.add(ds['img_id'])
+            super().process(data_batch, data_samples)
+
+        def compute_metrics(self, results):
+            if getattr(self, '_seen_img_ids', None):
+                self.img_ids = sorted(self._seen_img_ids)
+            out = super().compute_metrics(results)
+            # CocoMetric hardcodes key names using the default proposal_nums
+            # (100, 300, 1000).  Build an explicit rename table so that keys
+            # reflect the actual maxDets values used.  String-replacement is
+            # avoided because '@1000' contains '@100' as a substring.
+            nums = self.proposal_nums  # e.g. [5, 10, 100]
+            ar_renames = {
+                f'bbox_AR@100':    f'bbox_AR@{nums[0]}',
+                f'bbox_AR@300':    f'bbox_AR@{nums[1]}',
+                f'bbox_AR@1000':   f'bbox_AR@{nums[2]}',
+                f'bbox_AR_s@1000': f'bbox_AR_s@{nums[2]}',
+                f'bbox_AR_m@1000': f'bbox_AR_m@{nums[2]}',
+                f'bbox_AR_l@1000': f'bbox_AR_l@{nums[2]}',
+            }
+            return {ar_renames.get(k, k): v for k, v in out.items()}
+
+    ds_cfg = pose_cfg.test_dataloader.dataset
+    ann_file = osp.join(ds_cfg.get('data_root', ''), ds_cfg.ann_file)
+
+    metric = _SubsetCocoMetric(
+        ann_file=ann_file,
+        metric='bbox',
+        classwise=False,
+        prefix='det',
+        proposal_nums=(5, 10, 100),
+        metric_items=[
+            'mAP', 'mAP_50', 'mAP_75', 'mAP_s', 'mAP_m', 'mAP_l',
+            'AR@100', 'AR@300', 'AR@1000',
+            'AR_s@1000', 'AR_m@1000', 'AR_l@1000',
+        ],
+    )
+    metric.dataset_meta = {'classes': ('person',)}
+    return Evaluator([metric])
+
+
 def _make_topdown_data_sample(
     img_id: int,
     bbox_results: list,
@@ -344,6 +412,7 @@ def _mock_detector_producer(
     frame_start_times: dict,
     frame_end_times: dict,
     zero_det_frames: dict,
+    det_predictions: dict,
 ) -> None:
     """Producer: push GT BBoxItems into bbox_queue without running a detector.
 
@@ -377,6 +446,7 @@ def _mock_detector_producer(
                 frame_id, (np.zeros((0, 4), dtype=np.float32),
                             np.zeros(0, dtype=np.float32)))
 
+            det_predictions[frame_id] = (bboxes_xyxy, scores)
             n_bboxes = len(bboxes_xyxy)
 
             if n_bboxes == 0:
@@ -412,6 +482,7 @@ def _detector_producer(
     frame_start_times: dict,
     frame_end_times: dict,
     zero_det_frames: dict,
+    det_predictions: dict,
 ) -> None:
     """Producer: run detector and push BBoxItems into bbox_queue.
 
@@ -468,6 +539,7 @@ def _detector_producer(
                 bboxes_xyxy = bboxes_s[:, :4]
                 scores = np.array([], dtype=np.float32)
 
+            det_predictions[frame_id] = (bboxes_xyxy, scores)
             n_bboxes = len(bboxes_xyxy)
             h, w = img.shape[:2]
 
@@ -637,6 +709,7 @@ def run_topdown(
     pose_cfg: Config,
     log_interval: int = 100,
     gt_bboxes_per_frame: Optional[Dict[int, Tuple[np.ndarray, np.ndarray]]] = None,
+    det_evaluator: Optional[Evaluator] = None,
 ) -> Tuple[dict, dict]:
     """Run topdown async producer/consumer benchmark.
 
@@ -658,13 +731,15 @@ def run_topdown(
     frame_results: dict = {}
     frame_counts: dict = {}
     zero_det_frames: dict = {}
+    det_predictions: dict = {}  # frame_id -> (bboxes_xyxy, scores)
 
     if gt_bboxes_per_frame is not None:
         producer = threading.Thread(
             target=_mock_detector_producer,
             args=(prefetched_images, gt_bboxes_per_frame, det_batch_size,
                   bbox_queue, log_interval,
-                  frame_start_times, frame_end_times, zero_det_frames),
+                  frame_start_times, frame_end_times, zero_det_frames,
+                  det_predictions),
             daemon=True,
         )
     else:
@@ -673,7 +748,7 @@ def run_topdown(
             args=(det_model, prefetched_images, det_batch_size, bbox_thr,
                   nms_thr, det_cat_id, bbox_queue, warmup_batches,
                   log_interval, det_timings, frame_start_times,
-                  frame_end_times, zero_det_frames),
+                  frame_end_times, zero_det_frames, det_predictions),
             daemon=True,
         )
     consumer = threading.Thread(
@@ -711,6 +786,27 @@ def run_topdown(
         evaluator.process(data_samples=[ds], data_batch=None)
 
     quality = evaluator.evaluate(n_images)
+
+    # ── Detection AP/AR metrics (optional) ──────────────────────────────
+    if det_evaluator is not None:
+        for frame_id, (img_id, img) in enumerate(prefetched_images):
+            h, w = img.shape[:2]
+            bb, sc = det_predictions.get(
+                frame_id,
+                (np.zeros((0, 4), dtype=np.float32),
+                 np.zeros(0, dtype=np.float32)))
+            det_ds = dict(
+                img_id=img_id,
+                ori_shape=(h, w),
+                pred_instances=dict(
+                    bboxes=torch.from_numpy(bb),
+                    scores=torch.from_numpy(sc),
+                    labels=torch.zeros(len(bb), dtype=torch.long),
+                ),
+            )
+            det_evaluator.process(data_samples=[det_ds], data_batch=None)
+        det_quality = det_evaluator.evaluate(n_images)
+        quality = {**quality, **det_quality}
 
     # ── Performance metrics ──────────────────────────────────────────────
     timed_det_time = sum(t for t, _ in det_timings)
@@ -778,12 +874,19 @@ def run_topdown(
 
 def _print_results(quality: dict, perf: dict, mode: str) -> None:
     sep = '=' * 62
+    pose_metrics = {k: v for k, v in quality.items() if not k.startswith('det/')}
+    det_metrics = {k: v for k, v in quality.items() if k.startswith('det/')}
+
     print(f'\n{sep}')
     print(f'  Benchmark results  ({mode})')
     print(sep)
     print('  Quality metrics:')
-    for k, v in sorted(quality.items()):
+    for k, v in sorted(pose_metrics.items()):
         print(f'    {k}: {v:.4f}')
+    if det_metrics:
+        print('  Detector metrics:')
+        for k, v in sorted(det_metrics.items()):
+            print(f'    {k}: {v:.4f}')
     print('  Performance metrics:')
     for k, v in sorted(perf.items()):
         unit = 'ms' if 'latency' in k else 'fps/s'
@@ -890,6 +993,9 @@ def _parse_args():
                    help='Model group name (required with --results-file)')
     p.add_argument('--model-variant', default=None,
                    help='Model variant name (required with --results-file)')
+    p.add_argument('--det-metrics', action='store_true',
+                   help='Compute COCO-style detection AP/AR for the person '
+                        'class (topdown mode only).')
     p.add_argument('--log-interval', type=int, default=100,
                    help='Print a progress line every N batches (default: 100)')
     p.add_argument(
@@ -923,6 +1029,10 @@ def main():
         raise ValueError(
             '--mock-detector and --det-config/--det-checkpoint are mutually '
             'exclusive.')
+    if getattr(args, 'det_metrics', False) and not is_topdown:
+        raise ValueError(
+            '--det-metrics requires topdown mode '
+            '(pass --det-config/--det-checkpoint or --mock-detector).')
 
     # ── Topdown mode ───────────────────────────────────────────────────────
     if is_topdown:
@@ -963,6 +1073,10 @@ def main():
             args.pose_config, args.pose_checkpoint, device=args.device)
         evaluator = build_evaluator(pose_cfg, kp_model.dataset_meta)
 
+        det_evaluator = None
+        if getattr(args, 'det_metrics', False):
+            det_evaluator = build_det_evaluator(pose_cfg)
+
         prefetched = prefetch_images(img_list)
 
         quality, perf = run_topdown(
@@ -981,6 +1095,7 @@ def main():
             pose_cfg=pose_cfg,
             log_interval=args.log_interval,
             gt_bboxes_per_frame=gt_bboxes_per_frame,
+            det_evaluator=det_evaluator,
         )
         mode_suffix = 'mock-detector' if args.mock_detector else args.queue_strategy
         mode = f'topdown (strategy={mode_suffix})'
