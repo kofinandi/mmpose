@@ -261,10 +261,16 @@ class CocoMetric(BaseMetric):
                 bbox_scores = data_sample['gt_instances']['bbox_scores']
             pred['bbox_scores'] = bbox_scores
 
-            # get area information
+            # Per-prediction area (for small/medium/large buckets).  Use GT
+            # bbox_scales only when they align 1:1 with predictions (mock-
+            # detector mode); otherwise derive from prediction bboxes.
+            n_pred = len(keypoints)
             if 'bbox_scales' in data_sample['gt_instances']:
-                pred['areas'] = np.prod(
-                    data_sample['gt_instances']['bbox_scales'], axis=1)
+                gt_scales = data_sample['gt_instances']['bbox_scales']
+                if len(gt_scales) == n_pred:
+                    pred['areas'] = np.prod(gt_scales, axis=1)
+            if 'areas' not in pred and 'bbox' in pred:
+                pred['areas'] = pred['bbox'][:, 2] * pred['bbox'][:, 3]
 
             # parse gt
             gt = dict()

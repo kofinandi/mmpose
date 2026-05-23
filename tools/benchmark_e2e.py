@@ -117,6 +117,33 @@ def build_unique_image_list(
     return list(seen.items())
 
 
+def _evaluator_needs_gt_from_samples(pose_cfg: Config) -> bool:
+    """Return True when the pose evaluator synthesizes GT from samples."""
+    ev_cfg = pose_cfg.test_evaluator
+    if isinstance(ev_cfg, dict):
+        ev_cfg = [ev_cfg]
+    return any(m.get('gt_from_samples', False) for m in ev_cfg)
+
+
+def build_gt_instances_per_frame(
+    pose_cfg: Config,
+    img_list: List[Tuple[int, str]],
+) -> Dict[int, list]:
+    """Map frame index to per-instance GT dicts for metric evaluation.
+
+    Used in real-detector mode when ``gt_from_samples=True``: predictions
+    come from the detector, but CocoMetric still needs GT keypoints/area
+    attached to each sample.
+    """
+    gt_data = build_gt_bbox_image_list(pose_cfg, num_frames=len(img_list))
+    gt_by_img_id = {iid: insts for iid, _, _, _, insts in gt_data}
+    return {
+        fid: gt_by_img_id[img_id]
+        for fid, (img_id, _) in enumerate(img_list)
+        if img_id in gt_by_img_id
+    }
+
+
 def build_gt_bbox_image_list(
     pose_cfg: Config,
     num_frames: Optional[int] = None,
@@ -193,6 +220,7 @@ def build_gt_bbox_image_list(
                 'keypoints': item.get('keypoints'),
                 'keypoints_visible': item.get('keypoints_visible'),
                 'bbox_scale': item.get('bbox_scale'),
+                'bbox': item.get('bbox'),
                 'orig_area': orig_area,
                 'category_id': item.get('category_id', 1),
                 'id': item.get('id'),
@@ -321,18 +349,24 @@ def build_det_evaluator(pose_cfg: Config) -> Evaluator:
     ds_cfg = pose_cfg.test_dataloader.dataset
     ann_file = osp.join(ds_cfg.get('data_root', ''), ds_cfg.ann_file)
 
-    metric = _SubsetCocoMetric(
-        ann_file=ann_file,
-        metric='bbox',
-        classwise=False,
-        prefix='det',
-        proposal_nums=(5, 10, 100),
-        metric_items=[
-            'mAP', 'mAP_50', 'mAP_75', 'mAP_s', 'mAP_m', 'mAP_l',
-            'AR@100', 'AR@300', 'AR@1000',
-            'AR_s@1000', 'AR_m@1000', 'AR_l@1000',
-        ],
-    )
+    try:
+        metric = _SubsetCocoMetric(
+            ann_file=ann_file,
+            metric='bbox',
+            classwise=False,
+            prefix='det',
+            proposal_nums=(5, 10, 100),
+            metric_items=[
+                'mAP', 'mAP_50', 'mAP_75', 'mAP_s', 'mAP_m', 'mAP_l',
+                'AR@100', 'AR@300', 'AR@1000',
+                'AR_s@1000', 'AR_m@1000', 'AR_l@1000',
+            ],
+        )
+    except (AssertionError, Exception) as e:
+        print(
+            f'WARNING: --det-metrics skipped — annotation file '
+            f'"{ann_file}" is not in COCO format ({type(e).__name__}: {e})')
+        return None
     metric.dataset_meta = {'classes': ('person',)}
     return Evaluator([metric])
 
@@ -385,6 +419,8 @@ def _make_topdown_data_sample(
         gt_inst = InstanceData()
         gt_inst.bbox_scores = np.zeros(0, dtype=np.float32)
         ds.gt_instances = gt_inst
+        if gt_instances_data:
+            _attach_gt_instances(ds, gt_instances_data, img_id)
         return ds
 
     # Inject detector scores into each result's gt_instances so that
@@ -393,6 +429,10 @@ def _make_topdown_data_sample(
         res.gt_instances.bbox_scores = np.array([score], dtype=np.float32)
 
     merged = merge_data_samples(bbox_results)
+
+    # Detector scores belong on pred_instances; gt_instances may be replaced
+    # below with dataset GT that has a different instance count.
+    merged.pred_instances.bbox_scores = np.array(det_scores, dtype=np.float32)
 
     # Use a list of unique synthetic IDs to trigger the bottomup code path
     # inside CocoMetric._sort_and_unique_bboxes (which early-returns when
@@ -428,6 +468,8 @@ def _attach_gt_instances(
         img_id: Image identifier used as a fallback for generating unique
             annotation ids when the GT dicts don't carry an ``id`` field.
     """
+    from mmengine.structures import InstanceData
+
     n = len(gt_instances_data)
     if n == 0:
         return
@@ -438,7 +480,11 @@ def _attach_gt_instances(
             return None
         return np.concatenate([np.atleast_2d(a) for a in arrays], axis=0)
 
-    gt_inst = data_sample.gt_instances
+    # Replace gt_instances entirely.  After merge_data_samples the existing
+    # gt_instances has one entry per *detection*; GT may have a different
+    # count (real-detector mode), so we must not update it in-place.
+    gt_inst = InstanceData()
+    data_sample.gt_instances = gt_inst
 
     # keypoints: each item is (1, K, 2) → stack to (N, K, 2)
     kpts = _stack('keypoints')
@@ -454,6 +500,13 @@ def _attach_gt_instances(
     bs = _stack('bbox_scale')
     if bs is not None:
         gt_inst.bbox_scales = bs.astype(np.float32)
+
+    # bbox: each item is (1, 4) xyxy → (N, 4).  Required when detector
+    # bboxes differ from GT (real-detector mode); mock mode gets these from
+    # the inference pipeline via merge_data_samples.
+    bb = _stack('bbox')
+    if bb is not None:
+        gt_inst.bboxes = bb.astype(np.float32)
 
     # Original per-instance annotation area (mask-based for COCO, heuristic
     # for MPII).  Store as a (N,) float array so the metric can use the
@@ -1213,6 +1266,10 @@ def main():
 
             print('Building image list...')
             img_list = build_unique_image_list(pose_cfg, args.num_frames)
+            if _evaluator_needs_gt_from_samples(pose_cfg):
+                print('Building GT instance lookup for evaluation...')
+                gt_instances_per_frame = build_gt_instances_per_frame(
+                    pose_cfg, img_list)
 
         kp_model = init_model(
             args.pose_config, args.pose_checkpoint, device=args.device)
