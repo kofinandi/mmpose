@@ -36,13 +36,13 @@ import mmpose.datasets       # noqa: F401
 import mmpose.evaluation     # noqa: F401
 import mmpose.models         # noqa: F401
 from mmengine.registry import DATASETS, METRICS, TRANSFORMS
+from mmpose.apis.det_inference import inference_det_model, init_det_model
 from mmpose.apis import init_model
 from mmpose.evaluation.functional import nms
 from mmpose.structures import PoseDataSample, merge_data_samples
-from mmpose.utils import adapt_mmdet_pipeline
 
 try:
-    from mmdet.apis import inference_detector, init_detector
+    import mmdet  # noqa: F401
     HAS_MMDET = True
 except (ImportError, ModuleNotFoundError):
     HAS_MMDET = False
@@ -685,7 +685,7 @@ def _detector_producer(
         imgs = [img for _, img in batch]
         with torch.no_grad():
             with _CudaTimer() as timer:
-                det_results = inference_detector(detector, imgs)
+                det_results = inference_det_model(detector, imgs)
 
         wall_after_det = time.perf_counter()
 
@@ -1260,9 +1260,8 @@ def main():
             print(f'  Detector : {args.det_config}')
             print(f'  KP model : {args.pose_config}\n')
 
-            detector = init_detector(
+            detector = init_det_model(
                 args.det_config, args.det_checkpoint, device=args.device)
-            detector.cfg = adapt_mmdet_pipeline(detector.cfg)
 
             print('Building image list...')
             img_list = build_unique_image_list(pose_cfg, args.num_frames)

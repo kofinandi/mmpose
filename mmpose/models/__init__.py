@@ -4,6 +4,7 @@ from .builder import (BACKBONES, HEADS, LOSSES, NECKS, build_backbone,
                       build_head, build_loss, build_neck, build_pose_estimator,
                       build_posenet)
 from .data_preprocessors import *  # noqa
+from .detectors import *  # noqa
 from .distillers import *  # noqa
 from .heads import *  # noqa
 from .losses import *  # noqa
