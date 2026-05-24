@@ -18,7 +18,15 @@ try:
 except (ImportError, ModuleNotFoundError):
     HAS_MMDET = False
 
-ULTRALYTICS_DETECTOR_TYPE = 'UltralyticsYOLODetector'
+CUSTOM_DETECTOR_TYPES = frozenset({
+    'UltralyticsYOLODetector',
+    'RFDETRDetector',
+})
+
+_CHECKPOINT_FIELDS = {
+    'UltralyticsYOLODetector': 'weights',
+    'RFDETRDetector': 'pretrain_weights',
+}
 
 
 def init_det_model(
@@ -28,9 +36,9 @@ def init_det_model(
 ) -> nn.Module:
     """Initialize a detector from a config file.
 
-    For ``UltralyticsYOLODetector`` configs, builds the wrapper directly and
-    loads Ultralytics ``.pt`` weights.  Otherwise delegates to MMDetection's
-    ``init_detector``.
+    For custom detector configs (``UltralyticsYOLODetector``,
+    ``RFDETRDetector``), builds the wrapper directly.  Otherwise delegates
+    to MMDetection's ``init_detector``.
     """
     if not HAS_MMDET:
         raise ImportError(
@@ -49,9 +57,11 @@ def init_det_model(
     # Ensure custom detector modules are registered.
     import mmpose.models.detectors  # noqa: F401
 
-    if cfg.model.get('type') == ULTRALYTICS_DETECTOR_TYPE:
+    det_type = cfg.model.get('type')
+    if det_type in CUSTOM_DETECTOR_TYPES:
         if checkpoint is not None:
-            cfg.model.weights = checkpoint
+            weights_field = _CHECKPOINT_FIELDS[det_type]
+            cfg.model[weights_field] = checkpoint
         cfg.model.device = device
         model = MODELS.build(cfg.model)
         model.cfg = cfg
