@@ -35,10 +35,14 @@ from mmengine.registry import init_default_scope
 import mmpose.datasets       # noqa: F401
 import mmpose.evaluation     # noqa: F401
 import mmpose.models         # noqa: F401
-from mmengine.registry import DATASETS, METRICS, TRANSFORMS
+from mmengine.registry import DATASETS, METRICS
 from mmpose.apis.det_inference import inference_det_model, init_det_model
 from mmpose.apis import init_model
 from mmpose.evaluation.functional import nms
+from mmpose.evaluation.functional.pose_gt_to_coco_det import (
+    load_pose_gt_per_image,
+    resolve_det_ann_file,
+)
 from mmpose.structures import PoseDataSample, merge_data_samples
 
 try:
@@ -162,77 +166,15 @@ def build_gt_bbox_image_list(
       ``KeypointConverter``, it is applied to each raw item so keypoints
       arrive in the target order (e.g. COCO) for metric evaluation.
     """
-    _init_scope(pose_cfg)
-    ds_cfg = pose_cfg.test_dataloader.dataset.to_dict()
-    ds_cfg['pipeline'] = []
-    dataset = DATASETS.build(ds_cfg)
-
-    # Look for a KeypointConverter step in the test pipeline.  Apply it
-    # to raw items so GT keypoints arrive in the converter's target order.
-    kp_converter = None
-    for step in pose_cfg.test_dataloader.dataset.pipeline:
-        if isinstance(step, dict) and step.get('type') == 'KeypointConverter':
-            kp_converter = TRANSFORMS.build(step)
-            break
-
-    # Group all instances by img_id while preserving insertion order.
-    img_paths: dict = {}
-    img_bboxes: dict = {}
-    img_gt_instances: dict = {}
-
-    for idx in range(len(dataset)):
-        item = dataset[idx]
-        img_id = item['img_id']
-        if img_id not in img_paths:
-            img_paths[img_id] = item['img_path']
-            img_bboxes[img_id] = []
-            img_gt_instances[img_id] = []
-            if num_frames is not None and len(img_paths) > num_frames:
-                # Drop the last entry we just added – we hit the cap.
-                del img_paths[img_id]
-                del img_bboxes[img_id]
-                del img_gt_instances[img_id]
-                break
-        if img_id in img_bboxes:
-            # 'bbox' is already xyxy, shape (1, 4)
-            img_bboxes[img_id].append(item['bbox'].reshape(4))
-
-            # Apply KeypointConverter so GT keypoints match the model output
-            if kp_converter is not None:
-                item = kp_converter(item)
-
-            # Prefer the original annotation area (mask-based for COCO,
-            # or heuristic for MPII).  Using the pipeline-derived bbox_scale
-            # area would inflate OKS because bbox_scale includes padding.
-            raw_ann = item.get('raw_ann_info')
-            if raw_ann is not None and isinstance(raw_ann, dict):
-                orig_area = raw_ann.get('area', None)
-            elif raw_ann is not None and isinstance(raw_ann, list) and raw_ann:
-                orig_area = raw_ann[0].get('area', None)
-            else:
-                orig_area = None
-            if orig_area is None:
-                # MPII and similar: use the per-instance area already computed
-                _a = item.get('area')
-                orig_area = float(_a.flat[0]) if _a is not None else None
-
-            img_gt_instances[img_id].append({
-                'keypoints': item.get('keypoints'),
-                'keypoints_visible': item.get('keypoints_visible'),
-                'bbox_scale': item.get('bbox_scale'),
-                'bbox': item.get('bbox'),
-                'orig_area': orig_area,
-                'category_id': item.get('category_id', 1),
-                'id': item.get('id'),
-            })
-
     result = []
-    for img_id, img_path in img_paths.items():
-        boxes = np.stack(img_bboxes[img_id], axis=0).astype(np.float32)
+    for img_id, img_path, gt_insts in load_pose_gt_per_image(
+            pose_cfg, num_frames):
+        boxes = np.stack(
+            [g['bbox'].reshape(4) for g in gt_insts],
+            axis=0,
+        ).astype(np.float32)
         scores = np.ones(len(boxes), dtype=np.float32)
-        result.append((img_id, img_path, boxes, scores,
-                        img_gt_instances[img_id]))
-
+        result.append((img_id, img_path, boxes, scores, gt_insts))
     return result
 
 
@@ -297,12 +239,16 @@ def build_evaluator(pose_cfg: Config, dataset_meta: dict) -> Evaluator:
     return Evaluator(metrics)
 
 
-def build_det_evaluator(pose_cfg: Config) -> Evaluator:
+def build_det_evaluator(
+    pose_cfg: Config,
+    num_frames: Optional[int] = None,
+) -> Evaluator:
     """COCO bbox AP/AR for the person (human) class only.
 
-    Uses the annotation file referenced by the pose config, so no extra paths
-    are needed.  Restricts evaluation to the images that were actually
-    processed (important when --num-frames is set).
+    Uses the annotation file referenced by the pose config when it is already
+    in COCO bbox-detection format; otherwise converts pose-dataset GT on the
+    fly.  Restricts evaluation to the images that were actually processed
+    (important when --num-frames is set).
     """
     if not HAS_MMDET:
         raise ImportError(
@@ -346,27 +292,20 @@ def build_det_evaluator(pose_cfg: Config) -> Evaluator:
             }
             return {ar_renames.get(k, k): v for k, v in out.items()}
 
-    ds_cfg = pose_cfg.test_dataloader.dataset
-    ann_file = osp.join(ds_cfg.get('data_root', ''), ds_cfg.ann_file)
+    ann_file = resolve_det_ann_file(pose_cfg, num_frames=num_frames)
 
-    try:
-        metric = _SubsetCocoMetric(
-            ann_file=ann_file,
-            metric='bbox',
-            classwise=False,
-            prefix='det',
-            proposal_nums=(5, 10, 100),
-            metric_items=[
-                'mAP', 'mAP_50', 'mAP_75', 'mAP_s', 'mAP_m', 'mAP_l',
-                'AR@100', 'AR@300', 'AR@1000',
-                'AR_s@1000', 'AR_m@1000', 'AR_l@1000',
-            ],
-        )
-    except (AssertionError, Exception) as e:
-        print(
-            f'WARNING: --det-metrics skipped — annotation file '
-            f'"{ann_file}" is not in COCO format ({type(e).__name__}: {e})')
-        return None
+    metric = _SubsetCocoMetric(
+        ann_file=ann_file,
+        metric='bbox',
+        classwise=False,
+        prefix='det',
+        proposal_nums=(5, 10, 100),
+        metric_items=[
+            'mAP', 'mAP_50', 'mAP_75', 'mAP_s', 'mAP_m', 'mAP_l',
+            'AR@100', 'AR@300', 'AR@1000',
+            'AR_s@1000', 'AR_m@1000', 'AR_l@1000',
+        ],
+    )
     metric.dataset_meta = {'classes': ('person',)}
     return Evaluator([metric])
 
@@ -1276,7 +1215,8 @@ def main():
 
         det_evaluator = None
         if getattr(args, 'det_metrics', False):
-            det_evaluator = build_det_evaluator(pose_cfg)
+            det_evaluator = build_det_evaluator(
+                pose_cfg, num_frames=args.num_frames)
 
         prefetched = prefetch_images(img_list)
 

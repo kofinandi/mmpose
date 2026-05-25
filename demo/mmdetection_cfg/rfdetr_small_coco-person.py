@@ -8,4 +8,5 @@ model = dict(
     pretrain_weights='rf-detr-small.pth',
     conf_thr=0.05,
     model_cache_dir='data/models',
+    inference_batch_size=32,
 )

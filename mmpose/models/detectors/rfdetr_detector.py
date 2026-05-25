@@ -118,7 +118,10 @@ class RFDETRDetector(nn.Module):
                  pretrain_weights: str = 'rf-detr-nano.pth',
                  conf_thr: float = 0.05,
                  device: str = 'cuda:0',
-                 model_cache_dir: str = 'data/models') -> None:
+                 model_cache_dir: str = 'data/models',
+                 optimize_for_inference: bool = True,
+                 inference_batch_size: int = 32,
+                 compile: bool = True) -> None:
         super().__init__()
         _configure_model_cache(model_cache_dir)
         rfdetr = _import_rfdetr()
@@ -127,13 +130,39 @@ class RFDETRDetector(nn.Module):
         self.conf_thr = conf_thr
         self._device = device
         self.model_cache_dir = model_cache_dir
+        self.inference_batch_size = inference_batch_size
         # Keep RF-DETR off the nn.Module tree.  RFDETR.train() starts
         # fine-tuning, so PyTorch's eval()/train() would conflict.
         object.__setattr__(
             self, '_rfdetr',
             _load_rfdetr_model(rfdetr, model_class, pretrain_weights, device))
+        if optimize_for_inference:
+            self._rfdetr.optimize_for_inference(
+                compile=compile,
+                batch_size=inference_batch_size,
+            )
         self.cfg = None
         self.dataset_meta = {'classes': tuple(self._rfdetr.class_names)}
+
+    def _pad_batch_for_inference(
+        self,
+        rgb_imgs: List[np.ndarray],
+    ) -> tuple[List[np.ndarray], int]:
+        """Pad a batch to ``inference_batch_size`` when JIT-compiled."""
+        n = len(rgb_imgs)
+        rfdetr = self._rfdetr
+        if (not rfdetr._is_optimized_for_inference
+                or not rfdetr._optimized_has_been_compiled):
+            return rgb_imgs, n
+        target = self.inference_batch_size
+        if n == target:
+            return rgb_imgs, n
+        if n > target:
+            raise ValueError(
+                f'Batch size {n} exceeds inference_batch_size={target}. '
+                'Increase inference_batch_size in the detector config.')
+        pad = target - n
+        return rgb_imgs + [rgb_imgs[-1]] * pad, n
 
     def predict_imgs(
         self,
@@ -144,6 +173,7 @@ class RFDETRDetector(nn.Module):
             return []
 
         rgb_imgs = [img[..., ::-1].copy() for img in imgs]
+        rgb_imgs, n_real = self._pad_batch_for_inference(rgb_imgs)
         detections = self._rfdetr.predict(
             rgb_imgs,
             threshold=self.conf_thr,
@@ -151,6 +181,7 @@ class RFDETRDetector(nn.Module):
         )
         if not isinstance(detections, list):
             detections = [detections]
+        detections = detections[:n_real]
 
         return [
             _detections_to_data_sample(img, det)
