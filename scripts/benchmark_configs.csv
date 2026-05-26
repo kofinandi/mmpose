@@ -38,9 +38,6 @@ configs/body_2d_keypoint/simcc/coco/simcc_res50_8xb64-210e_coco-256x192.py,https
 configs/body_2d_keypoint/simcc/coco/simcc_res50_8xb32-140e_coco-384x288.py,https://download.openmmlab.com/mmpose/v1/body_2d_keypoint/simcc/coco/simcc_res50_8xb32-140e_coco-384x288-45c3ba34_20220913.pth,SimCC,resnet50-li
 configs/body_2d_keypoint/simcc/coco/simcc_vipnas-mbv3_8xb64-210e_coco-256x192.py,https://download.openmmlab.com/mmpose/v1/body_2d_keypoint/simcc/coco/simcc_vipnas-mbv3_8xb64-210e_coco-256x192-719f3489_20220922.pth,SimCC,vipnas
 configs/body_2d_keypoint/simcc/coco/simcc_mobilenetv2_wo-deconv-8xb64-210e_coco-256x192.py,https://download.openmmlab.com/mmpose/v1/body_2d_keypoint/simcc/coco/simcc_mobilenetv2_wo-deconv-8xb64-210e_coco-256x192-4b0703bb_20221010.pth,SimCC,mobilenetv2
-configs/body_2d_keypoint/petr/coco/petr_r50_16x2_100e_coco.py,data/models/petr_r50_16x2_100e_coco.pth,PETR,resnet50
-configs/body_2d_keypoint/petr/coco/petr_r101_16x2_100e_coco.py,data/models/petr_r101_16x2_100e_coco.pth,PETR,resnet101
-configs/body_2d_keypoint/petr/coco/petr_swin-l-p4-w7_16x1_100e_coco.py,data/models/petr_swin-l-p4-w7_16x1_100e_coco.pth,PETR,swin-l
 configs/body_2d_keypoint/rtmpose/coco/rtmpose-t_8xb256-420e_coco-256x192.py,https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/rtmpose-tiny_simcc-coco_pt-aic-coco_420e-256x192-e613ba3f_20230127.pth,RTMPose,tiny
 configs/body_2d_keypoint/rtmpose/coco/rtmpose-s_8xb256-420e_coco-256x192.py,https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/rtmpose-s_simcc-coco_pt-aic-coco_420e-256x192-8edcf0d7_20230127.pth,RTMPose,small
 configs/body_2d_keypoint/rtmpose/coco/rtmpose-m_8xb256-420e_coco-256x192.py,https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/rtmpose-m_simcc-coco_pt-aic-coco_420e-256x192-d8dd5ca4_20230127.pth,RTMPose,medium

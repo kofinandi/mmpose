@@ -92,9 +92,12 @@ def init_model(config: Union[str, Path, Config],
                         f'but got {type(config)}')
     if cfg_options is not None:
         config.merge_from_dict(cfg_options)
-    elif 'init_cfg' in config.model.backbone:
+    backbone = config.model.get('backbone', None)
+    if backbone is not None and 'init_cfg' in backbone:
         config.model.backbone.init_cfg = None
-    config.model.train_cfg = None
+    # Drop train_cfg so inference builds don't pass it to wrappers
+    # (e.g. PETRPoseEstimator) that only embed it in nested configs.
+    config.model.pop('train_cfg', None)
 
     # register all modules in mmpose into the registries
     scope = config.get('default_scope', 'mmpose')
