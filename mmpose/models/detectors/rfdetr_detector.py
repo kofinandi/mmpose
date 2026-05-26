@@ -146,8 +146,8 @@ class RFDETRDetector(nn.Module):
 
     def _pad_batch_for_inference(
         self,
-        rgb_imgs: List[np.ndarray],
-    ) -> tuple[List[np.ndarray], int]:
+        rgb_imgs,
+    ):
         """Pad a batch to ``inference_batch_size`` when JIT-compiled."""
         n = len(rgb_imgs)
         rfdetr = self._rfdetr

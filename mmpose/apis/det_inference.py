@@ -8,7 +8,10 @@ import torch.nn as nn
 from mmengine.config import Config
 from mmengine.registry import init_default_scope
 
+from mmpose.compat.transformers_v5 import install_transformers_v5_shims
 from mmpose.utils import adapt_mmdet_pipeline
+
+install_transformers_v5_shims()
 
 try:
     from mmdet.apis import inference_detector, init_detector

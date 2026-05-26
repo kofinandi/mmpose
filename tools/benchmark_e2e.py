@@ -11,6 +11,10 @@ Performance metrics cover FPS and per-frame/per-location latency at
 whole-pipeline and per-stage granularity.
 """
 
+from mmpose.compat.transformers_v5 import install_transformers_v5_shims
+
+install_transformers_v5_shims()
+
 import argparse
 import collections
 import json
