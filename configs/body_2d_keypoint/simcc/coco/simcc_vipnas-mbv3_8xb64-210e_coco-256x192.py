@@ -101,8 +101,8 @@ val_dataloader = dict(
         data_root=data_root,
         data_mode=data_mode,
         ann_file='annotations/person_keypoints_val2017.json',
-        bbox_file=data_root + 'person_detection_results/'
-        'COCO_val2017_detections_AP_H_56_person.json',
+        # bbox_file=data_root + 'person_detection_results/'
+        # 'COCO_val2017_detections_AP_H_56_person.json',
         data_prefix=dict(img='val2017/'),
         test_mode=True,
         pipeline=val_pipeline,
