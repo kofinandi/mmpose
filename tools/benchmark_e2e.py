@@ -43,6 +43,10 @@ from mmengine.registry import DATASETS, METRICS
 from mmpose.apis.det_inference import inference_det_model, init_det_model
 from mmpose.apis import init_model
 from mmpose.evaluation.functional import nms
+from mmpose.evaluation.benchmark_datasets import (
+    BENCHMARK_TEST_DATASET_NAMES,
+    apply_benchmark_test_dataset,
+)
 from mmpose.evaluation.functional.pose_gt_to_coco_det import (
     load_pose_gt_per_image,
     resolve_det_ann_file,
@@ -1044,6 +1048,7 @@ def _save_out(quality: dict, perf: dict, mode: str, args) -> None:
                 osp.abspath(args.det_checkpoint)
                 if args.det_checkpoint else None),
         },
+        'test_dataset': args.test_dataset,
         'timestamp': datetime.now().isoformat(timespec='seconds'),
     }
     out_dir = osp.dirname(osp.abspath(args.out))
@@ -1068,6 +1073,7 @@ def _append_to_results_file(quality: dict, perf: dict, args) -> None:
         'timestamp': datetime.now().isoformat(timespec='seconds'),
         'config': osp.abspath(args.pose_config),
         'checkpoint': osp.abspath(args.pose_checkpoint),
+        'test_dataset': args.test_dataset,
         'metrics': metrics,
     }
     data.setdefault(args.model_name, {}).setdefault(
@@ -1137,6 +1143,10 @@ def _parse_args():
     p.add_argument(
         '--cfg-options', nargs='+', action=DictAction, default={},
         help='Override config options, e.g. model.backbone.depth=18')
+    p.add_argument(
+        '--test-dataset', default='coco',
+        choices=list(BENCHMARK_TEST_DATASET_NAMES),
+        help='Override test set and metric (default: use config as-is)')
     return p.parse_args()
 
 
@@ -1149,6 +1159,7 @@ def main():
     pose_cfg = Config.fromfile(args.pose_config)
     if args.cfg_options:
         pose_cfg.merge_from_dict(args.cfg_options)
+    apply_benchmark_test_dataset(pose_cfg, args.test_dataset)
 
     _init_scope(pose_cfg)
     MMLogger.get_current_instance()  # ensure logger is initialised

@@ -6,8 +6,9 @@ set -uo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CSV="${ROOT_DIR}/scripts/benchmark_configs_e2e.csv"
-LOG_DIR="${LOG_DIR:-${ROOT_DIR}/benchmark_logs_e2e}"
-RESULTS_FILE="${RESULTS_FILE:-${ROOT_DIR}/coco_benchmark_e2e.json}"
+TEST_DATASET="${TEST_DATASET:-coco}"
+LOG_DIR="${LOG_DIR:-${ROOT_DIR}/benchmark_logs_e2e_${TEST_DATASET}}"
+RESULTS_FILE="${RESULTS_FILE:-${ROOT_DIR}/${TEST_DATASET}_benchmark_e2e.json}"
 DEVICE="${DEVICE:-cuda:7}"
 KP_BATCH_SIZE="${KP_BATCH_SIZE:-32}"
 
@@ -29,6 +30,7 @@ run_benchmark() {
     TOTAL=$((TOTAL + 1))
     echo "============================================================"
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting: ${name} / ${variant}"
+    echo "  Test set:   ${TEST_DATASET}"
     echo "  Config:     ${config}"
     echo "  Checkpoint: ${checkpoint}"
     echo "  Log file:   ${log_file}"
@@ -37,6 +39,7 @@ run_benchmark() {
     if python tools/benchmark_e2e.py \
         "$config" \
         "$checkpoint" \
+        --test-dataset "$TEST_DATASET" \
         --kp-batch-size "$KP_BATCH_SIZE" \
         --device "$DEVICE" \
         --results-file "$RESULTS_FILE" \
@@ -76,6 +79,7 @@ done < <(tail -n +2 "$CSV")
 echo ""
 echo "============================================================"
 echo "Benchmark sweep complete"
+echo "  Test set:    ${TEST_DATASET}"
 echo "  Total runs:  ${TOTAL}"
 echo "  Passed:      ${PASSED}"
 echo "  Failed:      $((TOTAL - PASSED))"

@@ -1,13 +1,14 @@
 #!/bin/bash
-# Run end-to-end pose benchmarks for every model in benchmark_configs.csv,
+# Run top-down pose benchmarks for every model in benchmark_configs_topdown.csv,
 # using RF-DETR and RTMDet as person detectors.
 
 set -uo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CSV="${ROOT_DIR}/scripts/benchmark_configs.csv"
-LOG_DIR="${LOG_DIR:-${ROOT_DIR}/benchmark_logs}"
-RESULTS_FILE="${RESULTS_FILE:-${ROOT_DIR}/coco_benchmark.json}"
+CSV="${CSV:-${ROOT_DIR}/scripts/benchmark_configs_topdown.csv}"
+TEST_DATASET="${TEST_DATASET:-coco}"
+LOG_DIR="${LOG_DIR:-${ROOT_DIR}/benchmark_logs_${TEST_DATASET}}"
+RESULTS_FILE="${RESULTS_FILE:-${ROOT_DIR}/${TEST_DATASET}_benchmark.json}"
 DEVICE="${DEVICE:-cuda:7}"
 
 RFDET_CONFIG="demo/mmdetection_cfg/rfdetr_medium_coco-person.py"
@@ -38,6 +39,7 @@ run_benchmark() {
     TOTAL=$((TOTAL + 1))
     echo "============================================================"
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting: ${name} / ${full_variant}"
+    echo "  Test set:   ${TEST_DATASET}"
     echo "  Config:     ${config}"
     echo "  Detector:   ${det_config}"
     echo "  Log file:   ${log_file}"
@@ -46,6 +48,7 @@ run_benchmark() {
     if python tools/benchmark_e2e.py \
         "$config" \
         "$checkpoint" \
+        --test-dataset "$TEST_DATASET" \
         --det-config "$det_config" \
         --det-checkpoint "$det_checkpoint" \
         --det-batch-size 32 \
@@ -94,6 +97,7 @@ done < <(tail -n +2 "$CSV")
 echo ""
 echo "============================================================"
 echo "Benchmark sweep complete"
+echo "  Test set:    ${TEST_DATASET}"
 echo "  Total runs:  ${TOTAL}"
 echo "  Passed:      ${PASSED}"
 echo "  Failed:      $((TOTAL - PASSED))"
