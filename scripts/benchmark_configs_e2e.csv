@@ -6,3 +6,8 @@ configs/body_2d_keypoint/yoloxpose/coco/yoloxpose_s_8xb32-300e_coco-640.py,https
 configs/body_2d_keypoint/yoloxpose/coco/yoloxpose_m_8xb32-300e_coco-640.py,https://download.openmmlab.com/mmpose/v1/body_2d_keypoint/yolox_pose/yoloxpose_m_8xb32-300e_coco-640-84e9a538_20230829.pth,YOLO-Pose,medium
 configs/body_2d_keypoint/yoloxpose/coco/yoloxpose_l_8xb32-300e_coco-640.py,https://download.openmmlab.com/mmpose/v1/body_2d_keypoint/yolox_pose/yoloxpose_l_8xb32-300e_coco-640-de0f8dee_20230829.pth,YOLO-Pose,large
 configs/body_2d_keypoint/yoloxpose/coco/yoloxpose_tiny_4xb64-300e_coco-416.py,https://download.openmmlab.com/mmpose/v1/body_2d_keypoint/yolox_pose/yoloxpose_tiny_4xb64-300e_coco-416-76eb44ca_20230829.pth,YOLO-Pose,tiny
+configs/body_2d_keypoint/yolo26pose/coco/yolo26n-pose_coco-640.py,data/models/yolo26n-pose.pt,YOLO26-Pose,nano
+configs/body_2d_keypoint/yolo26pose/coco/yolo26s-pose_coco-640.py,data/models/yolo26s-pose.pt,YOLO26-Pose,small
+configs/body_2d_keypoint/yolo26pose/coco/yolo26m-pose_coco-640.py,data/models/yolo26m-pose.pt,YOLO26-Pose,medium
+configs/body_2d_keypoint/yolo26pose/coco/yolo26l-pose_coco-640.py,data/models/yolo26l-pose.pt,YOLO26-Pose,large
+configs/body_2d_keypoint/yolo26pose/coco/yolo26x-pose_coco-640.py,data/models/yolo26x-pose.pt,YOLO26-Pose,xlarge

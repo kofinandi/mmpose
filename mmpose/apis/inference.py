@@ -18,6 +18,11 @@ from mmpose.models.builder import build_pose_estimator
 from mmpose.structures import PoseDataSample
 from mmpose.structures.bbox import bbox_xywh2xyxy
 
+CUSTOM_POSE_WRAPPER_TYPES = frozenset({'UltralyticsYOLOPoseEstimator'})
+_POSE_WRAPPER_CHECKPOINT_FIELDS = {
+    'UltralyticsYOLOPoseEstimator': 'weights',
+}
+
 
 def dataset_meta_from_config(config: Config,
                              dataset_mode: str = 'train') -> Optional[dict]:
@@ -104,12 +109,20 @@ def init_model(config: Union[str, Path, Config],
     if scope is not None:
         init_default_scope(scope)
 
+    model_type = config.model.get('type')
+    is_custom_wrapper = model_type in CUSTOM_POSE_WRAPPER_TYPES
+    if is_custom_wrapper:
+        if checkpoint is not None:
+            weights_field = _POSE_WRAPPER_CHECKPOINT_FIELDS[model_type]
+            config.model[weights_field] = checkpoint
+        config.model['device'] = device
+
     model = build_pose_estimator(config.model)
     model = revert_sync_batchnorm(model)
     # get dataset_meta in this priority: checkpoint > config > default (COCO)
     dataset_meta = None
 
-    if checkpoint is not None:
+    if checkpoint is not None and not is_custom_wrapper:
         ckpt = load_checkpoint(model, checkpoint, map_location='cpu')
 
         if 'dataset_meta' in ckpt.get('meta', {}):

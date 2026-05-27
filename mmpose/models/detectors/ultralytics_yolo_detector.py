@@ -16,6 +16,8 @@ except ImportError as exc:
         'mmdet is required for UltralyticsYOLODetector. '
         'Install it with: pip install mmdet') from exc
 
+from mmpose.models.utils.ultralytics_weights import resolve_ultralytics_weights
+
 
 def _import_ultralytics():
     try:
@@ -39,10 +41,12 @@ class UltralyticsYOLODetector(nn.Module):
                  conf_thr: float = 0.05,
                  iou_thr: float = 0.7,
                  imgsz: int = 640,
-                 device: str = 'cuda:0') -> None:
+                 device: str = 'cuda:0',
+                 model_cache_dir: str = 'data/models') -> None:
         super().__init__()
         YOLO = _import_ultralytics()
-        self.weights = weights
+        self.weights = resolve_ultralytics_weights(weights, model_cache_dir)
+        self.model_cache_dir = model_cache_dir
         self.conf_thr = conf_thr
         self.iou_thr = iou_thr
         self.imgsz = imgsz
@@ -50,7 +54,7 @@ class UltralyticsYOLODetector(nn.Module):
         # Keep the Ultralytics model off the nn.Module tree.  YOLO overrides
         # train() for fine-tuning, so PyTorch's eval()/train() would start
         # a training run instead of toggling inference mode.
-        object.__setattr__(self, '_yolo', YOLO(weights))
+        object.__setattr__(self, '_yolo', YOLO(self.weights))
         names = self._yolo.names
         if isinstance(names, dict):
             classes = tuple(names[i] for i in sorted(names))
