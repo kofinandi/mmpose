@@ -4,11 +4,12 @@
 
 set -uo pipefail
 
+TIMESTAMP="$(date '+%Y%m%d')"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CSV="${ROOT_DIR}/scripts/benchmark_configs_e2e.csv"
 TEST_DATASET="${TEST_DATASET:-coco}"
-LOG_DIR="${LOG_DIR:-${ROOT_DIR}/benchmark_logs_e2e_${TEST_DATASET}}"
-RESULTS_FILE="${RESULTS_FILE:-${ROOT_DIR}/${TEST_DATASET}_benchmark_e2e.json}"
+LOG_DIR="${LOG_DIR:-${ROOT_DIR}/benchmark/logs/${TIMESTAMP}_${TEST_DATASET}_e2e}"
+RESULTS_FILE="${RESULTS_FILE:-${ROOT_DIR}/benchmark/results/${TIMESTAMP}_${TEST_DATASET}_e2e.json}"
 DEVICE="${DEVICE:-cuda:7}"
 KP_BATCH_SIZE="${KP_BATCH_SIZE:-32}"
 
@@ -24,6 +25,7 @@ run_benchmark() {
     local checkpoint="$2"
     local name="$3"
     local variant="$4"
+    local kp_batch_size="${5:-$KP_BATCH_SIZE}"
 
     local log_file="${LOG_DIR}/${name}-${variant}.log"
 
@@ -33,6 +35,7 @@ run_benchmark() {
     echo "  Test set:   ${TEST_DATASET}"
     echo "  Config:     ${config}"
     echo "  Checkpoint: ${checkpoint}"
+    echo "  KP batch:   ${kp_batch_size}"
     echo "  Log file:   ${log_file}"
     echo "============================================================"
 
@@ -40,7 +43,7 @@ run_benchmark() {
         "$config" \
         "$checkpoint" \
         --test-dataset "$TEST_DATASET" \
-        --kp-batch-size "$KP_BATCH_SIZE" \
+        --kp-batch-size "$kp_batch_size" \
         --device "$DEVICE" \
         --results-file "$RESULTS_FILE" \
         --model-name "$name" \
@@ -63,17 +66,21 @@ if [[ ! -f "$CSV" ]]; then
     exit 1
 fi
 
-while IFS=',' read -r config checkpoint name variant || [[ -n "${config:-}" ]]; do
+while IFS=',' read -r config checkpoint name variant kp_batch_size || [[ -n "${config:-}" ]]; do
     config="$(strip_cr "$config")"
     checkpoint="$(strip_cr "$checkpoint")"
     name="$(strip_cr "$name")"
     variant="$(strip_cr "$variant")"
+    kp_batch_size="$(strip_cr "${kp_batch_size:-}")"
+    if [[ -z "$kp_batch_size" ]]; then
+        kp_batch_size="$KP_BATCH_SIZE"
+    fi
 
     if [[ -z "$config" ]]; then
         continue
     fi
 
-    run_benchmark "$config" "$checkpoint" "$name" "$variant"
+    run_benchmark "$config" "$checkpoint" "$name" "$variant" "$kp_batch_size"
 done < <(tail -n +2 "$CSV")
 
 echo ""

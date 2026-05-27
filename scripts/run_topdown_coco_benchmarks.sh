@@ -4,11 +4,12 @@
 
 set -uo pipefail
 
+TIMESTAMP="$(date '+%Y%m%d')"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CSV="${CSV:-${ROOT_DIR}/scripts/benchmark_configs_topdown.csv}"
 TEST_DATASET="${TEST_DATASET:-coco}"
-LOG_DIR="${LOG_DIR:-${ROOT_DIR}/benchmark_logs_${TEST_DATASET}}"
-RESULTS_FILE="${RESULTS_FILE:-${ROOT_DIR}/${TEST_DATASET}_benchmark.json}"
+LOG_DIR="${LOG_DIR:-${ROOT_DIR}/benchmark/logs/${TIMESTAMP}_${TEST_DATASET}_topdown}"
+RESULTS_FILE="${RESULTS_FILE:-${ROOT_DIR}/benchmark/results/${TIMESTAMP}_${TEST_DATASET}_topdown.json}"
 DEVICE="${DEVICE:-cuda:7}"
 
 RFDET_CONFIG="demo/mmdetection_cfg/rfdetr_medium_coco-person.py"
