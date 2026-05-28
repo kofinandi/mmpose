@@ -1289,9 +1289,6 @@ def main():
     run_date = datetime.now().strftime('%Y%m%d')
     frame_records: Optional[List[dict]] = [] if args.model_name else None
     gt_by_img_id: Optional[Dict[int, list]] = None
-    if frame_records is not None:
-        print('Building GT lookup for prediction export...')
-        gt_by_img_id = build_gt_by_img_id(pose_cfg, args.num_frames)
     dataset_meta = None
 
     # ── Config ────────────────────────────────────────────────────────────
@@ -1302,6 +1299,10 @@ def main():
 
     _init_scope(pose_cfg)
     MMLogger.get_current_instance()  # ensure logger is initialised
+
+    if frame_records is not None:
+        print('Building GT lookup for prediction export...')
+        gt_by_img_id = build_gt_by_img_id(pose_cfg, args.num_frames)
 
     use_real_detector = bool(args.det_config and args.det_checkpoint)
     is_topdown = args.mock_detector or use_real_detector
