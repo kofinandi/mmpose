@@ -51,6 +51,101 @@ def is_coco_det_ann_file(ann_file: str) -> bool:
     return True
 
 
+def _take_instance_field(item: dict, key: str, idx: Optional[int]):
+    """Return one instance field, indexing stacked bottom-up arrays."""
+    val = item.get(key)
+    if val is None:
+        return None
+    if idx is None:
+        return val
+    arr = np.asarray(val)
+    if arr.ndim == 0 or arr.shape[0] == 1:
+        return val
+    return arr[idx]
+
+
+def _orig_area_from_item(item: dict, idx: Optional[int]) -> Optional[float]:
+    raw_ann = item.get('raw_ann_info')
+    if isinstance(raw_ann, dict):
+        area = raw_ann.get('area')
+        if area is not None:
+            return float(area)
+    elif isinstance(raw_ann, list) and raw_ann:
+        ann_idx = idx if idx is not None and idx < len(raw_ann) else 0
+        ann = raw_ann[ann_idx]
+        if isinstance(ann, dict) and ann.get('area') is not None:
+            return float(ann['area'])
+
+    area = _take_instance_field(item, 'area', idx)
+    if area is not None:
+        arr = np.asarray(area).reshape(-1)
+        if arr.size == 0:
+            return None
+        return float(arr[0])
+    return None
+
+
+def _category_id_from_item(item: dict, idx: Optional[int]) -> int:
+    cat_id = _take_instance_field(item, 'category_id', idx)
+    if cat_id is None:
+        return 1
+    arr = np.asarray(cat_id).reshape(-1)
+    if arr.size == 0:
+        return 1
+    return int(arr[0])
+
+
+def _inst_id_from_item(item: dict, idx: Optional[int]) -> Optional[int]:
+    inst_id = _take_instance_field(item, 'id', idx)
+    if inst_id is None:
+        return None
+    arr = np.asarray(inst_id).reshape(-1)
+    if arr.size == 0:
+        return None
+    return int(arr[0])
+
+
+def _build_gt_instance_dict(item: dict, idx: Optional[int] = None) -> dict:
+    return {
+        'keypoints': _take_instance_field(item, 'keypoints', idx),
+        'keypoints_visible': _take_instance_field(item, 'keypoints_visible', idx),
+        'bbox_scale': _take_instance_field(item, 'bbox_scale', idx),
+        'bbox': _take_instance_field(item, 'bbox', idx),
+        'orig_area': _orig_area_from_item(item, idx),
+        'category_id': _category_id_from_item(item, idx),
+        'id': _inst_id_from_item(item, idx),
+    }
+
+
+def _item_to_gt_instances(item: dict) -> List[dict]:
+    """Expand one dataset item into per-instance GT dicts."""
+    kpts = item.get('keypoints')
+    if kpts is not None:
+        kpts_arr = np.asarray(kpts)
+        if kpts_arr.size == 0:
+            return []
+        if kpts_arr.ndim == 3 and kpts_arr.shape[0] > 1:
+            return [
+                _build_gt_instance_dict(item, i)
+                for i in range(kpts_arr.shape[0])
+            ]
+        return [_build_gt_instance_dict(item)]
+
+    bbox = item.get('bbox')
+    if bbox is not None:
+        bbox_arr = np.asarray(bbox)
+        if bbox_arr.size == 0:
+            return []
+        if bbox_arr.ndim == 2 and bbox_arr.shape[0] > 1:
+            return [
+                _build_gt_instance_dict(item, i)
+                for i in range(bbox_arr.shape[0])
+            ]
+        return [_build_gt_instance_dict(item)]
+
+    return []
+
+
 def load_pose_gt_per_image(
     pose_cfg: Config,
     num_frames: Optional[int] = None,
@@ -88,39 +183,7 @@ def load_pose_gt_per_image(
         if img_id in img_gt_instances:
             if kp_converter is not None:
                 item = kp_converter(item)
-
-            raw_ann = item.get('raw_ann_info')
-            if raw_ann is not None and isinstance(raw_ann, dict):
-                orig_area = raw_ann.get('area', None)
-            elif raw_ann is not None and isinstance(raw_ann, list) and raw_ann:
-                orig_area = raw_ann[0].get('area', None)
-            else:
-                orig_area = None
-            if orig_area is None:
-                _a = item.get('area')
-                orig_area = float(_a.flat[0]) if _a is not None else None
-
-            cat_id = item.get('category_id', 1)
-            if hasattr(cat_id, 'flat'):
-                cat_id = int(cat_id.flat[0])
-            elif isinstance(cat_id, (list, tuple)) and cat_id:
-                cat_id = int(cat_id[0])
-            else:
-                cat_id = int(cat_id)
-
-            inst_id = item.get('id')
-            if inst_id is not None and hasattr(inst_id, 'flat'):
-                inst_id = int(inst_id.flat[0])
-
-            img_gt_instances[img_id].append({
-                'keypoints': item.get('keypoints'),
-                'keypoints_visible': item.get('keypoints_visible'),
-                'bbox_scale': item.get('bbox_scale'),
-                'bbox': item.get('bbox'),
-                'orig_area': orig_area,
-                'category_id': cat_id,
-                'id': inst_id,
-            })
+            img_gt_instances[img_id].extend(_item_to_gt_instances(item))
 
     return [
         (img_id, img_paths[img_id], img_gt_instances[img_id])

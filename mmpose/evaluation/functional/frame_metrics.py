@@ -98,16 +98,39 @@ def _serialize_gt_instance_data(gt_inst: InstanceData) -> List[dict]:
 
 def _to_oks_vector(keypoints: np.ndarray,
                     visibility: Optional[np.ndarray] = None,
-                    scores: Optional[np.ndarray] = None) -> np.ndarray:
+                    scores: Optional[np.ndarray] = None,
+                    num_kpts: Optional[int] = None) -> np.ndarray:
     """Pack keypoints into (K*3,) vector for :func:`oks_iou`."""
     kpts = np.asarray(keypoints).reshape(-1, 2)
+    if num_kpts is not None:
+        if kpts.shape[0] > num_kpts:
+            kpts = kpts[:num_kpts]
+        elif kpts.shape[0] < num_kpts:
+            padded = np.zeros((num_kpts, 2), dtype=np.float32)
+            padded[:kpts.shape[0]] = kpts
+            kpts = padded
+
     num_kpts = kpts.shape[0]
     if visibility is not None:
-        vis = np.asarray(visibility).reshape(num_kpts)
+        vis = np.asarray(visibility).reshape(-1)
         if vis.ndim > 1:
             vis = vis[:, 0]
+        if num_kpts is not None and vis.shape[0] != num_kpts:
+            if vis.shape[0] > num_kpts:
+                vis = vis[:num_kpts]
+            else:
+                vis_pad = np.zeros(num_kpts, dtype=np.float32)
+                vis_pad[:vis.shape[0]] = vis
+                vis = vis_pad
     elif scores is not None:
-        vis = np.asarray(scores).reshape(num_kpts)
+        vis = np.asarray(scores).reshape(-1)
+        if num_kpts is not None and vis.shape[0] != num_kpts:
+            if vis.shape[0] > num_kpts:
+                vis = vis[:num_kpts]
+            else:
+                vis_pad = np.zeros(num_kpts, dtype=np.float32)
+                vis_pad[:vis.shape[0]] = vis
+                vis = vis_pad
     else:
         vis = np.ones(num_kpts, dtype=np.float32)
 
@@ -155,30 +178,47 @@ def match_instances_oks(
         return [], base_metrics
 
     sigmas = np.asarray(sigmas, dtype=np.float32)
+    num_kpts = len(sigmas)
+    if num_kpts == 0:
+        return [], base_metrics
+
     pred_vecs = []
     pred_areas = []
     for pred in pred_list:
+        if pred.get('keypoints') is None:
+            continue
         kpts = np.asarray(pred['keypoints'])
         scores = pred.get('keypoint_scores')
         pred_vecs.append(
-            _to_oks_vector(kpts, scores=np.asarray(scores)
-                           if scores is not None else None))
+            _to_oks_vector(
+                kpts,
+                scores=np.asarray(scores) if scores is not None else None,
+                num_kpts=num_kpts,
+            ))
         pred_areas.append(_instance_area(pred))
+    if not pred_vecs:
+        return [], base_metrics
     pred_vecs_arr = np.stack(pred_vecs, axis=0)
     pred_areas_arr = np.asarray(pred_areas, dtype=np.float32)
 
     pairs: List[Tuple[float, int, int]] = []
+    pred_indices = [
+        pi for pi, pred in enumerate(pred_list) if pred.get('keypoints') is not None
+    ]
     for gi, gt in enumerate(gt_list):
+        if gt.get('keypoints') is None:
+            continue
         g_vec = _to_oks_vector(
             np.asarray(gt['keypoints']),
             visibility=np.asarray(gt['keypoints_visible'])
             if gt.get('keypoints_visible') is not None else None,
+            num_kpts=num_kpts,
         )
         g_area = _instance_area(gt)
         oks_row = oks_iou(g_vec, pred_vecs_arr, g_area, pred_areas_arr,
                           sigmas)
-        for pi, oks_val in enumerate(oks_row):
-            pairs.append((float(oks_val), gi, pi))
+        for row_pi, oks_val in enumerate(oks_row):
+            pairs.append((float(oks_val), gi, pred_indices[row_pi]))
 
     pairs.sort(key=lambda x: x[0], reverse=True)
 
