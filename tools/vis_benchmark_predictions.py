@@ -30,8 +30,8 @@ import mmcv
 import numpy as np
 from mmengine.structures import InstanceData
 
-from mmpose.registry import VISUALIZERS
 from mmpose.structures import PoseDataSample
+from mmpose.visualization import PoseLocalVisualizer
 
 
 def parse_args():
@@ -74,6 +74,12 @@ def parse_args():
         default='mmpose',
         choices=['mmpose', 'openpose'],
         help='Skeleton style for visualization')
+    parser.add_argument(
+        '--render-scale',
+        type=float,
+        default=2.0,
+        help='Upscale factor for rendering (image + overlays). '
+        'Use 1.0 for native resolution. Default: 2.0')
     return parser.parse_args()
 
 
@@ -107,6 +113,11 @@ def _instances_from_json(instances: List[dict]) -> InstanceData:
     bboxes = []
     visibility = []
     for item in instances:
+        if 'bbox' in item:
+            bbox = np.asarray(item['bbox'], dtype=np.float32).reshape(-1)[:4]
+            bboxes.append(bbox)
+        if 'keypoints' not in item:
+            continue
         kpts = np.asarray(item['keypoints'], dtype=np.float32).reshape(-1, 2)
         keypoints.append(kpts)
         if 'keypoint_scores' in item:
@@ -117,14 +128,12 @@ def _instances_from_json(instances: List[dict]) -> InstanceData:
         if 'keypoints_visible' in item:
             vis = np.asarray(item['keypoints_visible'], dtype=np.float32).reshape(-1)
             visibility.append(vis)
-        if 'bbox' in item:
-            bbox = np.asarray(item['bbox'], dtype=np.float32).reshape(-1)[:4]
-            bboxes.append(bbox)
 
-    inst.keypoints = np.stack(keypoints, axis=0)
-    inst.keypoint_scores = np.stack(scores, axis=0)
-    if visibility:
-        inst.keypoints_visible = np.stack(visibility, axis=0)
+    if keypoints:
+        inst.keypoints = np.stack(keypoints, axis=0)
+        inst.keypoint_scores = np.stack(scores, axis=0)
+        if visibility:
+            inst.keypoints_visible = np.stack(visibility, axis=0)
     if bboxes:
         inst.bboxes = np.stack(bboxes, axis=0)
     return inst
@@ -172,6 +181,55 @@ def _format_metrics(metrics: dict) -> str:
     return '  '.join(parts)
 
 
+def _upscale_image(img: np.ndarray, scale: float) -> np.ndarray:
+    """Upscale image for sharper overlay rendering."""
+    if scale <= 1.0:
+        return img
+    h, w = img.shape[:2]
+    new_size = (int(round(w * scale)), int(round(h * scale)))
+    return mmcv.imresize(img, new_size, interpolation='bicubic')
+
+
+def _scale_instances(inst: InstanceData, scale: float) -> InstanceData:
+    """Scale keypoints and bboxes to match an upscaled canvas."""
+    if scale <= 1.0:
+        return inst
+
+    scaled = InstanceData()
+    if not hasattr(inst, 'keypoints') or len(inst.keypoints) == 0:
+        scaled.keypoints = inst.keypoints
+        scaled.keypoint_scores = inst.keypoint_scores
+        if hasattr(inst, 'bboxes'):
+            scaled.bboxes = inst.bboxes
+        if hasattr(inst, 'keypoints_visible'):
+            scaled.keypoints_visible = inst.keypoints_visible
+        return scaled
+
+    scaled.keypoints = inst.keypoints * scale
+    scaled.keypoint_scores = inst.keypoint_scores
+    if hasattr(inst, 'keypoints_visible'):
+        scaled.keypoints_visible = inst.keypoints_visible
+    if hasattr(inst, 'bboxes') and inst.bboxes is not None:
+        scaled.bboxes = inst.bboxes * scale
+    return scaled
+
+
+def _apply_render_scale(
+    img: np.ndarray,
+    pred_inst: InstanceData,
+    gt_inst: InstanceData,
+    scale: float,
+) -> tuple:
+    """Return upscaled image and coordinate-scaled instances."""
+    if scale <= 1.0:
+        return img, pred_inst, gt_inst
+    return (
+        _upscale_image(img, scale),
+        _scale_instances(pred_inst, scale),
+        _scale_instances(gt_inst, scale),
+    )
+
+
 class PredictionBrowser:
     """Matplotlib browser for benchmark prediction frames."""
 
@@ -185,8 +243,11 @@ class PredictionBrowser:
         self.show_pred = True
         self.show_gt = True
         self.show_bbox = True
+        self.render_scale = max(float(args.render_scale), 1.0)
 
-        self.visualizer = VISUALIZERS.build(dict(type='PoseLocalVisualizer'))
+        self.visualizer = PoseLocalVisualizer(name='benchmark_vis')
+        self.visualizer.radius = 3 * self.render_scale
+        self.visualizer.line_width = max(1, int(round(self.render_scale)))
         self.visualizer.set_dataset_meta(
             manifest['dataset_meta'],
             skeleton_style=args.skeleton_style)
@@ -217,6 +278,8 @@ class PredictionBrowser:
         gt_json = frame['ground_truth']['instances']
         pred_inst = _instances_from_json(pred_json)
         gt_inst = _instances_from_json(gt_json)
+        img, pred_inst, gt_inst = _apply_render_scale(
+            img, pred_inst, gt_inst, self.render_scale)
         data_sample = _build_data_sample(frame, pred_inst, gt_inst)
 
         canvas = img.copy()
@@ -254,7 +317,7 @@ class PredictionBrowser:
             canvas = self.visualizer.get_image()
 
         self.ax.clear()
-        self.ax.imshow(canvas)
+        self.ax.imshow(canvas, interpolation='nearest')
         self.ax.axis('off')
 
         toggles = []

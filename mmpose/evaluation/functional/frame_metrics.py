@@ -71,19 +71,24 @@ def serialize_gt_instances(
 
 
 def _serialize_gt_instance_data(gt_inst: InstanceData) -> List[dict]:
-    if not hasattr(gt_inst, 'keypoints') or len(gt_inst.keypoints) == 0:
+    has_keypoints = hasattr(gt_inst, 'keypoints') and len(gt_inst.keypoints) > 0
+    has_bboxes = hasattr(gt_inst, 'bboxes') and len(gt_inst.bboxes) > 0
+    if not has_keypoints and not has_bboxes:
         return []
 
+    n = len(gt_inst.keypoints) if has_keypoints else len(gt_inst.bboxes)
     results = []
-    n = len(gt_inst.keypoints)
     for i in range(n):
-        inst = {'keypoints': np.asarray(gt_inst.keypoints[i]).tolist()}
-        if hasattr(gt_inst, 'keypoints_visible'):
+        inst: dict = {}
+        if has_keypoints:
+            inst['keypoints'] = np.asarray(gt_inst.keypoints[i]).tolist()
+        if hasattr(gt_inst, 'keypoints_visible') and len(
+                gt_inst.keypoints_visible) > i:
             vis = gt_inst.keypoints_visible[i]
             if np.asarray(vis).ndim > 1:
                 vis = np.asarray(vis).reshape(-1)
             inst['keypoints_visible'] = np.asarray(vis).tolist()
-        if hasattr(gt_inst, 'bboxes') and len(gt_inst.bboxes) > i:
+        if has_bboxes and len(gt_inst.bboxes) > i:
             inst['bbox'] = np.asarray(gt_inst.bboxes[i]).reshape(-1)[:4].tolist()
         if hasattr(gt_inst, 'orig_areas') and len(gt_inst.orig_areas) > i:
             inst['orig_area'] = float(gt_inst.orig_areas[i])
@@ -261,7 +266,7 @@ def build_frame_record(
     return record
 
 
-def _sanitize_dataset_meta(dataset_meta: dict) -> dict:
+def sanitize_dataset_meta(dataset_meta: dict) -> dict:
     """Convert dataset_meta values to JSON-serializable types."""
     out = {}
     for key, val in dataset_meta.items():

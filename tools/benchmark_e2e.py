@@ -52,7 +52,7 @@ from mmpose.evaluation.functional.frame_metrics import (
     save_prediction_bundle,
     serialize_gt_instances,
     serialize_pred_instances,
-    _sanitize_dataset_meta,
+    sanitize_dataset_meta,
 )
 from mmpose.evaluation.functional.pose_gt_to_coco_det import (
     load_pose_gt_per_image,
@@ -142,6 +142,18 @@ def _evaluator_needs_gt_from_samples(pose_cfg: Config) -> bool:
     if isinstance(ev_cfg, dict):
         ev_cfg = [ev_cfg]
     return any(m.get('gt_from_samples', False) for m in ev_cfg)
+
+
+def build_gt_by_img_id(
+    pose_cfg: Config,
+    num_frames: Optional[int] = None,
+) -> Dict[int, list]:
+    """Map COCO ``img_id`` to per-instance GT dicts in original image coords."""
+    return {
+        img_id: gt_insts
+        for img_id, _, gt_insts in load_pose_gt_per_image(
+            pose_cfg, num_frames)
+    }
 
 
 def build_gt_instances_per_frame(
@@ -493,6 +505,7 @@ def run_bottomup(
     frame_records: Optional[List[dict]] = None,
     dataset_meta: Optional[dict] = None,
     data_root: str = '',
+    gt_by_img_id: Optional[Dict[int, list]] = None,
 ) -> Tuple[dict, dict]:
     """Bottomup benchmark loop with CUDA-event timing."""
     batch_latencies: List[Tuple[float, int]] = []  # (elapsed_s, n_samples)
@@ -515,10 +528,11 @@ def run_bottomup(
             for ds in results:
                 meta = ds.metainfo
                 ori_shape = meta.get('ori_shape', (0, 0))
-                gt_src = ds.gt_instances if hasattr(ds, 'gt_instances') else None
+                img_id = int(meta['img_id'])
+                gt_src = (gt_by_img_id or {}).get(img_id, [])
                 frame_records.append(
                     build_frame_record(
-                        img_id=int(meta['img_id']),
+                        img_id=img_id,
                         frame_id=len(frame_records),
                         img_path=meta.get('img_path', ''),
                         data_root=data_root,
@@ -871,6 +885,7 @@ def run_topdown(
     dataset_meta: Optional[dict] = None,
     data_root: str = '',
     img_paths: Optional[List[str]] = None,
+    gt_by_img_id: Optional[Dict[int, list]] = None,
 ) -> Tuple[dict, dict]:
     """Run topdown async producer/consumer benchmark.
 
@@ -961,9 +976,7 @@ def run_topdown(
             img_path = ''
             if img_paths is not None and frame_id < len(img_paths):
                 img_path = img_paths[frame_id]
-            gt_src = (gt_instances_per_frame or {}).get(frame_id)
-            if gt_src is None and hasattr(ds, 'gt_instances'):
-                gt_src = ds.gt_instances
+            gt_src = (gt_by_img_id or {}).get(int(img_id), [])
             det_bb, det_sc = det_predictions.get(
                 frame_id,
                 (np.zeros((0, 4), dtype=np.float32),
@@ -1160,7 +1173,7 @@ def _save_predictions(
         'quality': quality,
         'perf': perf,
         'data_root': data_root,
-        'dataset_meta': _sanitize_dataset_meta(dataset_meta),
+        'dataset_meta': sanitize_dataset_meta(dataset_meta),
         'badcase_defaults': {
             'metric_key': 'mean_oks',
             'metric_type': 'accuracy',
@@ -1275,6 +1288,10 @@ def main():
     args = _parse_args()
     run_date = datetime.now().strftime('%Y%m%d')
     frame_records: Optional[List[dict]] = [] if args.model_name else None
+    gt_by_img_id: Optional[Dict[int, list]] = None
+    if frame_records is not None:
+        print('Building GT lookup for prediction export...')
+        gt_by_img_id = build_gt_by_img_id(pose_cfg, args.num_frames)
     dataset_meta = None
 
     # ── Config ────────────────────────────────────────────────────────────
@@ -1383,6 +1400,7 @@ def main():
             dataset_meta=kp_model.dataset_meta,
             data_root=data_root,
             img_paths=img_paths,
+            gt_by_img_id=gt_by_img_id,
         )
         mode_suffix = 'mock-detector' if args.mock_detector else args.queue_strategy
         mode = f'topdown (strategy={mode_suffix})'
@@ -1413,6 +1431,7 @@ def main():
             frame_records=frame_records,
             dataset_meta=model.dataset_meta,
             data_root=data_root,
+            gt_by_img_id=gt_by_img_id,
         )
         mode = 'bottomup'
 
