@@ -51,6 +51,7 @@ run_benchmark() {
         >"$log_file" 2>&1; then
         PASSED=$((PASSED + 1))
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] Finished: ${name} / ${variant}"
+        echo "  Predictions: benchmark/predictions/${TIMESTAMP}_${TEST_DATASET}_e2e/${name}-${variant}/"
     else
         FAILED+=("${name}/${variant}")
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] FAILED: ${name} / ${variant} (see ${log_file})"

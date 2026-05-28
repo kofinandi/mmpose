@@ -47,6 +47,13 @@ from mmpose.evaluation.benchmark_datasets import (
     BENCHMARK_TEST_DATASET_NAMES,
     apply_benchmark_test_dataset,
 )
+from mmpose.evaluation.functional.frame_metrics import (
+    build_frame_record,
+    save_prediction_bundle,
+    serialize_gt_instances,
+    serialize_pred_instances,
+    _sanitize_dataset_meta,
+)
 from mmpose.evaluation.functional.pose_gt_to_coco_det import (
     load_pose_gt_per_image,
     resolve_det_ann_file,
@@ -483,6 +490,9 @@ def run_bottomup(
     device: str,
     warmup_batches: int = 3,
     log_interval: int = 100,
+    frame_records: Optional[List[dict]] = None,
+    dataset_meta: Optional[dict] = None,
+    data_root: str = '',
 ) -> Tuple[dict, dict]:
     """Bottomup benchmark loop with CUDA-event timing."""
     batch_latencies: List[Tuple[float, int]] = []  # (elapsed_s, n_samples)
@@ -500,6 +510,24 @@ def run_bottomup(
             batch_latencies.append((timer.elapsed_s, len(results)))
 
         evaluator.process(data_samples=results, data_batch=batch)
+
+        if frame_records is not None:
+            for ds in results:
+                meta = ds.metainfo
+                ori_shape = meta.get('ori_shape', (0, 0))
+                gt_src = ds.gt_instances if hasattr(ds, 'gt_instances') else None
+                frame_records.append(
+                    build_frame_record(
+                        img_id=int(meta['img_id']),
+                        frame_id=len(frame_records),
+                        img_path=meta.get('img_path', ''),
+                        data_root=data_root,
+                        ori_shape=(int(ori_shape[0]), int(ori_shape[1])),
+                        pred_instances=serialize_pred_instances(
+                            ds.pred_instances),
+                        gt_instances=serialize_gt_instances(gt_src),
+                        dataset_meta=dataset_meta,
+                    ))
 
         if (i + 1) % log_interval == 0 or (i + 1) == n_batches:
             frames_done = sum(n for _, n in batch_latencies)
@@ -839,6 +867,10 @@ def run_topdown(
     gt_bboxes_per_frame: Optional[Dict[int, Tuple[np.ndarray, np.ndarray]]] = None,
     det_evaluator: Optional[Evaluator] = None,
     gt_instances_per_frame: Optional[Dict[int, list]] = None,
+    frame_records: Optional[List[dict]] = None,
+    dataset_meta: Optional[dict] = None,
+    data_root: str = '',
+    img_paths: Optional[List[str]] = None,
 ) -> Tuple[dict, dict]:
     """Run topdown async producer/consumer benchmark.
 
@@ -924,6 +956,32 @@ def run_topdown(
             raise ValueError(f'Frame {frame_id} was neither processed by detector nor had results')
 
         evaluator.process(data_samples=[ds], data_batch=None)
+
+        if frame_records is not None:
+            img_path = ''
+            if img_paths is not None and frame_id < len(img_paths):
+                img_path = img_paths[frame_id]
+            gt_src = (gt_instances_per_frame or {}).get(frame_id)
+            if gt_src is None and hasattr(ds, 'gt_instances'):
+                gt_src = ds.gt_instances
+            det_bb, det_sc = det_predictions.get(
+                frame_id,
+                (np.zeros((0, 4), dtype=np.float32),
+                 np.zeros(0, dtype=np.float32)))
+            frame_records.append(
+                build_frame_record(
+                    img_id=int(img_id),
+                    frame_id=frame_id,
+                    img_path=img_path,
+                    data_root=data_root,
+                    ori_shape=(int(h), int(w)),
+                    pred_instances=serialize_pred_instances(
+                        ds.pred_instances),
+                    gt_instances=serialize_gt_instances(gt_src),
+                    dataset_meta=dataset_meta,
+                    det_bboxes=det_bb,
+                    det_scores=det_sc,
+                ))
 
     quality = evaluator.evaluate(n_images)
 
@@ -1059,6 +1117,62 @@ def _save_out(quality: dict, perf: dict, mode: str, args) -> None:
     print(f'Results saved to {args.out}')
 
 
+def _prediction_mode_tag(is_topdown: bool) -> str:
+    return 'topdown' if is_topdown else 'e2e'
+
+
+def _prediction_out_dir(args, run_date: str, is_topdown: bool) -> str:
+    if args.pred_dir:
+        return osp.abspath(args.pred_dir)
+    model_label = args.model_name
+    if args.model_variant:
+        model_label = f'{args.model_name}-{args.model_variant}'
+    tag = f'{run_date}_{args.test_dataset}_{_prediction_mode_tag(is_topdown)}'
+    return osp.join('benchmark', 'predictions', tag, model_label)
+
+
+def _save_predictions(
+    args,
+    pose_cfg: Config,
+    mode: str,
+    is_topdown: bool,
+    quality: dict,
+    perf: dict,
+    frame_records: List[dict],
+    dataset_meta: dict,
+    run_date: str,
+) -> None:
+    data_root = pose_cfg.test_dataloader.dataset.get('data_root', 'data/')
+    manifest = {
+        'timestamp': datetime.now().isoformat(timespec='seconds'),
+        'mode': mode,
+        'mode_tag': _prediction_mode_tag(is_topdown),
+        'test_dataset': args.test_dataset,
+        'model_name': args.model_name,
+        'model_variant': args.model_variant,
+        'pose_config': osp.abspath(args.pose_config),
+        'pose_checkpoint': osp.abspath(args.pose_checkpoint),
+        'det_config': (
+            osp.abspath(args.det_config) if args.det_config else None),
+        'det_checkpoint': (
+            osp.abspath(args.det_checkpoint)
+            if args.det_checkpoint else None),
+        'quality': quality,
+        'perf': perf,
+        'data_root': data_root,
+        'dataset_meta': _sanitize_dataset_meta(dataset_meta),
+        'badcase_defaults': {
+            'metric_key': 'mean_oks',
+            'metric_type': 'accuracy',
+            'thr': 0.5,
+        },
+        'num_frames': len(frame_records),
+    }
+    out_dir = _prediction_out_dir(args, run_date, is_topdown)
+    save_prediction_bundle(manifest, frame_records, out_dir)
+    print(f'Predictions saved to {osp.abspath(out_dir)}')
+
+
 def _append_to_results_file(quality: dict, perf: dict, args) -> None:
     """Append to --results-file in the same schema as test_tracked.py."""
     results_file = args.results_file
@@ -1135,6 +1249,11 @@ def _parse_args():
                    help='Model group name (required with --results-file)')
     p.add_argument('--model-variant', default=None,
                    help='Model variant name (required with --results-file)')
+    p.add_argument(
+        '--pred-dir',
+        default=None,
+        help='Directory for prediction export (default: '
+             'benchmark/predictions/{DATE}_{DATASET}_{MODE}/{MODELNAME})')
     p.add_argument('--det-metrics', action='store_true',
                    help='Compute COCO-style detection AP/AR for the person '
                         'class (topdown mode only).')
@@ -1154,6 +1273,9 @@ def _parse_args():
 
 def main():
     args = _parse_args()
+    run_date = datetime.now().strftime('%Y%m%d')
+    frame_records: Optional[List[dict]] = [] if args.model_name else None
+    dataset_meta = None
 
     # ── Config ────────────────────────────────────────────────────────────
     pose_cfg = Config.fromfile(args.pose_config)
@@ -1219,13 +1341,15 @@ def main():
 
             print('Building image list...')
             img_list = build_unique_image_list(pose_cfg, args.num_frames)
-            if _evaluator_needs_gt_from_samples(pose_cfg):
+            if (_evaluator_needs_gt_from_samples(pose_cfg)
+                    or frame_records is not None):
                 print('Building GT instance lookup for evaluation...')
                 gt_instances_per_frame = build_gt_instances_per_frame(
                     pose_cfg, img_list)
 
         kp_model = init_model(
             args.pose_config, args.pose_checkpoint, device=args.device)
+        dataset_meta = kp_model.dataset_meta
         evaluator = build_evaluator(pose_cfg, kp_model.dataset_meta)
 
         det_evaluator = None
@@ -1234,6 +1358,8 @@ def main():
                 pose_cfg, num_frames=args.num_frames)
 
         prefetched = prefetch_images(img_list)
+        img_paths = [path for _, path in img_list]
+        data_root = pose_cfg.test_dataloader.dataset.get('data_root', 'data/')
 
         quality, perf = run_topdown(
             det_model=detector,
@@ -1253,6 +1379,10 @@ def main():
             gt_bboxes_per_frame=gt_bboxes_per_frame,
             det_evaluator=det_evaluator,
             gt_instances_per_frame=gt_instances_per_frame,
+            frame_records=frame_records,
+            dataset_meta=kp_model.dataset_meta,
+            data_root=data_root,
+            img_paths=img_paths,
         )
         mode_suffix = 'mock-detector' if args.mock_detector else args.queue_strategy
         mode = f'topdown (strategy={mode_suffix})'
@@ -1264,11 +1394,13 @@ def main():
 
         model = init_model(
             args.pose_config, args.pose_checkpoint, device=args.device)
+        dataset_meta = model.dataset_meta
         evaluator = build_evaluator(pose_cfg, model.dataset_meta)
 
         print('Building and prefetching batches...')
         batches, total_frames = build_bottomup_batches(
             pose_cfg, args.kp_batch_size, args.num_frames)
+        data_root = pose_cfg.test_dataloader.dataset.get('data_root', 'data/')
 
         quality, perf = run_bottomup(
             model=model,
@@ -1278,6 +1410,9 @@ def main():
             device=args.device,
             warmup_batches=args.warmup_batches,
             log_interval=args.log_interval,
+            frame_records=frame_records,
+            dataset_meta=model.dataset_meta,
+            data_root=data_root,
         )
         mode = 'bottomup'
 
@@ -1292,6 +1427,11 @@ def main():
             '--model-name and --model-variant are required when '
             '--results-file is specified')
         _append_to_results_file(quality, perf, args)
+
+    if args.model_name and frame_records is not None:
+        _save_predictions(
+            args, pose_cfg, mode, is_topdown, quality, perf,
+            frame_records, dataset_meta, run_date)
 
 
 if __name__ == '__main__':
