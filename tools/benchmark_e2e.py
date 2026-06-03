@@ -137,11 +137,17 @@ def build_unique_image_list(
 
 
 def _evaluator_needs_gt_from_samples(pose_cfg: Config) -> bool:
-    """Return True when the pose evaluator synthesizes GT from samples."""
+    """Return True when evaluation needs per-sample GT from the dataset."""
     ev_cfg = pose_cfg.test_evaluator
     if isinstance(ev_cfg, dict):
         ev_cfg = [ev_cfg]
-    return any(m.get('gt_from_samples', False) for m in ev_cfg)
+    if any(m.get('gt_from_samples', False) for m in ev_cfg):
+        return True
+    # Temporal / PCK metrics read GT keypoints and raw_ann_info (track_id).
+    _GT_FROM_DATASET_TYPES = {
+        'PCKAccuracy', 'AUC', 'EPE', 'MPJVE', 'MPJAE',
+    }
+    return any(m.get('type') in _GT_FROM_DATASET_TYPES for m in ev_cfg)
 
 
 def build_gt_by_img_id(
@@ -343,6 +349,7 @@ def _make_topdown_data_sample(
     det_scores: List[float],
     ori_shape: Tuple[int, int],
     gt_instances_data: Optional[list] = None,
+    img_path: Optional[str] = None,
 ) -> PoseDataSample:
     """Merge per-bbox PoseDataSamples into a single per-image PoseDataSample.
 
@@ -370,12 +377,15 @@ def _make_topdown_data_sample(
     if n == 0:
         ds = PoseDataSample()
         num_kpts = 17  # COCO default; will be overridden if model differs
-        ds.set_metainfo({
+        meta = {
             'img_id': img_id,
             'id': [img_id],
             'category_id': 1,
             'ori_shape': ori_shape,
-        })
+        }
+        if img_path is not None:
+            meta['img_path'] = img_path
+        ds.set_metainfo(meta)
         pred_inst = InstanceData()
         pred_inst.keypoints = np.zeros((0, num_kpts, 2), dtype=np.float32)
         pred_inst.keypoint_scores = np.zeros((0, num_kpts), dtype=np.float32)
@@ -404,12 +414,15 @@ def _make_topdown_data_sample(
     # inside CocoMetric._sort_and_unique_bboxes (which early-returns when
     # the 'id' value is a Sequence).
     ids = list(range(img_id * 10000, img_id * 10000 + n))
-    merged.set_metainfo({
+    meta = {
         'img_id': img_id,
         'id': ids,
         'category_id': 1,
         'ori_shape': ori_shape,
-    })
+    }
+    if img_path is not None:
+        meta['img_path'] = img_path
+    merged.set_metainfo(meta)
 
     # Attach GT instances so that CocoMetric with gt_from_samples=True can
     # synthesize COCO-format ground-truth annotations.
@@ -490,6 +503,10 @@ def _attach_gt_instances(
     else:
         data_sample.set_metainfo(
             {'id': list(range(img_id * 10000, img_id * 10000 + n))})
+
+    raw_ann = gt_instances_data[0].get('raw_ann_info')
+    if isinstance(raw_ann, dict):
+        data_sample.set_metainfo({'raw_ann_info': raw_ann})
 
 
 # ── Bottomup pipeline ──────────────────────────────────────────────────────
@@ -953,9 +970,13 @@ def run_topdown(
     for frame_id, (img_id, img) in enumerate(prefetched_images):
         h, w = img.shape[:2]
         gt_inst_data = (gt_instances_per_frame or {}).get(frame_id)
+        frame_img_path = None
+        if img_paths is not None and frame_id < len(img_paths):
+            frame_img_path = img_paths[frame_id]
         if frame_id in zero_det_frames:
             ds = _make_topdown_data_sample(
-                img_id, [], [], (h, w), gt_inst_data)
+                img_id, [], [], (h, w), gt_inst_data,
+                img_path=frame_img_path)
         elif frame_id in frame_results:
             res_scores = frame_results[frame_id]
             ds = _make_topdown_data_sample(
@@ -964,6 +985,7 @@ def run_topdown(
                 [s for _, s in res_scores],
                 (h, w),
                 gt_inst_data,
+                img_path=frame_img_path,
             )
         else:
             # Frame was neither processed by detector nor had results (shouldn't

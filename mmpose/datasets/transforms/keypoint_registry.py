@@ -22,6 +22,7 @@ _METAINFO_FILES: Dict[str, str] = {
     'posetrack18':  'configs/_base_/datasets/posetrack18.py',
     'coco_wholebody': 'configs/_base_/datasets/coco_wholebody.py',
     'threedpw': 'configs/_base_/datasets/threedpw.py',
+    'emdb': 'configs/_base_/datasets/emdb.py',
     'ubody': 'configs/_base_/datasets/ubody2d.py',
 }
 

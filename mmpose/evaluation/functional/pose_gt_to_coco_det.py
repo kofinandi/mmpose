@@ -106,6 +106,9 @@ def _inst_id_from_item(item: dict, idx: Optional[int]) -> Optional[int]:
 
 
 def _build_gt_instance_dict(item: dict, idx: Optional[int] = None) -> dict:
+    raw_ann = item.get('raw_ann_info')
+    if isinstance(raw_ann, list) and idx is not None and idx < len(raw_ann):
+        raw_ann = raw_ann[idx]
     return {
         'keypoints': _take_instance_field(item, 'keypoints', idx),
         'keypoints_visible': _take_instance_field(item, 'keypoints_visible', idx),
@@ -114,6 +117,7 @@ def _build_gt_instance_dict(item: dict, idx: Optional[int] = None) -> dict:
         'orig_area': _orig_area_from_item(item, idx),
         'category_id': _category_id_from_item(item, idx),
         'id': _inst_id_from_item(item, idx),
+        'raw_ann_info': raw_ann,
     }
 
 

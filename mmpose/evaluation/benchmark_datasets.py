@@ -2,9 +2,10 @@
 """Registry and helpers for cross-dataset benchmark evaluation.
 
 Maps standard COCO-trained model configs onto alternate test datasets
-(CrowdPose, MPII, AIC, OCHuman) without duplicating per-model config files.
-Swap ``test_dataloader.dataset``, insert ``KeypointConverter`` before
-``PackPoseInputs``, and use ``CocoMetric(gt_from_samples=True)``.
+(CrowdPose, MPII, AIC, OCHuman, EMDB) without duplicating per-model config
+files.  Swap ``test_dataloader.dataset``, insert ``KeypointConverter`` before
+``PackPoseInputs``, and use ``CocoMetric(gt_from_samples=True)`` unless
+``preserve_evaluator`` is set on the dataset spec (e.g. EMDB temporal metrics).
 
 ``dst='coco'`` assumes 17-keypoint COCO-trained checkpoints. Whole-body or
 Halpe models need a different destination convention and are out of scope.
@@ -25,7 +26,8 @@ EXTENDED_PACK_META_KEYS = (
     'raw_ann_info', 'dataset_name', 'area',
 )
 
-BENCHMARK_TEST_DATASET_NAMES = ('coco', 'crowdpose', 'mpii', 'aic', 'ochuman')
+BENCHMARK_TEST_DATASET_NAMES = (
+    'coco', 'crowdpose', 'mpii', 'aic', 'ochuman', 'emdb')
 
 
 @dataclass(frozen=True)
@@ -38,6 +40,8 @@ class BenchmarkTestDataset:
     data_prefix: dict
     keypoint_src: str
     extended_meta_keys: bool = True
+    dataset_kwargs: Optional[dict] = None
+    preserve_evaluator: bool = False
 
 
 BENCHMARK_TEST_DATASETS: Dict[str, Optional[BenchmarkTestDataset]] = {
@@ -72,6 +76,18 @@ BENCHMARK_TEST_DATASETS: Dict[str, Optional[BenchmarkTestDataset]] = {
         'ochuman_coco_format_val_range_0.00_1.00.json',
         data_prefix=dict(img='ochuman/images/'),
         keypoint_src='ochuman',
+    ),
+    'emdb': BenchmarkTestDataset(
+        dataset_type='EmdbDataset',
+        data_root='data/emdb/',
+        ann_file='annotations/emdb_all.json',
+        data_prefix=dict(img=''),
+        keypoint_src='emdb',
+        dataset_kwargs=dict(
+            emdb1=True,
+            emdb2=False,
+            good_frame_mask=True,
+        ),
     ),
 }
 
@@ -170,7 +186,7 @@ def apply_benchmark_test_dataset(
         spec.extended_meta_keys,
     )
 
-    cfg.test_dataloader.dataset = dict(
+    dataset_cfg = dict(
         type=spec.dataset_type,
         data_root=spec.data_root,
         data_mode=data_mode,
@@ -179,4 +195,9 @@ def apply_benchmark_test_dataset(
         pipeline=pipeline,
         test_mode=True,
     )
-    cfg.test_evaluator = _build_evaluator_with_gt_from_samples(cfg)
+    if spec.dataset_kwargs:
+        dataset_cfg.update(spec.dataset_kwargs)
+    cfg.test_dataloader.dataset = dataset_cfg
+
+    if not spec.preserve_evaluator:
+        cfg.test_evaluator = _build_evaluator_with_gt_from_samples(cfg)

@@ -27,13 +27,17 @@ _METRIC_PREFIX = {
 
 
 def _parse_frame_id(img_path: str) -> int:
-    """Extract the zero-based frame index from a 3DPW image path.
+    """Extract the zero-based frame index from a video image path.
 
-    The filename convention is ``image_XXXXX.jpg`` (5-digit zero-padded),
-    e.g. ``imageFiles/downtown_arguing_00/image_00042.jpg`` → ``42``.
+    Supports:
+
+    - 3DPW: ``image_XXXXX.jpg`` (e.g. ``image_00042`` → ``42``)
+    - EMDB: ``XXXXX.jpg`` (e.g. ``00042`` → ``42``)
     """
-    basename = osp.splitext(osp.basename(img_path))[0]  # 'image_00042'
-    return int(basename.split('_')[-1])
+    basename = osp.splitext(osp.basename(img_path))[0]
+    if basename.startswith('image_'):
+        return int(basename.split('_')[-1])
+    return int(basename)
 
 
 class _TemporalBaseMetric(BaseMetric):
