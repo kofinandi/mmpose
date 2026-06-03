@@ -28,6 +28,7 @@ Usage example::
     )
 """
 
+import contextlib
 import os
 import sys
 from typing import Optional
@@ -59,6 +60,15 @@ class PETRPoseEstimator(BaseModel):
         petr_model_cfg (dict): Full model configuration dict for
             ``opera.models.build_model``.  Must include at minimum ``type``,
             ``backbone``, ``neck``, ``bbox_head``, and ``test_cfg``.
+        fp16 (bool): Run inference under CUDA automatic mixed precision
+            (``torch.autocast`` with ``float16``) for lower GPU memory usage.
+            Weights stay in float32; only the forward pass uses half precision.
+            Defaults to ``True`` because PETR is memory-heavy even at batch
+            size 1.
+        torch_compile (bool): Wrap ``petr_model`` with ``torch.compile`` on the
+            first forward pass.  This can improve throughput but does not reduce
+            peak memory and may increase it during compilation.  Defaults to
+            ``False``.
         data_preprocessor (dict | None): Config for ``PoseDataPreprocessor``.
         init_cfg (dict | None): Unused; kept for API compatibility.
     """
@@ -67,6 +77,8 @@ class PETRPoseEstimator(BaseModel):
         self,
         petr_model_cfg: dict,
         petr_root: str = _PETR_ROOT,
+        fp16: bool = True,
+        torch_compile: bool = False,
         data_preprocessor: Optional[dict] = None,
         init_cfg=None,
     ):
@@ -95,6 +107,10 @@ class PETRPoseEstimator(BaseModel):
         cfg = copy.deepcopy(petr_model_cfg)
         self.petr_model = build_model(cfg)
         self.petr_model.eval()
+
+        self.fp16 = fp16
+        self.torch_compile = torch_compile
+        self._compiled = False
 
         self.test_cfg = petr_model_cfg.get('test_cfg', {})
         self._register_load_state_dict_pre_hook(self._remap_checkpoint_keys)
@@ -134,6 +150,25 @@ class PETRPoseEstimator(BaseModel):
     # Predict
     # ------------------------------------------------------------------
 
+    def _maybe_compile(self) -> None:
+        """Apply ``torch.compile`` once, lazily on first inference."""
+        if not self.torch_compile or self._compiled:
+            return
+        self.petr_model = torch.compile(
+            self.petr_model, mode='reduce-overhead')
+        self._compiled = True
+
+    @contextlib.contextmanager
+    def _amp_context(self, inputs: torch.Tensor):
+        """Enable FP16 autocast for CUDA inference when ``self.fp16`` is set."""
+        if self.fp16 and inputs.is_cuda:
+            with torch.autocast(
+                    device_type=inputs.device.type,
+                    dtype=torch.float16):
+                yield
+        else:
+            yield
+
     def _inference_forward(self, inputs: torch.Tensor,
                            img_metas: list) -> list:
         """Run the PETR neural network and return raw detection results.
@@ -152,14 +187,17 @@ class PETRPoseEstimator(BaseModel):
         Returns:
             list[tuple]: One ``(bbox_result, kpt_result)`` tuple per image.
         """
+        self._maybe_compile()
+
         batch_size = inputs.shape[0]
         all_results = []
-        for i in range(batch_size):
-            single_img = inputs[i:i + 1]
-            single_meta = [img_metas[i]]
-            res = self.petr_model.simple_test(
-                single_img, single_meta, rescale=True)
-            all_results.append(res[0])  # (bbox_result, kpt_result)
+        with self._amp_context(inputs):
+            for i in range(batch_size):
+                single_img = inputs[i:i + 1]
+                single_meta = [img_metas[i]]
+                res = self.petr_model.simple_test(
+                    single_img, single_meta, rescale=True)
+                all_results.append(res[0])  # (bbox_result, kpt_result)
         return all_results
 
     def predict(self, inputs: torch.Tensor,
