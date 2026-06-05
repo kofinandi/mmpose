@@ -15,6 +15,41 @@ from mmpose.evaluation.functional.nms import oks_iou
 from mmpose.structures import split_instances
 
 
+def normalize_keypoint_visibility(
+    visibility: Union[np.ndarray, Sequence, None],
+    num_keypoints: Optional[int] = None,
+) -> Optional[np.ndarray]:
+    """Return per-joint visibility scores with shape ``(K,)``.
+
+    Supports dataset layouts ``(K,)``, ``(1, K)``, ``(1, K, 1)``, and
+    ``KeypointConverter`` outputs ``(K, 2)`` / ``(1, K, 2)`` where the second
+    channel is a loss weight, not visibility.
+    """
+    if visibility is None:
+        return None
+
+    vis = np.asarray(visibility, dtype=np.float32)
+    if vis.ndim == 3:
+        vis = vis[0]
+    if vis.ndim == 2:
+        if vis.shape[0] == 1:
+            vis = vis[0]
+        elif vis.shape[1] in (1, 2):
+            vis = vis[:, 0]
+
+    vis = vis.reshape(-1)
+    k = num_keypoints if num_keypoints is not None else vis.size
+    if vis.size == k * 2:
+        vis = vis.reshape(k, 2)[:, 0]
+    elif vis.size > k:
+        vis = vis[:k]
+    elif vis.size < k:
+        padded = np.zeros(k, dtype=np.float32)
+        padded[:vis.size] = vis
+        vis = padded
+    return vis
+
+
 def _json_default(obj: Any) -> Any:
     if isinstance(obj, np.ndarray):
         return obj.tolist()
@@ -52,12 +87,11 @@ def serialize_gt_instances(
 
         kv = g.get('keypoints_visible')
         if kv is not None:
-            kv = np.asarray(kv)
-            if kv.ndim == 3:
-                kv = kv[0, :, 0] if kv.shape[-1] == 1 else kv[0]
-            elif kv.ndim == 2 and kv.shape[0] == 1:
-                kv = kv[0]
-            inst['keypoints_visible'] = np.atleast_1d(kv).tolist()
+            n_kpts = None
+            if inst.get('keypoints') is not None:
+                n_kpts = len(inst['keypoints'])
+            kv = normalize_keypoint_visibility(kv, n_kpts)
+            inst['keypoints_visible'] = kv.tolist()
 
         bbox = g.get('bbox')
         if bbox is not None:
@@ -84,10 +118,12 @@ def _serialize_gt_instance_data(gt_inst: InstanceData) -> List[dict]:
             inst['keypoints'] = np.asarray(gt_inst.keypoints[i]).tolist()
         if hasattr(gt_inst, 'keypoints_visible') and len(
                 gt_inst.keypoints_visible) > i:
-            vis = gt_inst.keypoints_visible[i]
-            if np.asarray(vis).ndim > 1:
-                vis = np.asarray(vis).reshape(-1)
-            inst['keypoints_visible'] = np.asarray(vis).tolist()
+            n_kpts = None
+            if has_keypoints:
+                n_kpts = int(np.asarray(gt_inst.keypoints[i]).reshape(-1, 2).shape[0])
+            vis = normalize_keypoint_visibility(
+                gt_inst.keypoints_visible[i], n_kpts)
+            inst['keypoints_visible'] = vis.tolist()
         if has_bboxes and len(gt_inst.bboxes) > i:
             inst['bbox'] = np.asarray(gt_inst.bboxes[i]).reshape(-1)[:4].tolist()
         if hasattr(gt_inst, 'orig_areas') and len(gt_inst.orig_areas) > i:
@@ -112,9 +148,7 @@ def _to_oks_vector(keypoints: np.ndarray,
 
     num_kpts = kpts.shape[0]
     if visibility is not None:
-        vis = np.asarray(visibility).reshape(-1)
-        if vis.ndim > 1:
-            vis = vis[:, 0]
+        vis = normalize_keypoint_visibility(visibility, num_kpts)
         if num_kpts is not None and vis.shape[0] != num_kpts:
             if vis.shape[0] > num_kpts:
                 vis = vis[:num_kpts]

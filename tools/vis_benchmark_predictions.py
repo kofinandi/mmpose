@@ -30,6 +30,9 @@ import mmcv
 import numpy as np
 from mmengine.structures import InstanceData
 
+from mmpose.evaluation.functional.frame_metrics import (
+    normalize_keypoint_visibility,
+)
 from mmpose.structures import PoseDataSample
 from mmpose.visualization import PoseLocalVisualizer
 
@@ -126,7 +129,8 @@ def _instances_from_json(instances: List[dict]) -> InstanceData:
             sc = np.ones(kpts.shape[0], dtype=np.float32)
         scores.append(sc)
         if 'keypoints_visible' in item:
-            vis = np.asarray(item['keypoints_visible'], dtype=np.float32).reshape(-1)
+            vis = normalize_keypoint_visibility(
+                item['keypoints_visible'], kpts.shape[0])
             visibility.append(vis)
 
     if keypoints:
