@@ -163,6 +163,12 @@ def load_pose_gt_per_image(
     _init_scope(pose_cfg)
     ds_cfg = pose_cfg.test_dataloader.dataset.to_dict()
     ds_cfg['pipeline'] = []
+    # Always use topdown mode for the GT lookup regardless of the model's
+    # data_mode.  In bottomup mode _get_bottomup_data_infos stacks all
+    # instances (including invalid ones) into a single per-image item, while
+    # _get_topdown_data_infos filters them via _is_valid_instance and returns
+    # one item per valid instance — which is exactly what we need here.
+    ds_cfg['data_mode'] = 'topdown'
     dataset = DATASETS.build(ds_cfg)
 
     kp_converter = None

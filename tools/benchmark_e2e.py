@@ -539,7 +539,15 @@ def run_bottomup(
         if i >= warmup_batches:
             batch_latencies.append((timer.elapsed_s, len(results)))
 
-        evaluator.process(data_samples=results, data_batch=batch)
+        # Replace model-provided gt_instances with the filtered per-image GT
+        # so the evaluator sees the same valid-instance set as the topdown path.
+        if gt_by_img_id is not None:
+            for ds in results:
+                img_id = int(ds.metainfo['img_id'])
+                gt_inst_data = gt_by_img_id.get(img_id, [])
+                _attach_gt_instances(ds, gt_inst_data, img_id)
+
+        evaluator.process(data_samples=results, data_batch=None)
 
         if frame_records is not None:
             for ds in results:
@@ -1322,13 +1330,27 @@ def main():
     _init_scope(pose_cfg)
     MMLogger.get_current_instance()  # ensure logger is initialised
 
-    if frame_records is not None:
-        print('Building GT lookup for prediction export...')
-        gt_by_img_id = build_gt_by_img_id(pose_cfg, args.num_frames)
-
     use_real_detector = bool(args.det_config and args.det_checkpoint)
     is_topdown = args.mock_detector or use_real_detector
     model_type = pose_cfg.model.get('type', '')
+
+    # Build the per-image GT lookup when it is needed for:
+    #   (a) frame_records export (--model-name), or
+    #   (b) bottomup evaluation with gt_from_samples=True — in this path GT
+    #       flows opaquely through model.test_step from a data_mode='bottomup'
+    #       dataset which stacks ALL instances including invalid ones.  We
+    #       override gt_instances on each result with the filtered GT built by
+    #       load_pose_gt_per_image (which forces data_mode='topdown') so both
+    #       modes evaluate against the same valid-instance set.
+    _bottomup_needs_gt = (
+        not is_topdown
+        and 'Bottomup' in model_type
+        and _evaluator_needs_gt_from_samples(pose_cfg)
+    )
+    if frame_records is not None or _bottomup_needs_gt:
+        print('Building GT lookup for prediction export...')
+        gt_by_img_id = build_gt_by_img_id(pose_cfg, args.num_frames)
+
     if 'Bottomup' in model_type and is_topdown:
         raise ValueError(
             'The pose config uses a BottomupPoseEstimator but --det-config '
