@@ -12,7 +12,7 @@ import numpy as np
 from mmengine.structures import InstanceData
 
 from mmpose.evaluation.functional.nms import oks_iou
-from mmpose.structures import split_instances
+from mmpose.structures import PoseDataSample, split_instances
 
 
 def normalize_keypoint_visibility(
@@ -301,15 +301,24 @@ def build_frame_record(
     frame_id: int,
     img_path: str,
     data_root: str,
-    ori_shape: Tuple[int, int],
-    pred_instances: List[dict],
+    pred_ds: PoseDataSample,
     gt_instances: List[dict],
     dataset_meta: dict,
-    det_bboxes: Optional[np.ndarray] = None,
-    det_scores: Optional[np.ndarray] = None,
     match_thr: float = 0.5,
 ) -> dict:
-    """Build one frame dict for ``frames.json``."""
+    """Build one frame dict for ``frames.json``.
+
+    Prediction instances, shape, and optional raw detector bboxes are read
+    directly from ``pred_ds`` so callers don't need to extract them separately.
+    Raw detector output (before keypoint refinement) is stored in
+    ``pred_ds.metainfo`` under ``'det_bboxes'`` / ``'det_scores'`` by
+    :func:`run_topdown`.
+    """
+    pred_instances = serialize_pred_instances(pred_ds.pred_instances)
+    ori_shape = pred_ds.metainfo.get('ori_shape', (0, 0))
+    det_bboxes = pred_ds.metainfo.get('det_bboxes')
+    det_scores = pred_ds.metainfo.get('det_scores')
+
     sigmas = np.asarray(dataset_meta.get('sigmas', []), dtype=np.float32)
     matches, metrics = match_instances_oks(
         gt_instances, pred_instances, sigmas, match_thr=match_thr)

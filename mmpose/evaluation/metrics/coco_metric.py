@@ -348,12 +348,14 @@ class CocoMetric(BaseMetric):
             keypoints = gt_instances.get('keypoints')
             kpts_vis = gt_instances.get('keypoints_visible')
             orig_areas = gt_instances.get('orig_areas')
+            iscrowd_arr = gt_instances.get('iscrowd')
         else:
             bboxes = getattr(gt_instances, 'bboxes', None)
             bbox_scales = getattr(gt_instances, 'bbox_scales', None)
             keypoints = getattr(gt_instances, 'keypoints', None)
             kpts_vis = getattr(gt_instances, 'keypoints_visible', None)
             orig_areas = getattr(gt_instances, 'orig_areas', None)
+            iscrowd_arr = getattr(gt_instances, 'iscrowd', None)
 
         # Area from raw_ann_info (e.g. COCO segmentation-mask area).
         # Takes priority over all other fallbacks so COCO keeps its exact area.
@@ -450,6 +452,12 @@ class CocoMetric(BaseMetric):
                      kv.astype(np.float32)],
                     axis=1).flatten().tolist()
 
+            # Use real iscrowd when available (set by unified benchmark loader).
+            if iscrowd_arr is not None and i < len(iscrowd_arr):
+                iscrowd = int(iscrowd_arr[i])
+            else:
+                iscrowd = 0
+
             ann = dict(
                 id=ann_id,
                 image_id=img_id,
@@ -457,7 +465,7 @@ class CocoMetric(BaseMetric):
                 bbox=bbox_xywh,
                 keypoints=kpts_flat,
                 num_keypoints=num_visible,
-                iscrowd=0,
+                iscrowd=iscrowd,
                 area=area,
             )
             anns.append(ann)

@@ -9,6 +9,13 @@ Supports two modes:
 Quality metrics are the same as tools/test.py (CocoMetric, PCK, etc.).
 Performance metrics cover FPS and per-frame/per-location latency at
 whole-pipeline and per-stage granularity.
+
+Data loading is unified via :func:`load_unified_samples`: all datasets
+(coco, crowdpose, mpii, aic, ochuman, emdb) go through one code path that
+loads every annotation unfiltered, converts keypoints to COCO-17 format,
+and prefetches images.  GT is never read from the model pipeline; it is
+assembled from :class:`UnifiedSample` and attached to each
+:class:`PoseDataSample` before metric evaluation.
 """
 
 from mmpose.compat.transformers_v5 import install_transformers_v5_shims
@@ -34,29 +41,28 @@ from mmengine.dataset import Compose, pseudo_collate
 from mmengine.evaluator import Evaluator
 from mmengine.logging import MMLogger
 from mmengine.registry import init_default_scope
+from mmengine.structures import InstanceData
 
 # Register all mmpose modules
 import mmpose.datasets       # noqa: F401
 import mmpose.evaluation     # noqa: F401
 import mmpose.models         # noqa: F401
-from mmengine.registry import DATASETS, METRICS
+from mmengine.registry import METRICS
 from mmpose.apis.det_inference import inference_det_model, init_det_model
 from mmpose.apis import init_model
+from mmpose.evaluation.benchmark_datasets import BENCHMARK_TEST_DATASETS
 from mmpose.evaluation.functional import nms
-from mmpose.evaluation.benchmark_datasets import (
-    BENCHMARK_TEST_DATASET_NAMES,
-    apply_benchmark_test_dataset,
+from mmpose.evaluation.functional.benchmark_data import (
+    GTInstance,
+    UnifiedSample,
+    build_det_ann_from_samples,
+    is_valid_instance,
+    load_unified_samples,
 )
 from mmpose.evaluation.functional.frame_metrics import (
     build_frame_record,
     save_prediction_bundle,
-    serialize_gt_instances,
-    serialize_pred_instances,
     sanitize_dataset_meta,
-)
-from mmpose.evaluation.functional.pose_gt_to_coco_det import (
-    load_pose_gt_per_image,
-    resolve_det_ann_file,
 )
 from mmpose.structures import PoseDataSample, merge_data_samples
 
@@ -66,7 +72,7 @@ try:
 except (ImportError, ModuleNotFoundError):
     HAS_MMDET = False
 
-# Named tuple carried through the producer->consumer queue
+# Named tuple carried through the producer→consumer queue
 BBoxItem = collections.namedtuple(
     'BBoxItem',
     ['frame_id', 'img_id', 'img', 'bbox_xyxy', 'det_score',
@@ -102,7 +108,7 @@ class _CudaTimer:
             self.elapsed_s = time.perf_counter() - self._t0
 
 
-# ── Dataset helpers ────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────
 
 def _init_scope(cfg: Config) -> None:
     scope = cfg.get('default_scope', 'mmpose')
@@ -110,154 +116,21 @@ def _init_scope(cfg: Config) -> None:
         init_default_scope(scope)
 
 
-def build_unique_image_list(
-    pose_cfg: Config,
-    num_frames: Optional[int] = None,
-) -> List[Tuple[int, str]]:
-    """Return [(img_id, img_path), ...] with one entry per unique image.
-
-    For bottomup configs the dataset is already per-image; for topdown
-    configs (one item per GT instance) we deduplicate by img_id.
-    """
-    _init_scope(pose_cfg)
-    ds_cfg = pose_cfg.test_dataloader.dataset.to_dict()
-    ds_cfg['pipeline'] = []
-    dataset = DATASETS.build(ds_cfg)
-
-    seen: dict = {}
-    for idx in range(len(dataset)):
-        item = dataset[idx]
-        img_id = item['img_id']
-        if img_id not in seen:
-            seen[img_id] = item['img_path']
-        if num_frames is not None and len(seen) >= num_frames:
-            break
-
-    return list(seen.items())
-
-
-def _evaluator_needs_gt_from_samples(pose_cfg: Config) -> bool:
-    """Return True when evaluation needs per-sample GT from the dataset."""
-    ev_cfg = pose_cfg.test_evaluator
-    if isinstance(ev_cfg, dict):
-        ev_cfg = [ev_cfg]
-    if any(m.get('gt_from_samples', False) for m in ev_cfg):
-        return True
-    # Temporal / PCK metrics read GT keypoints and raw_ann_info (track_id).
-    _GT_FROM_DATASET_TYPES = {
-        'PCKAccuracy', 'AUC', 'EPE', 'MPJVE', 'MPJAE',
-    }
-    return any(m.get('type') in _GT_FROM_DATASET_TYPES for m in ev_cfg)
-
-
-def build_gt_by_img_id(
-    pose_cfg: Config,
-    num_frames: Optional[int] = None,
-) -> Dict[int, list]:
-    """Map COCO ``img_id`` to per-instance GT dicts in original image coords."""
-    return {
-        img_id: gt_insts
-        for img_id, _, gt_insts in load_pose_gt_per_image(
-            pose_cfg, num_frames)
-    }
-
-
-def build_gt_instances_per_frame(
-    pose_cfg: Config,
-    img_list: List[Tuple[int, str]],
-) -> Dict[int, list]:
-    """Map frame index to per-instance GT dicts for metric evaluation.
-
-    Used in real-detector mode when ``gt_from_samples=True``: predictions
-    come from the detector, but CocoMetric still needs GT keypoints/area
-    attached to each sample.
-    """
-    gt_data = build_gt_bbox_image_list(pose_cfg, num_frames=len(img_list))
-    gt_by_img_id = {iid: insts for iid, _, _, _, insts in gt_data}
-    return {
-        fid: gt_by_img_id[img_id]
-        for fid, (img_id, _) in enumerate(img_list)
-        if img_id in gt_by_img_id
-    }
-
-
-def build_gt_bbox_image_list(
-    pose_cfg: Config,
-    num_frames: Optional[int] = None,
-) -> List[Tuple[int, str, np.ndarray, np.ndarray, list]]:
-    """Return GT bbox info from the test dataset, one entry per unique image.
-
-    Returns a list of
-    ``(img_id, img_path, bboxes_xyxy, bbox_scores, gt_instances_list)``
-    where:
-
-    - ``bboxes_xyxy`` has shape ``(N, 4)``
-    - ``bbox_scores`` has shape ``(N,)`` with all values set to 1.0
-    - ``gt_instances_list`` is a list of per-instance dicts with keys
-      ``keypoints``, ``keypoints_visible``, ``bbox_scale``, ``area``,
-      ``category_id``, and ``id``.  If the test pipeline contains a
-      ``KeypointConverter``, it is applied to each raw item so keypoints
-      arrive in the target order (e.g. COCO) for metric evaluation.
-    """
-    result = []
-    for img_id, img_path, gt_insts in load_pose_gt_per_image(
-            pose_cfg, num_frames):
-        boxes = np.stack(
-            [g['bbox'].reshape(4) for g in gt_insts],
-            axis=0,
-        ).astype(np.float32)
-        scores = np.ones(len(boxes), dtype=np.float32)
-        result.append((img_id, img_path, boxes, scores, gt_insts))
-    return result
-
-
-def prefetch_images(
-    img_list: List[Tuple[int, str]],
-) -> List[Tuple[int, np.ndarray]]:
-    """Load all images into memory as BGR numpy arrays."""
-    print(f'Prefetching {len(img_list)} images...')
-    result = []
-    for img_id, img_path in img_list:
-        img = mmcv.imread(img_path)  # BGR, HWC
-        result.append((img_id, img))
-    print('Prefetch complete.')
-    return result
-
-
-def build_bottomup_batches(
-    pose_cfg: Config,
-    kp_batch_size: int,
-    num_frames: Optional[int] = None,
-) -> Tuple[list, int]:
-    """Apply val pipeline and partition into batches for bottomup mode.
-
-    Returns (batches, total_items) where each batch is
-    (pseudo_collated_dict, list_of_img_ids).
-    """
-    _init_scope(pose_cfg)
-    ds_cfg = pose_cfg.test_dataloader.dataset.to_dict()
-    ds_cfg['pipeline'] = pose_cfg.test_dataloader.dataset.pipeline
-    dataset = DATASETS.build(ds_cfg)
-
-    total = len(dataset)
-    if num_frames is not None:
-        total = min(total, num_frames)
-
-    batches = []
-    for start in range(0, total, kp_batch_size):
-        end = min(start + kp_batch_size, total)
-        items = [dataset[i] for i in range(start, end)]
-        img_ids = [it['data_samples'].metainfo['img_id'] for it in items]
-        batch = pseudo_collate(items)
-        batches.append((batch, img_ids))
-
-    return batches, total
+def _data_root_for_dataset(dataset_name: str) -> str:
+    """Return the data root for the dataset being evaluated."""
+    return BENCHMARK_TEST_DATASETS[dataset_name].data_root
 
 
 # ── Evaluator helpers ──────────────────────────────────────────────────────
 
 def build_evaluator(pose_cfg: Config, dataset_meta: dict) -> Evaluator:
-    """Build mmengine Evaluator from the config's test_evaluator section."""
+    """Build an mmengine Evaluator from the config's test_evaluator section.
+
+    Forces ``gt_from_samples=True`` and removes ``ann_file`` on every metric
+    so that ground truth is always synthesised from the unified loader data
+    rather than read from the dataset's annotation file.  This makes every
+    dataset (including COCO) behave consistently.
+    """
     _init_scope(pose_cfg)
     ev_cfg = pose_cfg.test_evaluator
     if isinstance(ev_cfg, dict):
@@ -265,6 +138,9 @@ def build_evaluator(pose_cfg: Config, dataset_meta: dict) -> Evaluator:
 
     metrics = []
     for m_cfg in ev_cfg:
+        m_cfg = dict(m_cfg)
+        m_cfg['gt_from_samples'] = True
+        m_cfg.pop('ann_file', None)
         m = METRICS.build(m_cfg)
         m.dataset_meta = dataset_meta
         metrics.append(m)
@@ -273,15 +149,13 @@ def build_evaluator(pose_cfg: Config, dataset_meta: dict) -> Evaluator:
 
 
 def build_det_evaluator(
-    pose_cfg: Config,
-    num_frames: Optional[int] = None,
-) -> Evaluator:
-    """COCO bbox AP/AR for the person (human) class only.
+    samples: List[UnifiedSample],
+) -> 'Evaluator':
+    """COCO bbox AP/AR for the person class only.
 
-    Uses the annotation file referenced by the pose config when it is already
-    in COCO bbox-detection format; otherwise converts pose-dataset GT on the
-    fly.  Restricts evaluation to the images that were actually processed
-    (important when --num-frames is set).
+    Uses :func:`build_det_ann_from_samples` to build the annotation file
+    from the already-loaded unified samples so that ``iscrowd`` values are
+    preserved correctly.
     """
     if not HAS_MMDET:
         raise ImportError(
@@ -291,13 +165,7 @@ def build_det_evaluator(
     from mmdet.evaluation.metrics import CocoMetric as _CocoMetric
 
     class _SubsetCocoMetric(_CocoMetric):
-        """CocoMetric that evaluates only on the images seen during process().
-
-        Standard CocoMetric uses every image in the annotation file as the
-        denominator for recall.  When only a subset of frames is benchmarked
-        (--num-frames), that would unfairly depress AR.  This subclass tracks
-        which img_ids were actually processed and restricts COCOeval to those.
-        """
+        """CocoMetric restricted to images actually processed."""
 
         def process(self, data_batch, data_samples):
             if not hasattr(self, '_seen_img_ids'):
@@ -310,22 +178,18 @@ def build_det_evaluator(
             if getattr(self, '_seen_img_ids', None):
                 self.img_ids = sorted(self._seen_img_ids)
             out = super().compute_metrics(results)
-            # CocoMetric hardcodes key names using the default proposal_nums
-            # (100, 300, 1000).  Build an explicit rename table so that keys
-            # reflect the actual maxDets values used.  String-replacement is
-            # avoided because '@1000' contains '@100' as a substring.
-            nums = self.proposal_nums  # e.g. [5, 10, 100]
+            nums = self.proposal_nums
             ar_renames = {
-                f'bbox_AR@100':    f'bbox_AR@{nums[0]}',
-                f'bbox_AR@300':    f'bbox_AR@{nums[1]}',
-                f'bbox_AR@1000':   f'bbox_AR@{nums[2]}',
-                f'bbox_AR_s@1000': f'bbox_AR_s@{nums[2]}',
-                f'bbox_AR_m@1000': f'bbox_AR_m@{nums[2]}',
-                f'bbox_AR_l@1000': f'bbox_AR_l@{nums[2]}',
+                'bbox_AR@100':    f'bbox_AR@{nums[0]}',
+                'bbox_AR@300':    f'bbox_AR@{nums[1]}',
+                'bbox_AR@1000':   f'bbox_AR@{nums[2]}',
+                'bbox_AR_s@1000': f'bbox_AR_s@{nums[2]}',
+                'bbox_AR_m@1000': f'bbox_AR_m@{nums[2]}',
+                'bbox_AR_l@1000': f'bbox_AR_l@{nums[2]}',
             }
             return {ar_renames.get(k, k): v for k, v in out.items()}
 
-    ann_file = resolve_det_ann_file(pose_cfg, num_frames=num_frames)
+    ann_file = build_det_ann_from_samples(samples)
 
     metric = _SubsetCocoMetric(
         ann_file=ann_file,
@@ -343,40 +207,24 @@ def build_det_evaluator(
     return Evaluator([metric])
 
 
-def _make_topdown_data_sample(
+# ── Sample → PoseDataSample helpers ──────────────────────────────────────
+
+def _merge_pose_predictions_to_posedatasample(
     img_id: int,
     bbox_results: list,
     det_scores: List[float],
     ori_shape: Tuple[int, int],
-    gt_instances_data: Optional[list] = None,
     img_path: Optional[str] = None,
 ) -> PoseDataSample:
-    """Merge per-bbox PoseDataSamples into a single per-image PoseDataSample.
+    """Merge per-bbox keypoint results into a single per-image PoseDataSample.
 
-    Sets ``id`` as a list so ``CocoMetric._sort_and_unique_bboxes`` skips
-    deduplication (matching bottomup convention) and all N detected persons
-    are preserved.
-
-    Args:
-        img_id: Image identifier.
-        bbox_results: Per-bbox ``PoseDataSample`` outputs from the keypoint
-            model.
-        det_scores: Detector confidence score for each bbox.
-        ori_shape: ``(height, width)`` of the original image.
-        gt_instances_data: Optional list of per-GT-instance dicts, each with
-            keys ``keypoints``, ``keypoints_visible``, ``bbox_scale``,
-            ``area``, ``category_id``, and ``id``.  When provided the GT
-            data is written onto ``merged.gt_instances`` so that metrics
-            with ``gt_from_samples=True`` (e.g. :class:`CocoMetric`) can
-            synthesize ground-truth annotations without an ``ann_file``.
+    Prediction-only; GT is attached separately by :func:`_attach_gt_to_sample`.
     """
-    from mmengine.structures import InstanceData
-
     n = len(bbox_results)
+    num_kpts = 17  # COCO default; may be overridden if model differs
 
     if n == 0:
         ds = PoseDataSample()
-        num_kpts = 17  # COCO default; will be overridden if model differs
         meta = {
             'img_id': img_id,
             'id': [img_id],
@@ -392,11 +240,6 @@ def _make_topdown_data_sample(
         pred_inst.bboxes = np.zeros((0, 4), dtype=np.float32)
         pred_inst.bbox_scores = np.zeros(0, dtype=np.float32)
         ds.pred_instances = pred_inst
-        gt_inst = InstanceData()
-        gt_inst.bbox_scores = np.zeros(0, dtype=np.float32)
-        ds.gt_instances = gt_inst
-        if gt_instances_data:
-            _attach_gt_instances(ds, gt_instances_data, img_id)
         return ds
 
     # Inject detector scores into each result's gt_instances so that
@@ -405,9 +248,6 @@ def _make_topdown_data_sample(
         res.gt_instances.bbox_scores = np.array([score], dtype=np.float32)
 
     merged = merge_data_samples(bbox_results)
-
-    # Detector scores belong on pred_instances; gt_instances may be replaced
-    # below with dataset GT that has a different instance count.
     merged.pred_instances.bbox_scores = np.array(det_scores, dtype=np.float32)
 
     # Use a list of unique synthetic IDs to trigger the bottomup code path
@@ -423,113 +263,120 @@ def _make_topdown_data_sample(
     if img_path is not None:
         meta['img_path'] = img_path
     merged.set_metainfo(meta)
-
-    # Attach GT instances so that CocoMetric with gt_from_samples=True can
-    # synthesize COCO-format ground-truth annotations.
-    if gt_instances_data:
-        _attach_gt_instances(merged, gt_instances_data, img_id)
-
     return merged
 
 
-def _attach_gt_instances(
-    data_sample: PoseDataSample,
-    gt_instances_data: list,
-    img_id: int,
-) -> None:
-    """Write stacked GT keypoint/bbox arrays into data_sample.gt_instances.
+def _attach_gt_to_posedatasample(
+    ds: PoseDataSample,
+    sample: UnifiedSample,
+) -> PoseDataSample:
+    """Attach GT annotations from a :class:`UnifiedSample` to a prediction PoseDataSample.
 
-    Args:
-        data_sample: The merged per-image ``PoseDataSample``.  Its
-            ``gt_instances`` is updated in-place.
-        gt_instances_data: List of per-GT-instance dicts as produced by
-            :func:`build_gt_bbox_image_list`.
-        img_id: Image identifier used as a fallback for generating unique
-            annotation ids when the GT dicts don't carry an ``id`` field.
+    Builds ``gt_instances`` (with ``keypoints``, ``keypoints_visible``,
+    ``bboxes``, ``orig_areas``, and ``iscrowd``) and updates the metainfo
+    with the real annotation IDs and optional ``crowd_index``.
     """
-    from mmengine.structures import InstanceData
+    gt_insts = sample.gt_instances
+    n = len(gt_insts)
 
-    n = len(gt_instances_data)
-    if n == 0:
-        return
+    gt = InstanceData()
+    if n > 0:
+        gt.keypoints = np.stack(
+            [g.keypoints for g in gt_insts], axis=0).astype(np.float32)
+        gt.keypoints_visible = np.stack(
+            [g.keypoints_visible for g in gt_insts], axis=0).astype(np.float32)
+        gt.bboxes = np.stack(
+            [g.bbox for g in gt_insts], axis=0).astype(np.float32)
+        gt.orig_areas = np.array(
+            [g.area for g in gt_insts], dtype=np.float32)
+        gt.iscrowd = np.array(
+            [g.iscrowd for g in gt_insts], dtype=np.int32)
 
-    def _stack(key):
-        arrays = [g.get(key) for g in gt_instances_data]
-        if any(a is None for a in arrays):
-            return None
-        return np.concatenate([np.atleast_2d(a) for a in arrays], axis=0)
+    ds.gt_instances = gt
 
-    # Replace gt_instances entirely.  After merge_data_samples the existing
-    # gt_instances has one entry per *detection*; GT may have a different
-    # count (real-detector mode), so we must not update it in-place.
-    gt_inst = InstanceData()
-    data_sample.gt_instances = gt_inst
+    # Use actual annotation IDs (list → CocoMetric skips deduplication and
+    # uses these as annotation IDs when synthesising raw_ann_info).
+    gt_ids = [g.id for g in gt_insts] if n > 0 else [sample.img_id]
+    meta_update: dict = {'id': gt_ids}
+    if sample.crowd_index is not None:
+        meta_update['crowd_index'] = float(sample.crowd_index)
+    ds.set_metainfo(meta_update)
+    return ds
 
-    # keypoints: each item is (1, K, 2) → stack to (N, K, 2)
-    kpts = _stack('keypoints')
-    if kpts is not None:
-        gt_inst.keypoints = kpts.astype(np.float32)
 
-    # keypoints_visible: each item is (1, K) or (1, K, 2) → (N, K) or (N, K, 2)
-    kv = _stack('keypoints_visible')
-    if kv is not None:
-        gt_inst.keypoints_visible = kv.astype(np.float32)
-
-    # bbox_scale: each item is (1, 2) → (N, 2)
-    bs = _stack('bbox_scale')
-    if bs is not None:
-        gt_inst.bbox_scales = bs.astype(np.float32)
-
-    # bbox: each item is (1, 4) xyxy → (N, 4).  Required when detector
-    # bboxes differ from GT (real-detector mode); mock mode gets these from
-    # the inference pipeline via merge_data_samples.
-    bb = _stack('bbox')
-    if bb is not None:
-        gt_inst.bboxes = bb.astype(np.float32)
-
-    # Original per-instance annotation area (mask-based for COCO, heuristic
-    # for MPII).  Store as a (N,) float array so the metric can use the
-    # correct area for OKS computation instead of the padded bbox_scale area.
-    orig_areas = [g.get('orig_area') for g in gt_instances_data]
-    if all(a is not None for a in orig_areas):
-        gt_inst.orig_areas = np.array(orig_areas, dtype=np.float32)
-
-    # Override the sample's id with the GT instance ids so that
-    # CocoMetric._synthesize_raw_ann_info produces unique annotation ids that
-    # match the original dataset's per-instance identifiers.
-    gt_ids = [g.get('id') for g in gt_instances_data]
-    if all(x is not None for x in gt_ids):
-        data_sample.set_metainfo({'id': [int(x) for x in gt_ids]})
-    else:
-        data_sample.set_metainfo(
-            {'id': list(range(img_id * 10000, img_id * 10000 + n))})
-
-    raw_ann = gt_instances_data[0].get('raw_ann_info')
-    if isinstance(raw_ann, dict):
-        data_sample.set_metainfo({'raw_ann_info': raw_ann})
+def _pose_dicts_from_unifiedsample(sample: UnifiedSample) -> List[dict]:
+    """Build serialisation-friendly GT dicts from a :class:`UnifiedSample`."""
+    return [
+        {
+            'keypoints': g.keypoints,
+            'keypoints_visible': g.keypoints_visible,
+            'bbox': g.bbox,
+            'orig_area': g.area,
+        }
+        for g in sample.gt_instances
+    ]
 
 
 # ── Bottomup pipeline ──────────────────────────────────────────────────────
 
 def run_bottomup(
     model,
-    batches: list,
-    total_frames: int,
-    evaluator: Evaluator,
+    samples: List[UnifiedSample],
+    val_pipeline: Compose,
+    dataset_meta: dict,
+    kp_batch_size: int,
     device: str,
     warmup_batches: int = 3,
     log_interval: int = 100,
-    frame_records: Optional[List[dict]] = None,
-    dataset_meta: Optional[dict] = None,
-    data_root: str = '',
-    gt_by_img_id: Optional[Dict[int, list]] = None,
-) -> Tuple[dict, dict]:
-    """Bottomup benchmark loop with CUDA-event timing."""
-    batch_latencies: List[Tuple[float, int]] = []  # (elapsed_s, n_samples)
-    n_batches = len(batches)
+) -> Tuple[Dict[int, PoseDataSample], dict]:
+    """Run bottomup inference on unified samples.
 
-    for i, (batch, _img_ids) in enumerate(batches):
-        # Move tensor inputs to device
+    Pre-builds all batches (images are already prefetched) then runs the
+    timed model loop.  GT and evaluation are handled in :func:`main`.
+
+    Args:
+        model: Bottomup pose estimator.
+        samples: Loaded unified samples (one per image).
+        val_pipeline: Val pipeline from config; first step handles
+            pre-loaded images via ``LoadImage``.
+        dataset_meta: Model dataset meta for pipeline augmentation.
+        kp_batch_size: Images per batch.
+        device: Target device string.
+        warmup_batches: Leading batches excluded from timing.
+        log_interval: Batches between progress prints.
+
+    Returns:
+        pred_by_img_id: Mapping ``img_id → PoseDataSample`` (prediction only).
+        perf: Performance-metric dict.
+    """
+    print('Building bottomup batches ...')
+    batches: List[Tuple[dict, List[int]]] = []
+    n = len(samples)
+    for start in range(0, n, kp_batch_size):
+        end = min(start + kp_batch_size, n)
+        items = []
+        img_ids = []
+        for sample in samples[start:end]:
+            di: dict = {
+                'img': sample.image,
+                'img_path': sample.img_path,
+                'img_id': sample.img_id,
+                # Use GT annotation IDs so CocoMetric gets the right IDs
+                # when synthesising raw_ann_info.  A list value also causes
+                # CocoMetric._sort_and_unique_bboxes to skip deduplication.
+                'id': [g.id for g in sample.gt_instances],
+                'ori_shape': sample.ori_shape,
+            }
+            di.update(dataset_meta)
+            items.append(val_pipeline(di))
+            img_ids.append(sample.img_id)
+        batches.append((pseudo_collate(items), img_ids))
+
+    batch_latencies: List[Tuple[float, int]] = []
+    n_batches = len(batches)
+    pred_by_img_id: Dict[int, PoseDataSample] = {}
+
+    for i, (batch, img_ids) in enumerate(batches):
         batch['inputs'] = [t.to(device) for t in batch['inputs']]
 
         with torch.no_grad():
@@ -539,48 +386,20 @@ def run_bottomup(
         if i >= warmup_batches:
             batch_latencies.append((timer.elapsed_s, len(results)))
 
-        # Replace model-provided gt_instances with the filtered per-image GT
-        # so the evaluator sees the same valid-instance set as the topdown path.
-        if gt_by_img_id is not None:
-            for ds in results:
-                img_id = int(ds.metainfo['img_id'])
-                gt_inst_data = gt_by_img_id.get(img_id, [])
-                _attach_gt_instances(ds, gt_inst_data, img_id)
-
-        evaluator.process(data_samples=results, data_batch=None)
-
-        if frame_records is not None:
-            for ds in results:
-                meta = ds.metainfo
-                ori_shape = meta.get('ori_shape', (0, 0))
-                img_id = int(meta['img_id'])
-                gt_src = (gt_by_img_id or {}).get(img_id, [])
-                frame_records.append(
-                    build_frame_record(
-                        img_id=img_id,
-                        frame_id=len(frame_records),
-                        img_path=meta.get('img_path', ''),
-                        data_root=data_root,
-                        ori_shape=(int(ori_shape[0]), int(ori_shape[1])),
-                        pred_instances=serialize_pred_instances(
-                            ds.pred_instances),
-                        gt_instances=serialize_gt_instances(gt_src),
-                        dataset_meta=dataset_meta,
-                    ))
+        for ds, img_id in zip(results, img_ids):
+            pred_by_img_id[img_id] = ds
 
         if (i + 1) % log_interval == 0 or (i + 1) == n_batches:
-            frames_done = sum(n for _, n in batch_latencies)
+            frames_done = sum(k for _, k in batch_latencies)
             elapsed = sum(t for t, _ in batch_latencies)
             fps_so_far = frames_done / elapsed if elapsed > 0 else 0.0
             print(f'  [bottomup] batch {i + 1}/{n_batches} '
                   f'| frames processed: {frames_done} '
                   f'| running FPS: {fps_so_far:.1f}')
 
-    quality = evaluator.evaluate(total_frames)
-
     timed_time = sum(t for t, _ in batch_latencies)
-    timed_frames = sum(n for _, n in batch_latencies)
-    per_frame = [t / n for t, n in batch_latencies]
+    timed_frames = sum(k for _, k in batch_latencies)
+    per_frame = [t / k for t, k in batch_latencies]
     batch_times = [t for t, _ in batch_latencies]
 
     perf = {
@@ -592,7 +411,7 @@ def run_bottomup(
             1000.0 * sum(per_frame) / len(per_frame) if per_frame else 0.0
         ),
     }
-    return quality, perf
+    return pred_by_img_id, perf
 
 
 # ── Topdown pipeline ───────────────────────────────────────────────────────
@@ -603,18 +422,12 @@ def _mock_detector_producer(
     det_batch_size: int,
     bbox_queue: queue.Queue,
     log_interval: int,
-    # shared output containers (written only by this thread)
     frame_start_times: dict,
     frame_end_times: dict,
     zero_det_frames: dict,
     det_predictions: dict,
 ) -> None:
-    """Producer: push GT BBoxItems into bbox_queue without running a detector.
-
-    Mirrors the structure of _detector_producer so the downstream consumer
-    and timing containers work identically, but det_timings is never written
-    (detector timing metrics will therefore report 0 in the output).
-    """
+    """Producer: push GT BBoxItems into bbox_queue without running a detector."""
     n = len(prefetched_images)
     n_batches = -(-n // det_batch_size)
 
@@ -672,21 +485,15 @@ def _detector_producer(
     bbox_queue: queue.Queue,
     warmup_batches: int,
     log_interval: int,
-    # shared output containers (written only by this thread)
     det_timings: list,
     frame_start_times: dict,
     frame_end_times: dict,
     zero_det_frames: dict,
     det_predictions: dict,
 ) -> None:
-    """Producer: run detector and push BBoxItems into bbox_queue.
-
-    For frames with zero detections the pipeline ends at the detector, so
-    frame_end_times is set here (to the wall-clock time after the detector
-    batch returns) rather than in the consumer.
-    """
+    """Producer: run detector and push BBoxItems into bbox_queue."""
     n = len(prefetched_images)
-    n_batches = -(-n // det_batch_size)  # ceil division
+    n_batches = -(-n // det_batch_size)
 
     for batch_start in range(0, n, det_batch_size):
         batch_end = min(batch_start + det_batch_size, n)
@@ -720,7 +527,6 @@ def _detector_producer(
             frame_id = batch_start + rel
             pred = det_result.pred_instances.cpu().numpy()
 
-            # Class-filter + score-threshold
             mask = np.logical_and(pred.labels == det_cat_id,
                                   pred.scores > bbox_thr)
             bboxes_s = np.concatenate(
@@ -739,7 +545,6 @@ def _detector_producer(
             h, w = img.shape[:2]
 
             if n_bboxes == 0:
-                # Pipeline ends here for this frame; record end time now.
                 zero_det_frames[frame_id] = (img_id, (h, w))
                 frame_end_times[frame_id] = wall_after_det
             else:
@@ -765,7 +570,6 @@ def _keypoint_consumer(
     bbox_queue: queue.Queue,
     warmup_batches: int,
     log_interval: int,
-    # shared output containers (written only by this thread)
     kp_timings: list,
     frame_results: dict,
     frame_end_times: dict,
@@ -783,9 +587,9 @@ def _keypoint_consumer(
         data_list = []
         for item in buf:
             di = dict(img=item.img)
-            di['bbox'] = item.bbox_xyxy[None]       # shape (1, 4)
+            di['bbox'] = item.bbox_xyxy[None]
             di['bbox_score'] = np.array(
-                [item.det_score], dtype=np.float32)  # shape (1,)
+                [item.det_score], dtype=np.float32)
             di.update(dataset_meta)
             data_list.append(kp_pipeline(di))
 
@@ -822,7 +626,6 @@ def _keypoint_consumer(
     done = False
 
     while not done:
-        # Ensure at least one item is in the buffer before strategy logic
         if not buffer:
             item = bbox_queue.get()
             if item is _SENTINEL:
@@ -830,7 +633,6 @@ def _keypoint_consumer(
             buffer.append(item)
 
         if queue_strategy == 'full_batch':
-            # Block until buffer has a full batch or producer is done
             while len(buffer) < kp_batch_size:
                 item = bbox_queue.get()
                 if item is _SENTINEL:
@@ -841,7 +643,6 @@ def _keypoint_consumer(
             buffer = buffer[kp_batch_size:]
 
         elif queue_strategy == 'any':
-            # Non-blocking drain up to kp_batch_size, then flush
             while len(buffer) < kp_batch_size:
                 try:
                     item = bbox_queue.get_nowait()
@@ -855,8 +656,6 @@ def _keypoint_consumer(
             buffer = buffer[kp_batch_size:]
 
         elif queue_strategy == 'same_frame':
-            # Accumulate only items that share the current frame_id.
-            # If a different frame_id arrives, flush immediately and start fresh.
             current_fid = buffer[0].frame_id
             pending: Optional[BBoxItem] = None
 
@@ -869,7 +668,6 @@ def _keypoint_consumer(
                     if item.frame_id == current_fid:
                         buffer.append(item)
                     else:
-                        # Different frame – stop accumulating for current_fid
                         pending = item
                         break
                 except queue.Empty:
@@ -878,12 +676,9 @@ def _keypoint_consumer(
             flush(buffer[:kp_batch_size])
             buffer = buffer[kp_batch_size:]
 
-            # Remaining same-frame items (if any) stay at front of buffer;
-            # inject the next-frame item right after them.
             if pending is not None:
                 buffer.append(pending)
 
-    # Flush anything left over
     if buffer:
         flush(buffer)
 
@@ -891,9 +686,7 @@ def _keypoint_consumer(
 def run_topdown(
     det_model,
     kp_model,
-    prefetched_images: List[Tuple[int, np.ndarray]],
-    evaluator: Evaluator,
-    device: str,
+    samples: List[UnifiedSample],
     det_batch_size: int,
     kp_batch_size: int,
     queue_strategy: str,
@@ -903,24 +696,41 @@ def run_topdown(
     warmup_batches: int,
     pose_cfg: Config,
     log_interval: int = 100,
-    gt_bboxes_per_frame: Optional[Dict[int, Tuple[np.ndarray, np.ndarray]]] = None,
-    det_evaluator: Optional[Evaluator] = None,
-    gt_instances_per_frame: Optional[Dict[int, list]] = None,
-    frame_records: Optional[List[dict]] = None,
-    dataset_meta: Optional[dict] = None,
-    data_root: str = '',
-    img_paths: Optional[List[str]] = None,
-    gt_by_img_id: Optional[Dict[int, list]] = None,
-) -> Tuple[dict, dict]:
-    """Run topdown async producer/consumer benchmark.
+    use_mock_detector: bool = False,
+) -> Tuple[Dict[int, PoseDataSample], dict]:
+    """Run topdown async producer/consumer benchmark on unified samples.
 
-    When gt_bboxes_per_frame is provided the real detector is bypassed and
-    GT bboxes are fed directly into the queue (mock-detector mode).
+    When ``use_mock_detector=True`` the real detector is bypassed and valid
+    GT bboxes (filtered by :func:`is_valid_instance`) are fed directly into
+    the queue.
+
+    Raw detector bboxes/scores are stored on each returned
+    :class:`PoseDataSample` under metainfo keys ``'det_bboxes'`` and
+    ``'det_scores'`` so :func:`build_frame_record` can access them without
+    additional arguments.
+
+    Args:
+        det_model: Detector model (ignored when ``use_mock_detector=True``).
+        kp_model: Keypoint model.
+        samples: Unified samples (one per image).
+        det_batch_size: Detector batch size.
+        kp_batch_size: Keypoint model batch size.
+        queue_strategy: One of ``'full_batch'``, ``'any'``, ``'same_frame'``.
+        bbox_thr: Detector bbox confidence threshold.
+        nms_thr: NMS IoU threshold.
+        det_cat_id: Category id for the person class in the detector.
+        warmup_batches: Leading batches excluded from timing.
+        pose_cfg: Pose config (used to build the keypoint pipeline).
+        log_interval: Batches between progress prints.
+        use_mock_detector: If True, skip real detector.
+
+    Returns:
+        pred_by_img_id: Mapping ``img_id → PoseDataSample`` (prediction only).
+        perf: Performance-metric dict.
     """
     _init_scope(pose_cfg)
-    # Filter out GT-only transforms that require keypoints in the input dict
-    # (e.g. KeypointConverter).  During inference the consumer only provides
-    # image + bbox, so these steps would raise KeyError on 'keypoints'.
+
+    # Filter GT-only transforms (KeypointConverter) from the keypoint pipeline.
     _GT_ONLY_TYPES = {'KeypointConverter'}
     kp_pipeline_cfg = [
         s for s in pose_cfg.test_dataloader.dataset.pipeline
@@ -929,8 +739,24 @@ def run_topdown(
     kp_pipeline = Compose(kp_pipeline_cfg)
     dataset_meta = kp_model.dataset_meta
 
-    # Bounded queue provides back-pressure so the producer does not run too
-    # far ahead of the consumer.
+    # Convert samples to the legacy (img_id, img) tuple list for producers
+    prefetched_images: List[Tuple[int, np.ndarray]] = [
+        (s.img_id, s.image) for s in samples
+    ]
+
+    # Build GT bboxes for mock detector (valid instances only)
+    gt_bboxes_per_frame: Dict[int, Tuple[np.ndarray, np.ndarray]] = {}
+    if use_mock_detector:
+        for fid, sample in enumerate(samples):
+            valid = [g for g in sample.gt_instances if is_valid_instance(g)]
+            if valid:
+                bboxes = np.stack([g.bbox for g in valid], axis=0)
+                scores = np.ones(len(valid), dtype=np.float32)
+            else:
+                bboxes = np.zeros((0, 4), dtype=np.float32)
+                scores = np.zeros(0, dtype=np.float32)
+            gt_bboxes_per_frame[fid] = (bboxes, scores)
+
     bbox_queue: queue.Queue = queue.Queue(maxsize=kp_batch_size * 8)
 
     det_timings: list = []
@@ -940,9 +766,9 @@ def run_topdown(
     frame_results: dict = {}
     frame_counts: dict = {}
     zero_det_frames: dict = {}
-    det_predictions: dict = {}  # frame_id -> (bboxes_xyxy, scores)
+    det_predictions: dict = {}
 
-    if gt_bboxes_per_frame is not None:
+    if use_mock_detector:
         producer = threading.Thread(
             target=_mock_detector_producer,
             args=(prefetched_images, gt_bboxes_per_frame, det_batch_size,
@@ -960,6 +786,7 @@ def run_topdown(
                   frame_end_times, zero_det_frames, det_predictions),
             daemon=True,
         )
+
     consumer = threading.Thread(
         target=_keypoint_consumer,
         args=(kp_model, kp_pipeline, kp_batch_size, queue_strategy,
@@ -973,93 +800,8 @@ def run_topdown(
     producer.join()
     consumer.join()
 
-    # Build per-frame PoseDataSamples for the evaluator
-    n_images = len(prefetched_images)
-    for frame_id, (img_id, img) in enumerate(prefetched_images):
-        h, w = img.shape[:2]
-        gt_inst_data = (gt_instances_per_frame or {}).get(frame_id)
-        frame_img_path = None
-        if img_paths is not None and frame_id < len(img_paths):
-            frame_img_path = img_paths[frame_id]
-        if frame_id in zero_det_frames:
-            ds = _make_topdown_data_sample(
-                img_id, [], [], (h, w), gt_inst_data,
-                img_path=frame_img_path)
-        elif frame_id in frame_results:
-            res_scores = frame_results[frame_id]
-            ds = _make_topdown_data_sample(
-                img_id,
-                [r for r, _ in res_scores],
-                [s for _, s in res_scores],
-                (h, w),
-                gt_inst_data,
-                img_path=frame_img_path,
-            )
-        else:
-            # Frame was neither processed by detector nor had results (shouldn't
-            # happen in normal operation but guard defensively).
-            raise ValueError(f'Frame {frame_id} was neither processed by detector nor had results')
-
-        evaluator.process(data_samples=[ds], data_batch=None)
-
-        if frame_records is not None:
-            img_path = ''
-            if img_paths is not None and frame_id < len(img_paths):
-                img_path = img_paths[frame_id]
-            gt_src = (gt_by_img_id or {}).get(int(img_id), [])
-            det_bb, det_sc = det_predictions.get(
-                frame_id,
-                (np.zeros((0, 4), dtype=np.float32),
-                 np.zeros(0, dtype=np.float32)))
-            frame_records.append(
-                build_frame_record(
-                    img_id=int(img_id),
-                    frame_id=frame_id,
-                    img_path=img_path,
-                    data_root=data_root,
-                    ori_shape=(int(h), int(w)),
-                    pred_instances=serialize_pred_instances(
-                        ds.pred_instances),
-                    gt_instances=serialize_gt_instances(gt_src),
-                    dataset_meta=dataset_meta,
-                    det_bboxes=det_bb,
-                    det_scores=det_sc,
-                ))
-
-    quality = evaluator.evaluate(n_images)
-
-    # ── Detection AP/AR metrics (optional) ──────────────────────────────
-    if det_evaluator is not None:
-        for frame_id, (img_id, img) in enumerate(prefetched_images):
-            h, w = img.shape[:2]
-            bb, sc = det_predictions.get(
-                frame_id,
-                (np.zeros((0, 4), dtype=np.float32),
-                 np.zeros(0, dtype=np.float32)))
-            det_ds = dict(
-                img_id=img_id,
-                ori_shape=(h, w),
-                pred_instances=dict(
-                    bboxes=torch.from_numpy(bb),
-                    scores=torch.from_numpy(sc),
-                    labels=torch.zeros(len(bb), dtype=torch.long),
-                ),
-            )
-            det_evaluator.process(data_samples=[det_ds], data_batch=None)
-        det_quality = det_evaluator.evaluate(n_images)
-        quality = {**quality, **det_quality}
-
-    # ── Performance metrics ──────────────────────────────────────────────
-    timed_det_time = sum(t for t, _ in det_timings)
-    timed_det_frames = sum(n for _, n in det_timings)
-    timed_kp_time = sum(t for t, _ in kp_timings)
-    timed_kp_bboxes = sum(n for _, n in kp_timings)
-
-    det_per_frame = [t / n for t, n in det_timings]
-    det_batch_times = [t for t, _ in det_timings]
-    kp_per_loc = [t / n for t, n in kp_timings]
-    kp_batch_times = [t for t, _ in kp_timings]
-
+    # ── Performance metrics ─────────────────────────────────────────────
+    n_images = len(samples)
     complete_fids = [
         fid for fid in range(n_images)
         if fid in frame_start_times and fid in frame_end_times
@@ -1075,6 +817,16 @@ def run_topdown(
         pipe_latencies = []
 
     pipe_total_wall = pipe_wall_end - pipe_wall_start
+
+    timed_det_time = sum(t for t, _ in det_timings)
+    timed_det_frames = sum(k for _, k in det_timings)
+    timed_kp_time = sum(t for t, _ in kp_timings)
+    timed_kp_bboxes = sum(k for _, k in kp_timings)
+
+    det_per_frame = [t / k for t, k in det_timings]
+    det_batch_times = [t for t, _ in det_timings]
+    kp_per_loc = [t / k for t, k in kp_timings]
+    kp_batch_times = [t for t, _ in kp_timings]
 
     perf = {
         'e2e/fps': (
@@ -1108,7 +860,40 @@ def run_topdown(
             if kp_per_loc else 0.0
         ),
     }
-    return quality, perf
+
+    # ── Assemble one PoseDataSample per image ─────────────────────────────
+    # Store raw detector output in metainfo so build_frame_record can pick it
+    # up without needing separate det_bboxes / det_scores arguments.
+    pred_by_img_id: Dict[int, PoseDataSample] = {}
+    for fid, sample in enumerate(samples):
+        img_id = sample.img_id
+        h, w = sample.ori_shape
+
+        det_bb, det_sc = det_predictions.get(
+            fid,
+            (np.zeros((0, 4), dtype=np.float32),
+             np.zeros(0, dtype=np.float32)),
+        )
+
+        if fid in frame_results:
+            res_scores = frame_results[fid]
+            pred_ds = _merge_pose_predictions_to_posedatasample(
+                img_id,
+                [r for r, _ in res_scores],
+                [s for _, s in res_scores],
+                (h, w),
+                img_path=sample.img_path,
+            )
+        else:
+            pred_ds = _merge_pose_predictions_to_posedatasample(
+                img_id, [], [], (h, w), img_path=sample.img_path)
+
+        if len(det_bb) > 0:
+            pred_ds.set_metainfo({'det_bboxes': det_bb, 'det_scores': det_sc})
+
+        pred_by_img_id[img_id] = pred_ds
+
+    return pred_by_img_id, perf
 
 
 # ── Output helpers ─────────────────────────────────────────────────────────
@@ -1176,7 +961,7 @@ def _prediction_out_dir(args, run_date: str, is_topdown: bool) -> str:
 
 def _save_predictions(
     args,
-    pose_cfg: Config,
+    data_root: str,
     mode: str,
     is_topdown: bool,
     quality: dict,
@@ -1185,7 +970,6 @@ def _save_predictions(
     dataset_meta: dict,
     run_date: str,
 ) -> None:
-    data_root = pose_cfg.test_dataloader.dataset.get('data_root', 'data/')
     manifest = {
         'timestamp': datetime.now().isoformat(timespec='seconds'),
         'mode': mode,
@@ -1217,7 +1001,6 @@ def _save_predictions(
 
 
 def _append_to_results_file(quality: dict, perf: dict, args) -> None:
-    """Append to --results-file in the same schema as test_tracked.py."""
     results_file = args.results_file
     if osp.isfile(results_file):
         with open(results_file, 'r') as f:
@@ -1262,8 +1045,8 @@ def _parse_args():
                           'bboxes from the test dataset (topdown mode only). '
                           'Mutually exclusive with --det-config/--det-checkpoint.')
 
-    p.add_argument('--det-batch-size', type=int, default=4,
-                   help='Detector batch size (topdown mode, default: 4)')
+    p.add_argument('--det-batch-size', type=int, default=32,
+                   help='Detector batch size (topdown mode, default: 32)')
     p.add_argument('--kp-batch-size', type=int, default=32,
                    help='Keypoint model batch size (default: 32)')
     p.add_argument(
@@ -1307,7 +1090,7 @@ def _parse_args():
         help='Override config options, e.g. model.backbone.depth=18')
     p.add_argument(
         '--test-dataset', default='coco',
-        choices=list(BENCHMARK_TEST_DATASET_NAMES),
+        choices=list(BENCHMARK_TEST_DATASETS),
         help='Override test set and metric (default: use config as-is)')
     return p.parse_args()
 
@@ -1318,38 +1101,18 @@ def main():
     args = _parse_args()
     run_date = datetime.now().strftime('%Y%m%d')
     frame_records: Optional[List[dict]] = [] if args.model_name else None
-    gt_by_img_id: Optional[Dict[int, list]] = None
-    dataset_meta = None
 
     # ── Config ────────────────────────────────────────────────────────────
     pose_cfg = Config.fromfile(args.pose_config)
     if args.cfg_options:
         pose_cfg.merge_from_dict(args.cfg_options)
-    apply_benchmark_test_dataset(pose_cfg, args.test_dataset)
 
     _init_scope(pose_cfg)
-    MMLogger.get_current_instance()  # ensure logger is initialised
+    MMLogger.get_current_instance()
 
     use_real_detector = bool(args.det_config and args.det_checkpoint)
     is_topdown = args.mock_detector or use_real_detector
     model_type = pose_cfg.model.get('type', '')
-
-    # Build the per-image GT lookup when it is needed for:
-    #   (a) frame_records export (--model-name), or
-    #   (b) bottomup evaluation with gt_from_samples=True — in this path GT
-    #       flows opaquely through model.test_step from a data_mode='bottomup'
-    #       dataset which stacks ALL instances including invalid ones.  We
-    #       override gt_instances on each result with the filtered GT built by
-    #       load_pose_gt_per_image (which forces data_mode='topdown') so both
-    #       modes evaluate against the same valid-instance set.
-    _bottomup_needs_gt = (
-        not is_topdown
-        and 'Bottomup' in model_type
-        and _evaluator_needs_gt_from_samples(pose_cfg)
-    )
-    if frame_records is not None or _bottomup_needs_gt:
-        print('Building GT lookup for prediction export...')
-        gt_by_img_id = build_gt_by_img_id(pose_cfg, args.num_frames)
 
     if 'Bottomup' in model_type and is_topdown:
         raise ValueError(
@@ -1365,70 +1128,52 @@ def main():
             '--det-metrics requires topdown mode '
             '(pass --det-config/--det-checkpoint or --mock-detector).')
 
+    # ── Unified data loading ───────────────────────────────────────────────
+    print(f'\nLoading dataset: {args.test_dataset}')
+    samples = load_unified_samples(args.test_dataset, args.num_frames)
+    n_images = len(samples)
+    data_root = _data_root_for_dataset(args.test_dataset)
+
+    # Val pipeline from config with GT-only transforms stripped.
+    # We never need KeypointConverter in the inference pipeline since GT
+    # keypoint conversion is already handled in load_unified_samples.
+    _GT_ONLY_TYPES = {'KeypointConverter'}
+    raw_pipeline = list(pose_cfg.test_dataloader.dataset.pipeline)
+    pipeline_cfg = [
+        s for s in raw_pipeline
+        if not (isinstance(s, dict) and s.get('type') in _GT_ONLY_TYPES)
+    ]
+
     # ── Topdown mode ───────────────────────────────────────────────────────
     if is_topdown:
         print(f'\nMode: topdown  |  strategy: {args.queue_strategy}')
 
         detector = None
-        gt_bboxes_per_frame = None
-        gt_instances_per_frame = None
-
         if args.mock_detector:
             print('  Detector : MOCK (GT bboxes from dataset)')
             print(f'  KP model : {args.pose_config}\n')
-
-            print('Building GT bbox image list...')
-            img_list_with_bbox = build_gt_bbox_image_list(
-                pose_cfg, args.num_frames)
-            img_list = [(iid, p) for iid, p, _, _, _ in img_list_with_bbox]
-            gt_bboxes_per_frame = {
-                fid: (bb, sc)
-                for fid, (_, _, bb, sc, _) in enumerate(img_list_with_bbox)
-            }
-            gt_instances_per_frame = {
-                fid: gt_insts
-                for fid, (_, _, _, _, gt_insts) in enumerate(img_list_with_bbox)
-            }
         else:
             if not HAS_MMDET:
                 raise ImportError(
                     'mmdet is required for topdown mode. '
                     'Install it with: pip install mmdet')
-
             print(f'  Detector : {args.det_config}')
             print(f'  KP model : {args.pose_config}\n')
-
             detector = init_det_model(
                 args.det_config, args.det_checkpoint, device=args.device)
-
-            print('Building image list...')
-            img_list = build_unique_image_list(pose_cfg, args.num_frames)
-            if (_evaluator_needs_gt_from_samples(pose_cfg)
-                    or frame_records is not None):
-                print('Building GT instance lookup for evaluation...')
-                gt_instances_per_frame = build_gt_instances_per_frame(
-                    pose_cfg, img_list)
 
         kp_model = init_model(
             args.pose_config, args.pose_checkpoint, device=args.device)
         dataset_meta = kp_model.dataset_meta
-        evaluator = build_evaluator(pose_cfg, kp_model.dataset_meta)
+        evaluator = build_evaluator(pose_cfg, dataset_meta)
 
-        det_evaluator = None
-        if getattr(args, 'det_metrics', False):
-            det_evaluator = build_det_evaluator(
-                pose_cfg, num_frames=args.num_frames)
+        det_evaluator = (build_det_evaluator(samples)
+                          if getattr(args, 'det_metrics', False) else None)
 
-        prefetched = prefetch_images(img_list)
-        img_paths = [path for _, path in img_list]
-        data_root = pose_cfg.test_dataloader.dataset.get('data_root', 'data/')
-
-        quality, perf = run_topdown(
+        pred_by_img_id, perf = run_topdown(
             det_model=detector,
             kp_model=kp_model,
-            prefetched_images=prefetched,
-            evaluator=evaluator,
-            device=args.device,
+            samples=samples,
             det_batch_size=args.det_batch_size,
             kp_batch_size=args.kp_batch_size,
             queue_strategy=args.queue_strategy,
@@ -1438,15 +1183,9 @@ def main():
             warmup_batches=args.warmup_batches,
             pose_cfg=pose_cfg,
             log_interval=args.log_interval,
-            gt_bboxes_per_frame=gt_bboxes_per_frame,
-            det_evaluator=det_evaluator,
-            gt_instances_per_frame=gt_instances_per_frame,
-            frame_records=frame_records,
-            dataset_meta=kp_model.dataset_meta,
-            data_root=data_root,
-            img_paths=img_paths,
-            gt_by_img_id=gt_by_img_id,
+            use_mock_detector=args.mock_detector,
         )
+
         mode_suffix = 'mock-detector' if args.mock_detector else args.queue_strategy
         mode = f'topdown (strategy={mode_suffix})'
 
@@ -1458,27 +1197,73 @@ def main():
         model = init_model(
             args.pose_config, args.pose_checkpoint, device=args.device)
         dataset_meta = model.dataset_meta
-        evaluator = build_evaluator(pose_cfg, model.dataset_meta)
+        evaluator = build_evaluator(pose_cfg, dataset_meta)
+        det_evaluator = None
 
-        print('Building and prefetching batches...')
-        batches, total_frames = build_bottomup_batches(
-            pose_cfg, args.kp_batch_size, args.num_frames)
-        data_root = pose_cfg.test_dataloader.dataset.get('data_root', 'data/')
+        val_pipeline = Compose(pipeline_cfg)
 
-        quality, perf = run_bottomup(
+        pred_by_img_id, perf = run_bottomup(
             model=model,
-            batches=batches,
-            total_frames=total_frames,
-            evaluator=evaluator,
+            samples=samples,
+            val_pipeline=val_pipeline,
+            dataset_meta=dataset_meta,
+            kp_batch_size=args.kp_batch_size,
             device=args.device,
             warmup_batches=args.warmup_batches,
             log_interval=args.log_interval,
-            frame_records=frame_records,
-            dataset_meta=model.dataset_meta,
-            data_root=data_root,
-            gt_by_img_id=gt_by_img_id,
         )
+
         mode = 'bottomup'
+
+    # ── Unified post-processing (both modes) ───────────────────────────────
+    for fid, sample in enumerate(samples):
+        img_id = sample.img_id
+        pred_ds = pred_by_img_id.get(img_id)
+        if pred_ds is None:
+            continue
+
+        ds = _attach_gt_to_posedatasample(pred_ds, sample)
+        evaluator.process(data_samples=[ds], data_batch=None)
+
+        if frame_records is not None:
+            frame_records.append(build_frame_record(
+                img_id=int(img_id),
+                frame_id=fid,
+                img_path=sample.img_path,
+                data_root=data_root,
+                pred_ds=ds,
+                gt_instances=_pose_dicts_from_unifiedsample(sample),
+                dataset_meta=dataset_meta,
+            ))
+
+    quality = evaluator.evaluate(n_images)
+
+    # Optional detection AP/AR (topdown only — reads from pred_ds.metainfo)
+    if det_evaluator is not None:
+        for fid, sample in enumerate(samples):
+            pred_ds = pred_by_img_id.get(sample.img_id)
+            bb = (pred_ds.metainfo.get(
+                'det_bboxes', np.zeros((0, 4), dtype=np.float32))
+                  if pred_ds is not None
+                  else np.zeros((0, 4), dtype=np.float32))
+            sc = (pred_ds.metainfo.get(
+                'det_scores', np.zeros(0, dtype=np.float32))
+                  if pred_ds is not None
+                  else np.zeros(0, dtype=np.float32))
+            bb = np.asarray(bb, dtype=np.float32)
+            sc = np.asarray(sc, dtype=np.float32)
+            det_ds = dict(
+                img_id=sample.img_id,
+                ori_shape=sample.ori_shape,
+                pred_instances=dict(
+                    bboxes=torch.from_numpy(bb),
+                    scores=torch.from_numpy(sc),
+                    labels=torch.zeros(len(bb), dtype=torch.long),
+                ),
+            )
+            det_evaluator.process(data_samples=[det_ds], data_batch=None)
+        det_quality = det_evaluator.evaluate(n_images)
+        quality = {**quality, **det_quality}
 
     # ── Output ─────────────────────────────────────────────────────────────
     _print_results(quality, perf, mode)
@@ -1494,7 +1279,7 @@ def main():
 
     if args.model_name and frame_records is not None:
         _save_predictions(
-            args, pose_cfg, mode, is_topdown, quality, perf,
+            args, data_root, mode, is_topdown, quality, perf,
             frame_records, dataset_meta, run_date)
 
 
