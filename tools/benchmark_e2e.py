@@ -306,15 +306,19 @@ def _attach_gt_to_posedatasample(
 
 def _pose_dicts_from_unifiedsample(sample: UnifiedSample) -> List[dict]:
     """Build serialisation-friendly GT dicts from a :class:`UnifiedSample`."""
-    return [
-        {
+    result = []
+    for g in sample.gt_instances:
+        d: dict = {
             'keypoints': g.keypoints,
             'keypoints_visible': g.keypoints_visible,
             'bbox': g.bbox,
             'orig_area': g.area,
+            'iscrowd': int(g.iscrowd),
         }
-        for g in sample.gt_instances
-    ]
+        if g.keypoints_visible_coco is not None:
+            d['keypoints_visible_coco'] = g.keypoints_visible_coco
+        result.append(d)
+    return result
 
 
 # ── Bottomup pipeline ──────────────────────────────────────────────────────

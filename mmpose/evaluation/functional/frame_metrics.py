@@ -11,7 +11,6 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 from mmengine.structures import InstanceData
 
-from mmpose.evaluation.functional.nms import oks_iou
 from mmpose.structures import PoseDataSample, split_instances
 
 
@@ -100,6 +99,14 @@ def serialize_gt_instances(
         if g.get('orig_area') is not None:
             inst['orig_area'] = float(g['orig_area'])
 
+        if g.get('iscrowd') is not None:
+            inst['iscrowd'] = int(g['iscrowd'])
+
+        kv_coco = g.get('keypoints_visible_coco')
+        if kv_coco is not None:
+            inst['keypoints_visible_coco'] = np.asarray(
+                kv_coco, dtype=np.float32).reshape(-1).tolist()
+
         results.append(inst)
     return results
 
@@ -128,51 +135,61 @@ def _serialize_gt_instance_data(gt_inst: InstanceData) -> List[dict]:
             inst['bbox'] = np.asarray(gt_inst.bboxes[i]).reshape(-1)[:4].tolist()
         if hasattr(gt_inst, 'orig_areas') and len(gt_inst.orig_areas) > i:
             inst['orig_area'] = float(gt_inst.orig_areas[i])
+        if hasattr(gt_inst, 'iscrowd') and len(gt_inst.iscrowd) > i:
+            inst['iscrowd'] = int(gt_inst.iscrowd[i])
         results.append(inst)
     return results
 
 
-def _to_oks_vector(keypoints: np.ndarray,
-                    visibility: Optional[np.ndarray] = None,
-                    scores: Optional[np.ndarray] = None,
-                    num_kpts: Optional[int] = None) -> np.ndarray:
-    """Pack keypoints into (K*3,) vector for :func:`oks_iou`."""
-    kpts = np.asarray(keypoints).reshape(-1, 2)
-    if num_kpts is not None:
-        if kpts.shape[0] > num_kpts:
-            kpts = kpts[:num_kpts]
-        elif kpts.shape[0] < num_kpts:
-            padded = np.zeros((num_kpts, 2), dtype=np.float32)
-            padded[:kpts.shape[0]] = kpts
-            kpts = padded
+def _pad_or_trim_kpts(kpts: np.ndarray, num_kpts: int) -> np.ndarray:
+    """Reshape and pad/trim a keypoint array to (num_kpts, 2)."""
+    k = kpts.reshape(-1, 2)
+    if k.shape[0] == num_kpts:
+        return k.astype(np.float32)
+    if k.shape[0] > num_kpts:
+        return k[:num_kpts].astype(np.float32)
+    padded = np.zeros((num_kpts, 2), dtype=np.float32)
+    padded[:k.shape[0]] = k
+    return padded
 
-    num_kpts = kpts.shape[0]
-    if visibility is not None:
-        vis = normalize_keypoint_visibility(visibility, num_kpts)
-        if num_kpts is not None and vis.shape[0] != num_kpts:
-            if vis.shape[0] > num_kpts:
-                vis = vis[:num_kpts]
-            else:
-                vis_pad = np.zeros(num_kpts, dtype=np.float32)
-                vis_pad[:vis.shape[0]] = vis
-                vis = vis_pad
-    elif scores is not None:
-        vis = np.asarray(scores).reshape(-1)
-        if num_kpts is not None and vis.shape[0] != num_kpts:
-            if vis.shape[0] > num_kpts:
-                vis = vis[:num_kpts]
-            else:
-                vis_pad = np.zeros(num_kpts, dtype=np.float32)
-                vis_pad[:vis.shape[0]] = vis
-                vis = vis_pad
-    else:
-        vis = np.ones(num_kpts, dtype=np.float32)
 
-    flat = np.zeros(num_kpts * 3, dtype=np.float32)
-    flat[0::3] = kpts[:, 0]
-    flat[1::3] = kpts[:, 1]
-    flat[2::3] = vis.astype(np.float32)
-    return flat
+def _compute_oks_coco(
+    gt_kpts: np.ndarray,   # (K, 2)
+    gt_vis: np.ndarray,    # (K,) visibility flags; >0 = labeled
+    gt_area: float,
+    pred_kpts: np.ndarray, # (N, K, 2)
+    oks_vars: np.ndarray,  # (K,) = (2 * sigma_i)^2
+) -> np.ndarray:           # (N,) OKS values in [0, 1]
+    """Compute OKS between one GT instance and N predictions.
+
+    Implements the COCO keypoint evaluation formula exactly::
+
+        OKS = (Σ_i exp(-d_i² / (2·s²·k_i²)) · δ(v_i > 0)) / (Σ_i δ(v_i > 0))
+
+    where s² = GT area, k_i = sigma_i (so (2·k_i)² = oks_vars_i).
+    Only GT keypoints with v_i > 0 (labeled, whether occluded or visible)
+    contribute to numerator and denominator. Non-labeled keypoints (v_i == 0)
+    are excluded entirely, matching COCOeval behaviour.
+    """
+    labeled = gt_vis > 0          # (K,) boolean mask
+    k1 = int(labeled.sum())
+    if k1 == 0:
+        return np.zeros(len(pred_kpts), dtype=np.float32)
+
+    dx = pred_kpts[:, :, 0] - gt_kpts[None, :, 0]  # (N, K)
+    dy = pred_kpts[:, :, 1] - gt_kpts[None, :, 1]  # (N, K)
+    d2 = dx ** 2 + dy ** 2                          # (N, K)
+
+    # COCO exponent: e_i = d_i² / (2 · area · sigma_i²)
+    #   With oks_vars_i = (2·sigma_i)² = 4·sigma_i²:
+    #   e_i = d_i² / (vars_i · 2 · area) = d_i²/vars_i/area * 0.5
+    area = float(gt_area) + np.spacing(1)
+    e = d2 / (oks_vars[None, :] * (2.0 * area))  # (N, K)
+
+    # Mask to labeled keypoints only
+    e_labeled = e[:, labeled]                         # (N, k1)
+    oks = np.sum(np.exp(-e_labeled), axis=1) / k1    # (N,)
+    return oks.astype(np.float32)
 
 
 def _instance_area(inst: dict) -> float:
@@ -198,61 +215,93 @@ def match_instances_oks(
     sigmas: np.ndarray,
     match_thr: float = 0.5,
 ) -> Tuple[List[dict], dict]:
-    """Greedy OKS matching between GT and prediction instance lists."""
-    num_gt = len(gt_list)
+    """Greedy OKS matching aligned with COCOeval semantics.
+
+    Differences from a naive implementation:
+
+    * **Non-labeled keypoints excluded** – only GT keypoints with visibility
+      > 0 contribute to the OKS numerator and denominator (matches
+      ``COCOeval`` which applies ``e = e[vg > 0]``).
+    * **GT area only** – OKS is normalised by the GT object area, not the
+      average of GT and predicted areas.
+    * **iscrowd GT skipped** – crowd regions are not counted in ``num_gt``
+      and do not generate false negatives (matching ``COCOeval`` which
+      ignores crowd GT for recall).
+    * **k1 == 0 guard** – if a GT instance has no labeled keypoints, OKS is
+      0 (no match).
+
+    The GT visibility flag is taken from ``keypoints_visible_coco`` (raw COCO
+    0/1/2) when present, otherwise from ``keypoints_visible`` (binary 0/1).
+    Both representations mark labeled keypoints as v > 0.
+    """
+    sigmas = np.asarray(sigmas, dtype=np.float32)
+    num_kpts = len(sigmas)
+    oks_vars = (sigmas * 2.0) ** 2  # (K,)
+
     num_pred = len(pred_list)
+
+    # Separate valid GT from crowd / keypoint-free GT
+    valid_gt_idx: List[int] = []
+    for gi, gt in enumerate(gt_list):
+        if gt.get('iscrowd', 0):
+            continue
+        if gt.get('keypoints') is None:
+            continue
+        # Prefer raw COCO vis; fall back to binary vis
+        _coco = gt.get('keypoints_visible_coco')
+        vis_raw = _coco if _coco is not None else gt.get('keypoints_visible')
+        if vis_raw is not None:
+            vis = normalize_keypoint_visibility(vis_raw, num_kpts)
+            if int(np.sum(vis > 0)) == 0:
+                continue  # no labeled keypoints → can't match
+        valid_gt_idx.append(gi)
+
+    num_valid_gt = len(valid_gt_idx)
+
     base_metrics = {
         'mean_oks': 0.0,
         'num_pred': num_pred,
-        'num_gt': num_gt,
+        'num_gt': num_valid_gt,
         'num_matched': 0,
         'gt_recall': 0.0,
     }
-    if num_gt == 0 or num_pred == 0:
+    if num_valid_gt == 0 or num_pred == 0 or num_kpts == 0:
         return [], base_metrics
 
-    sigmas = np.asarray(sigmas, dtype=np.float32)
-    num_kpts = len(sigmas)
-    if num_kpts == 0:
-        return [], base_metrics
-
-    pred_vecs = []
-    pred_areas = []
-    for pred in pred_list:
-        if pred.get('keypoints') is None:
+    # Pre-build pred keypoint array (N, K, 2) and track original indices
+    pred_kpts_list: List[np.ndarray] = []
+    valid_pred_idx: List[int] = []
+    for pi, pred in enumerate(pred_list):
+        kpts = pred.get('keypoints')
+        if kpts is None:
             continue
-        kpts = np.asarray(pred['keypoints'])
-        scores = pred.get('keypoint_scores')
-        pred_vecs.append(
-            _to_oks_vector(
-                kpts,
-                scores=np.asarray(scores) if scores is not None else None,
-                num_kpts=num_kpts,
-            ))
-        pred_areas.append(_instance_area(pred))
-    if not pred_vecs:
-        return [], base_metrics
-    pred_vecs_arr = np.stack(pred_vecs, axis=0)
-    pred_areas_arr = np.asarray(pred_areas, dtype=np.float32)
+        pred_kpts_list.append(_pad_or_trim_kpts(np.asarray(kpts), num_kpts))
+        valid_pred_idx.append(pi)
 
+    if not pred_kpts_list:
+        return [], base_metrics
+
+    pred_kpts_arr = np.stack(pred_kpts_list, axis=0)  # (N, K, 2)
+
+    # Score each valid GT against all preds
     pairs: List[Tuple[float, int, int]] = []
-    pred_indices = [
-        pi for pi, pred in enumerate(pred_list) if pred.get('keypoints') is not None
-    ]
-    for gi, gt in enumerate(gt_list):
-        if gt.get('keypoints') is None:
-            continue
-        g_vec = _to_oks_vector(
-            np.asarray(gt['keypoints']),
-            visibility=np.asarray(gt['keypoints_visible'])
-            if gt.get('keypoints_visible') is not None else None,
-            num_kpts=num_kpts,
-        )
-        g_area = _instance_area(gt)
-        oks_row = oks_iou(g_vec, pred_vecs_arr, g_area, pred_areas_arr,
-                          sigmas)
-        for row_pi, oks_val in enumerate(oks_row):
-            pairs.append((float(oks_val), gi, pred_indices[row_pi]))
+    for gi in valid_gt_idx:
+        gt = gt_list[gi]
+        gt_kpts = _pad_or_trim_kpts(np.asarray(gt['keypoints']), num_kpts)
+
+        _coco = gt.get('keypoints_visible_coco')
+        vis_raw = _coco if _coco is not None else gt.get('keypoints_visible')
+        if vis_raw is not None:
+            gt_vis = normalize_keypoint_visibility(vis_raw, num_kpts)
+        else:
+            gt_vis = np.ones(num_kpts, dtype=np.float32)
+
+        gt_area = _instance_area(gt)
+        oks_vals = _compute_oks_coco(
+            gt_kpts, gt_vis, gt_area, pred_kpts_arr, oks_vars)
+
+        for row_pi, oks_val in enumerate(oks_vals):
+            pairs.append((float(oks_val), gi, valid_pred_idx[row_pi]))
 
     pairs.sort(key=lambda x: x[0], reverse=True)
 
@@ -266,20 +315,16 @@ def match_instances_oks(
             continue
         matched_gt.add(gi)
         matched_pred.add(pi)
-        matches.append({
-            'gt_idx': gi,
-            'pred_idx': pi,
-            'oks': oks_val,
-        })
+        matches.append({'gt_idx': gi, 'pred_idx': pi, 'oks': oks_val})
 
     num_matched = len(matches)
     mean_oks = float(np.mean([m['oks'] for m in matches])) if matches else 0.0
     metrics = {
         'mean_oks': mean_oks,
         'num_pred': num_pred,
-        'num_gt': num_gt,
+        'num_gt': num_valid_gt,
         'num_matched': num_matched,
-        'gt_recall': num_matched / num_gt if num_gt > 0 else 0.0,
+        'gt_recall': num_matched / num_valid_gt if num_valid_gt > 0 else 0.0,
     }
     return matches, metrics
 

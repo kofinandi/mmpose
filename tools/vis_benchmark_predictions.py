@@ -14,7 +14,8 @@ Local::
         --badcase --badcase-thr 0.5
 
 Controls: Left/Right arrows navigate; ``p`` pred keypoints; ``g`` GT keypoints;
-``b`` bboxes; ``q`` quit.
+``b`` bboxes; ``v`` visibility markers; ``m`` match OKS/IoU labels;
+``c`` iscrowd coloring; ``q`` quit.
 """
 
 from __future__ import annotations
@@ -23,19 +24,24 @@ import argparse
 import json
 import os
 import os.path as osp
-from typing import List, Optional
+from typing import Dict, List, Optional, Set, Tuple
 
+import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
 import mmcv
 import numpy as np
-from mmengine.structures import InstanceData
 
 from mmpose.evaluation.functional.frame_metrics import (
     normalize_keypoint_visibility,
 )
-from mmpose.structures import PoseDataSample
-from mmpose.visualization import PoseLocalVisualizer
 
+# ---- Color constants (RGB 0–1 floats) ----------------------------------------
+_GT_COLOR = (0.2, 0.4, 1.0)      # blue  – GT keypoints / matched bboxes
+_PRED_COLOR = (1.0, 0.25, 0.25)  # red   – pred keypoints / matched bboxes
+_CROWD_COLOR = (1.0, 0.6, 0.0)   # orange – iscrowd GT bboxes
+
+
+# ---- Argument parsing --------------------------------------------------------
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -76,15 +82,17 @@ def parse_args():
         '--skeleton-style',
         default='mmpose',
         choices=['mmpose', 'openpose'],
-        help='Skeleton style for visualization')
+        help='Skeleton style (unused; kept for CLI compatibility)')
     parser.add_argument(
         '--render-scale',
         type=float,
         default=2.0,
-        help='Upscale factor for rendering (image + overlays). '
-        'Use 1.0 for native resolution. Default: 2.0')
+        help='Upscale factor for rendering. Use 1.0 for native resolution. '
+        'Default: 2.0')
     return parser.parse_args()
 
+
+# ---- Data loading ------------------------------------------------------------
 
 def load_bundle(pred_dir: str):
     manifest_path = osp.join(pred_dir, 'manifest.json')
@@ -103,57 +111,321 @@ def _resolve_image_path(frame: dict, data_root: str) -> str:
     return osp.join(data_root, img_path)
 
 
-def _instances_from_json(instances: List[dict]) -> InstanceData:
-    inst = InstanceData()
-    if not instances:
-        inst.keypoints = np.zeros((0, 17, 2), dtype=np.float32)
-        inst.keypoint_scores = np.zeros((0, 17), dtype=np.float32)
-        inst.bboxes = np.zeros((0, 4), dtype=np.float32)
-        return inst
+# ---- Instance parsing --------------------------------------------------------
 
-    keypoints = []
-    scores = []
-    bboxes = []
-    visibility = []
-    for item in instances:
-        if 'bbox' in item:
-            bbox = np.asarray(item['bbox'], dtype=np.float32).reshape(-1)[:4]
-            bboxes.append(bbox)
-        if 'keypoints' not in item:
-            continue
-        kpts = np.asarray(item['keypoints'], dtype=np.float32).reshape(-1, 2)
-        keypoints.append(kpts)
+def _parse_instances(instances_json: List[dict]) -> List[dict]:
+    """Parse raw JSON instance list to a list of dicts with numpy arrays.
+
+    Each returned dict may contain:
+        keypoints (K, 2), keypoint_scores (K,), keypoints_visible (K,),
+        bbox (4,) [x1,y1,x2,y2], bbox_score (float), iscrowd (int 0/1).
+
+    When ``keypoints_visible_coco`` is present in the JSON (raw COCO 0/1/2
+    flags), it is stored as ``keypoints_visible`` and ``_coco_vis=True`` is
+    set so the drawing code can distinguish occluded (v=1) from visible (v=2).
+    For older bundles that only have the binary ``keypoints_visible`` field,
+    ``_coco_vis=False`` is set and all labeled keypoints are drawn filled.
+    """
+    result = []
+    for item in instances_json:
+        inst: dict = {}
+        if 'keypoints' in item:
+            inst['keypoints'] = np.asarray(
+                item['keypoints'], dtype=np.float32).reshape(-1, 2)
+        n_kpts = len(inst['keypoints']) if 'keypoints' in inst else None
         if 'keypoint_scores' in item:
-            sc = np.asarray(item['keypoint_scores'], dtype=np.float32).reshape(-1)
+            inst['keypoint_scores'] = np.asarray(
+                item['keypoint_scores'], dtype=np.float32).reshape(-1)
+        if 'keypoints_visible_coco' in item:
+            # Prefer raw COCO 0/1/2 visibility when available
+            inst['keypoints_visible'] = normalize_keypoint_visibility(
+                item['keypoints_visible_coco'], n_kpts)
+            inst['_coco_vis'] = True
+        elif 'keypoints_visible' in item:
+            # Binary 0/1 from older bundles or non-COCO datasets
+            inst['keypoints_visible'] = normalize_keypoint_visibility(
+                item['keypoints_visible'], n_kpts)
+            inst['_coco_vis'] = False
         else:
-            sc = np.ones(kpts.shape[0], dtype=np.float32)
-        scores.append(sc)
-        if 'keypoints_visible' in item:
-            vis = normalize_keypoint_visibility(
-                item['keypoints_visible'], kpts.shape[0])
-            visibility.append(vis)
-
-    if keypoints:
-        inst.keypoints = np.stack(keypoints, axis=0)
-        inst.keypoint_scores = np.stack(scores, axis=0)
-        if visibility:
-            inst.keypoints_visible = np.stack(visibility, axis=0)
-    if bboxes:
-        inst.bboxes = np.stack(bboxes, axis=0)
-    return inst
+            inst['_coco_vis'] = False
+        if 'bbox' in item:
+            # split_instances stores bbox as [[x1,y1,x2,y2]] (trailing comma
+            # artefact), so we flatten before slicing.
+            inst['bbox'] = np.asarray(
+                item['bbox'], dtype=np.float32).reshape(-1)[:4]
+        if 'bbox_score' in item:
+            inst['bbox_score'] = float(item['bbox_score'])
+        inst['iscrowd'] = int(item.get('iscrowd', 0))
+        result.append(inst)
+    return result
 
 
-def _build_data_sample(frame: dict, pred_inst: InstanceData,
-                       gt_inst: InstanceData) -> PoseDataSample:
-    ds = PoseDataSample()
-    ds.set_metainfo({
-        'img_id': frame['img_id'],
-        'ori_shape': tuple(frame['ori_shape']),
-    })
-    ds.pred_instances = pred_inst
-    ds.gt_instances = gt_inst
-    return ds
+def _count_valid_gt(gt_insts: List[dict]) -> int:
+    """Count GT instances that are valid matching targets.
 
+    Replicates the :func:`is_valid_instance` criteria from
+    ``benchmark_data.py``: non-crowd, has at least one labeled keypoint,
+    positive bbox area, keypoints not all zero.
+    """
+    count = 0
+    for inst in gt_insts:
+        if inst.get('iscrowd', 0):
+            continue
+        kpts = inst.get('keypoints')
+        if kpts is None or len(kpts) == 0:
+            continue
+        vis = inst.get('keypoints_visible')
+        if vis is not None and int(np.sum(vis > 0)) == 0:
+            continue
+        bbox = inst.get('bbox')
+        if bbox is not None:
+            if (bbox[2] - bbox[0]) <= 0 or (bbox[3] - bbox[1]) <= 0:
+                continue
+        if np.max(kpts) <= 0:
+            continue
+        count += 1
+    return count
+
+
+# ---- Drawing helpers ---------------------------------------------------------
+
+def _upscale_image(img: np.ndarray, scale: float) -> np.ndarray:
+    """Upscale image for sharper overlay rendering."""
+    if scale <= 1.0:
+        return img
+    h, w = img.shape[:2]
+    new_size = (int(round(w * scale)), int(round(h * scale)))
+    return mmcv.imresize(img, new_size, interpolation='bicubic')
+
+
+def _bbox_iou(box_a: np.ndarray, box_b: np.ndarray) -> float:
+    """Axis-aligned IoU of two [x1, y1, x2, y2] boxes."""
+    ix1 = max(float(box_a[0]), float(box_b[0]))
+    iy1 = max(float(box_a[1]), float(box_b[1]))
+    ix2 = min(float(box_a[2]), float(box_b[2]))
+    iy2 = min(float(box_a[3]), float(box_b[3]))
+    iw = max(0.0, ix2 - ix1)
+    ih = max(0.0, iy2 - iy1)
+    inter = iw * ih
+    if inter == 0.0:
+        return 0.0
+    area_a = (float(box_a[2]) - float(box_a[0])) * (
+        float(box_a[3]) - float(box_a[1]))
+    area_b = (float(box_b[2]) - float(box_b[0])) * (
+        float(box_b[3]) - float(box_b[1]))
+    union = area_a + area_b - inter
+    return float(inter / union) if union > 0 else 0.0
+
+
+def _build_match_lookups(
+    matches: List[dict],
+) -> Tuple[Set[int], Set[int], Dict[int, dict]]:
+    """Return (gt_matched, pred_matched, gt_idx → match) from match list."""
+    gt_matched: Set[int] = set()
+    pred_matched: Set[int] = set()
+    gt_to_match: Dict[int, dict] = {}
+    for m in matches:
+        gt_matched.add(int(m['gt_idx']))
+        pred_matched.add(int(m['pred_idx']))
+        gt_to_match[int(m['gt_idx'])] = m
+    return gt_matched, pred_matched, gt_to_match
+
+
+def _draw_kpts_and_skeleton(
+    ax,
+    instances: List[dict],
+    color,
+    is_gt: bool,
+    kpt_thr: float,
+    skeleton_links: List,
+    scale: float,
+    show_visibility: bool,
+) -> None:
+    """Draw skeleton links and keypoint circles on *ax*.
+
+    For GT instances visibility is taken from ``keypoints_visible``.
+    When the instance carries ``_coco_vis=True`` (raw COCO 0/1/2 values) and
+    *show_visibility* is True, v==1 (labeled but occluded) keypoints are drawn
+    as empty circles; v==2 (visible) are filled; v==0 are skipped.
+    For older bundles with binary visibility (``_coco_vis=False``), v==1 is
+    treated as visible (filled) since the occluded/visible distinction is lost.
+    For pred instances visibility is determined by ``keypoint_scores``.
+    """
+    radius = max(3.0, 3.0 * scale)
+    lw = max(1.0, scale)
+
+    for inst in instances:
+        kpts = inst.get('keypoints')
+        if kpts is None:
+            continue
+        kpts_s = kpts * scale  # scaled coordinates
+
+        if is_gt:
+            vis = inst.get('keypoints_visible')
+            # When no visibility info, assume all keypoints are visible
+            if vis is None:
+                vis = np.full(len(kpts), 2.0, dtype=np.float32)
+            coco_vis = inst.get('_coco_vis', False)
+
+            # Skeleton links – both endpoints must be labeled (v > 0)
+            for sk in skeleton_links:
+                i0, i1 = int(sk[0]), int(sk[1])
+                if i0 >= len(kpts) or i1 >= len(kpts):
+                    continue
+                v0 = float(vis[i0]) if i0 < len(vis) else 2.0
+                v1 = float(vis[i1]) if i1 < len(vis) else 2.0
+                if v0 < 0.5 or v1 < 0.5:
+                    continue
+                ax.plot(
+                    [kpts_s[i0, 0], kpts_s[i1, 0]],
+                    [kpts_s[i0, 1], kpts_s[i1, 1]],
+                    color=color, linewidth=lw, alpha=0.7, zorder=3,
+                    solid_capstyle='round',
+                )
+
+            # Keypoint circles
+            for k_idx in range(len(kpts)):
+                kx, ky = kpts_s[k_idx]
+                v = float(vis[k_idx]) if k_idx < len(vis) else 2.0
+                if v < 0.5:
+                    # v == 0: not labeled – skip
+                    continue
+                # Empty circle only when raw COCO vis is available and v==1
+                # (occluded).  For binary-only bundles v==1 means "visible".
+                if show_visibility and coco_vis and v < 1.5:
+                    # COCO v == 1: labeled but occluded – empty circle
+                    circ = mpatches.Circle(
+                        (kx, ky), radius=radius,
+                        facecolor='none', edgecolor=color,
+                        linewidth=lw, zorder=4,
+                    )
+                else:
+                    # COCO v == 2 or binary v == 1 or visibility markers off
+                    circ = mpatches.Circle(
+                        (kx, ky), radius=radius,
+                        facecolor=color, edgecolor=color,
+                        linewidth=lw, alpha=0.85, zorder=4,
+                    )
+                ax.add_patch(circ)
+
+        else:
+            scores = inst.get('keypoint_scores')
+            if scores is None:
+                scores = np.ones(len(kpts), dtype=np.float32)
+
+            # Skeleton links – both endpoints above threshold
+            for sk in skeleton_links:
+                i0, i1 = int(sk[0]), int(sk[1])
+                if i0 >= len(kpts) or i1 >= len(kpts):
+                    continue
+                s0 = float(scores[i0]) if i0 < len(scores) else 1.0
+                s1 = float(scores[i1]) if i1 < len(scores) else 1.0
+                if s0 < kpt_thr or s1 < kpt_thr:
+                    continue
+                ax.plot(
+                    [kpts_s[i0, 0], kpts_s[i1, 0]],
+                    [kpts_s[i0, 1], kpts_s[i1, 1]],
+                    color=color, linewidth=lw, alpha=0.7, zorder=3,
+                    solid_capstyle='round',
+                )
+
+            # Keypoint circles
+            for k_idx in range(len(kpts)):
+                kx, ky = kpts_s[k_idx]
+                sc = float(scores[k_idx]) if k_idx < len(scores) else 1.0
+                if sc < kpt_thr:
+                    continue
+                circ = mpatches.Circle(
+                    (kx, ky), radius=radius,
+                    facecolor=color, edgecolor=color,
+                    linewidth=lw, alpha=0.85, zorder=4,
+                )
+                ax.add_patch(circ)
+
+
+def _draw_bboxes(
+    ax,
+    instances: List[dict],
+    base_color,
+    matched_set: Set[int],
+    show_iscrowd: bool,
+    scale: float,
+) -> None:
+    """Draw bounding boxes for all instances.
+
+    - Matched bboxes: solid outline.
+    - Non-matched bboxes: dashed outline.
+    - GT iscrowd==1 (when *show_iscrowd* is True): orange outline, overrides
+      *base_color* regardless of match status.
+    """
+    lw = max(1.5, 1.5 * scale)
+    for idx, inst in enumerate(instances):
+        bbox = inst.get('bbox')
+        if bbox is None:
+            continue
+        x1, y1, x2, y2 = (float(v) * scale for v in bbox)
+        w, h = x2 - x1, y2 - y1
+        is_matched = idx in matched_set
+        is_crowd = show_iscrowd and inst.get('iscrowd', 0) == 1
+        color = _CROWD_COLOR if is_crowd else base_color
+        linestyle = '-' if is_matched else '--'
+        rect = mpatches.Rectangle(
+            (x1, y1), w, h,
+            fill=False,
+            edgecolor=color,
+            linewidth=lw,
+            linestyle=linestyle,
+            zorder=5,
+        )
+        ax.add_patch(rect)
+
+
+def _draw_match_labels(
+    ax,
+    gt_insts: List[dict],
+    pred_insts: List[dict],
+    gt_to_match: Dict[int, dict],
+    scale: float,
+) -> None:
+    """Draw OKS + bbox-IoU text labels above each matched GT-pred pair."""
+    for gt_idx, match in gt_to_match.items():
+        pred_idx = int(match['pred_idx'])
+        oks_val = float(match['oks'])
+        if gt_idx >= len(gt_insts) or pred_idx >= len(pred_insts):
+            continue
+
+        gt_bbox = gt_insts[gt_idx].get('bbox')
+        pred_bbox = pred_insts[pred_idx].get('bbox')
+
+        if gt_bbox is not None and pred_bbox is not None:
+            iou_val = _bbox_iou(gt_bbox, pred_bbox)
+            label = f'OKS={oks_val:.2f} IoU={iou_val:.2f}'
+        else:
+            label = f'OKS={oks_val:.2f}'
+
+        # Anchor at GT bbox top-left, fall back to pred bbox
+        ref_bbox = gt_bbox if gt_bbox is not None else pred_bbox
+        if ref_bbox is None:
+            continue
+        tx = float(ref_bbox[0]) * scale
+        ty = float(ref_bbox[1]) * scale
+
+        ax.text(
+            tx, ty,
+            label,
+            color='white',
+            fontsize=max(6, int(7 * scale)),
+            ha='left', va='bottom',
+            zorder=6,
+            bbox=dict(
+                facecolor='black', alpha=0.55,
+                boxstyle='round,pad=0.2',
+                edgecolor='none',
+            ),
+        )
+
+
+# ---- Frame filtering / metrics -----------------------------------------------
 
 def _filter_frames(frames: List[dict], manifest: dict, args) -> List[dict]:
     if not args.badcase:
@@ -185,54 +457,7 @@ def _format_metrics(metrics: dict) -> str:
     return '  '.join(parts)
 
 
-def _upscale_image(img: np.ndarray, scale: float) -> np.ndarray:
-    """Upscale image for sharper overlay rendering."""
-    if scale <= 1.0:
-        return img
-    h, w = img.shape[:2]
-    new_size = (int(round(w * scale)), int(round(h * scale)))
-    return mmcv.imresize(img, new_size, interpolation='bicubic')
-
-
-def _scale_instances(inst: InstanceData, scale: float) -> InstanceData:
-    """Scale keypoints and bboxes to match an upscaled canvas."""
-    if scale <= 1.0:
-        return inst
-
-    scaled = InstanceData()
-    if not hasattr(inst, 'keypoints') or len(inst.keypoints) == 0:
-        scaled.keypoints = inst.keypoints
-        scaled.keypoint_scores = inst.keypoint_scores
-        if hasattr(inst, 'bboxes'):
-            scaled.bboxes = inst.bboxes
-        if hasattr(inst, 'keypoints_visible'):
-            scaled.keypoints_visible = inst.keypoints_visible
-        return scaled
-
-    scaled.keypoints = inst.keypoints * scale
-    scaled.keypoint_scores = inst.keypoint_scores
-    if hasattr(inst, 'keypoints_visible'):
-        scaled.keypoints_visible = inst.keypoints_visible
-    if hasattr(inst, 'bboxes') and inst.bboxes is not None:
-        scaled.bboxes = inst.bboxes * scale
-    return scaled
-
-
-def _apply_render_scale(
-    img: np.ndarray,
-    pred_inst: InstanceData,
-    gt_inst: InstanceData,
-    scale: float,
-) -> tuple:
-    """Return upscaled image and coordinate-scaled instances."""
-    if scale <= 1.0:
-        return img, pred_inst, gt_inst
-    return (
-        _upscale_image(img, scale),
-        _scale_instances(pred_inst, scale),
-        _scale_instances(gt_inst, scale),
-    )
-
+# ---- Browser -----------------------------------------------------------------
 
 class PredictionBrowser:
     """Matplotlib browser for benchmark prediction frames."""
@@ -247,18 +472,19 @@ class PredictionBrowser:
         self.show_pred = True
         self.show_gt = True
         self.show_bbox = True
+        self.show_visibility = True   # v: empty circles for occluded GT kpts
+        self.show_match_labels = True  # m: OKS + IoU text labels
+        self.show_iscrowd = True      # c: orange bboxes for iscrowd GT
+
         self.render_scale = max(float(args.render_scale), 1.0)
 
-        self.visualizer = PoseLocalVisualizer(name='benchmark_vis')
-        self.visualizer.radius = 3 * self.render_scale
-        self.visualizer.line_width = max(1, int(round(self.render_scale)))
-        self.visualizer.set_dataset_meta(
-            manifest['dataset_meta'],
-            skeleton_style=args.skeleton_style)
+        # Extract skeleton connectivity from dataset_meta (robust fallback)
+        dmeta = manifest.get('dataset_meta', {})
+        raw_links = dmeta.get('skeleton_links', [])
+        self.skeleton_links: List = [list(lk) for lk in raw_links]
 
         self.fig, self.ax = plt.subplots(figsize=(12, 8))
         self.fig.canvas.mpl_connect('key_press_event', self._on_key)
-        self.im_artist = None
         self._render()
 
     def _load_image(self, frame: dict) -> np.ndarray:
@@ -277,65 +503,87 @@ class PredictionBrowser:
 
         frame = self.frames[self.index]
         img = self._load_image(frame)
+        img = _upscale_image(img, self.render_scale)
 
         pred_json = frame['predictions']['instances']
         gt_json = frame['ground_truth']['instances']
-        pred_inst = _instances_from_json(pred_json)
-        gt_inst = _instances_from_json(gt_json)
-        img, pred_inst, gt_inst = _apply_render_scale(
-            img, pred_inst, gt_inst, self.render_scale)
-        data_sample = _build_data_sample(frame, pred_inst, gt_inst)
+        pred_insts = _parse_instances(pred_json)
+        gt_insts = _parse_instances(gt_json)
 
-        canvas = img.copy()
+        # Build match lookups from stored metrics
+        matches: List[dict] = frame.get('metrics', {}).get('matches', [])
+        gt_matched, pred_matched, gt_to_match = _build_match_lookups(matches)
 
-        if self.show_gt:
-            self.visualizer.kpt_color = 'blue'
-            self.visualizer.link_color = 'blue'
-            self.visualizer.add_datasample(
-                'gt',
-                canvas,
-                data_sample=data_sample,
-                draw_gt=True,
-                draw_pred=False,
-                draw_bbox=self.show_bbox,
-                draw_heatmap=False,
-                show=False,
-                kpt_thr=self.args.kpt_thr,
-            )
-            canvas = self.visualizer.get_image()
-
-        if self.show_pred:
-            self.visualizer.kpt_color = 'red'
-            self.visualizer.link_color = 'red'
-            self.visualizer.add_datasample(
-                'pred',
-                canvas,
-                data_sample=data_sample,
-                draw_gt=False,
-                draw_pred=True,
-                draw_bbox=self.show_bbox,
-                draw_heatmap=False,
-                show=False,
-                kpt_thr=self.args.kpt_thr,
-            )
-            canvas = self.visualizer.get_image()
-
+        # Render base image
         self.ax.clear()
-        self.ax.imshow(canvas, interpolation='nearest')
+        self.ax.imshow(img, interpolation='nearest')
         self.ax.axis('off')
+        self.ax.autoscale(False)
 
-        toggles = []
-        toggles.append(f'pred={"ON" if self.show_pred else "off"}')
-        toggles.append(f'gt={"ON" if self.show_gt else "off"}')
-        toggles.append(f'bbox={"ON" if self.show_bbox else "off"}')
+        scale = self.render_scale
+
+        # GT overlays
+        if self.show_gt:
+            if self.show_bbox:
+                _draw_bboxes(
+                    self.ax, gt_insts, _GT_COLOR, gt_matched,
+                    show_iscrowd=self.show_iscrowd, scale=scale,
+                )
+            _draw_kpts_and_skeleton(
+                self.ax, gt_insts, _GT_COLOR,
+                is_gt=True,
+                kpt_thr=self.args.kpt_thr,
+                skeleton_links=self.skeleton_links,
+                scale=scale,
+                show_visibility=self.show_visibility,
+            )
+
+        # Pred overlays
+        if self.show_pred:
+            if self.show_bbox:
+                _draw_bboxes(
+                    self.ax, pred_insts, _PRED_COLOR, pred_matched,
+                    show_iscrowd=False, scale=scale,
+                )
+            _draw_kpts_and_skeleton(
+                self.ax, pred_insts, _PRED_COLOR,
+                is_gt=False,
+                kpt_thr=self.args.kpt_thr,
+                skeleton_links=self.skeleton_links,
+                scale=scale,
+                show_visibility=False,
+            )
+
+        # Match labels (OKS + IoU)
+        if self.show_match_labels and matches:
+            _draw_match_labels(
+                self.ax, gt_insts, pred_insts, gt_to_match, scale=scale)
+
+        # num_valid_gt: GT instances that count as matching targets (non-crowd,
+        # have keypoints, positive bbox area, not all-zero coords).
+        num_valid_gt = _count_valid_gt(gt_insts)
+
+        # Title
+        toggles = [
+            f'pred={"ON" if self.show_pred else "off"}',
+            f'gt={"ON" if self.show_gt else "off"}',
+            f'bbox={"ON" if self.show_bbox else "off"}',
+            f'vis={"ON" if self.show_visibility else "off"}',
+            f'labels={"ON" if self.show_match_labels else "off"}',
+            f'crowd={"ON" if self.show_iscrowd else "off"}',
+        ]
         metrics_str = _format_metrics(frame.get('metrics', {}))
+        # Append live num_valid_gt (may differ from stored num_gt which counts
+        # all GT annotations including crowd / zero-keypoint instances).
+        metrics_str += f'  num_valid_gt={num_valid_gt}'
         title = (
             f'[{self.index + 1}/{len(self.frames)}] '
             f'img_id={frame["img_id"]}  {frame["img_path"]}\n'
             f'{metrics_str}\n'
-            f'{"  ".join(toggles)}  |  arrows: prev/next  p/g/b: toggle  q: quit'
+            f'{"  ".join(toggles)}  |  '
+            f'arrows:prev/next  p/g/b/v/m/c:toggle  q:quit'
         )
-        self.ax.set_title(title, fontsize=10)
+        self.ax.set_title(title, fontsize=9)
         self.fig.canvas.draw_idle()
 
     def _on_key(self, event) -> None:
@@ -355,6 +603,15 @@ class PredictionBrowser:
             self._render()
         elif event.key == 'b':
             self.show_bbox = not self.show_bbox
+            self._render()
+        elif event.key == 'v':
+            self.show_visibility = not self.show_visibility
+            self._render()
+        elif event.key == 'm':
+            self.show_match_labels = not self.show_match_labels
+            self._render()
+        elif event.key == 'c':
+            self.show_iscrowd = not self.show_iscrowd
             self._render()
         elif event.key == 'q':
             plt.close(self.fig)

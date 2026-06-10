@@ -32,13 +32,16 @@ class GTInstance:
     """Per-instance ground-truth annotation in COCO-17 keypoint format."""
 
     keypoints: np.ndarray           # (K, 2) float32
-    keypoints_visible: np.ndarray   # (K,)   float32
+    keypoints_visible: np.ndarray   # (K,)   float32, binary 0/1
     bbox: np.ndarray                # (4,)   float32, xyxy
     area: float
     id: int
     category_id: int = 1
     iscrowd: int = 0
     num_keypoints: int = 0          # visible kps in COCO-17 space
+    # Raw COCO visibility (0=unlabeled, 1=occluded, 2=visible), when
+    # available from raw_ann_info. None for non-COCO / converted datasets.
+    keypoints_visible_coco: Optional[np.ndarray] = None
 
 
 @dataclass
@@ -219,6 +222,17 @@ def load_unified_samples(
         except (TypeError, ValueError):
             inst_id = 0
 
+        # Recover raw COCO visibility (0/1/2) from raw_ann_info when no
+        # keypoint converter is applied.  _load_annotations clips v to [0,1]
+        # via np.minimum(1, v), so we re-read from the original flat list.
+        kv_coco: Optional[np.ndarray] = None
+        if kp_converter is None:
+            raw_kp_list = inst.get('raw_ann_info', {}).get('keypoints', [])
+            if raw_kp_list:
+                raw_arr = np.asarray(raw_kp_list, dtype=np.float32).reshape(-1, 3)
+                if len(raw_arr) == len(kpts_final):
+                    kv_coco = raw_arr[:, 2]  # raw v column: 0/1/2
+
         return GTInstance(
             keypoints=kpts_final,
             keypoints_visible=kv_final,
@@ -228,6 +242,7 @@ def load_unified_samples(
             category_id=cat_id,
             iscrowd=iscrowd,
             num_keypoints=num_kpts,
+            keypoints_visible_coco=kv_coco,
         )
 
     # ── Prefetch images ───────────────────────────────────────────────────
