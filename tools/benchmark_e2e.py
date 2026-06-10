@@ -309,6 +309,7 @@ def _pose_dicts_from_unifiedsample(sample: UnifiedSample) -> List[dict]:
     result = []
     for g in sample.gt_instances:
         d: dict = {
+            'gt_ann_id': int(g.id),
             'keypoints': g.keypoints,
             'keypoints_visible': g.keypoints_visible,
             'bbox': g.bbox,
