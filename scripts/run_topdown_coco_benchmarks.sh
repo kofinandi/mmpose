@@ -57,6 +57,7 @@ run_benchmark() {
         --queue-strategy full_batch \
         --det-metrics \
         --det-cat-id "$det_cat_id" \
+        --nms-thr 0.95 \
         --device "$DEVICE" \
         --results-file "$RESULTS_FILE" \
         --model-name "$name" \
