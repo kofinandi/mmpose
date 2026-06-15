@@ -42,6 +42,10 @@ class BenchmarkTestDataset:
     extended_meta_keys: bool = True
     dataset_kwargs: Optional[dict] = None
     preserve_evaluator: bool = False
+    # Downscale factor applied when prefetching images (e.g. 0.5 halves
+    # width/height).  GT bboxes/keypoints are scaled to match.  Reduces
+    # RAM and I/O for high-resolution datasets such as EMDB.
+    prefetch_scale: Optional[float] = None
     # Extra metric configs appended to the evaluator by build_evaluator in
     # benchmark_e2e.py.  These metrics receive dataset_meta but NOT
     # gt_from_samples (they manage their own state via process()).
@@ -93,6 +97,7 @@ BENCHMARK_TEST_DATASETS: Dict[str, BenchmarkTestDataset] = {
         ann_file='annotations/emdb_all.json',
         data_prefix=dict(img=''),
         keypoint_src='emdb',
+        prefetch_scale=0.5,
         dataset_kwargs=dict(
             emdb1=True,
             emdb2=False,
@@ -111,6 +116,7 @@ BENCHMARK_TEST_DATASETS: Dict[str, BenchmarkTestDataset] = {
         ann_file='annotations/emdb_all.json',
         data_prefix=dict(img=''),
         keypoint_src='emdb',
+        prefetch_scale=0.5,
         dataset_kwargs=dict(
             emdb1=True,
             emdb2=False,

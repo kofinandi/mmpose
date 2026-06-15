@@ -13,9 +13,10 @@ whole-pipeline and per-stage granularity.
 Data loading is unified via :func:`load_unified_samples`: all datasets
 (coco, crowdpose, mpii, aic, ochuman, emdb) go through one code path that
 loads every annotation unfiltered, converts keypoints to COCO-17 format,
-and prefetches images.  GT is never read from the model pipeline; it is
-assembled from :class:`UnifiedSample` and attached to each
-:class:`PoseDataSample` before metric evaluation.
+and prefetches images.  EMDB splits downscale prefetched images (default
+0.5×) to reduce RAM; GT annotations are scaled to match.  GT is never read
+from the model pipeline; it is assembled from :class:`UnifiedSample` and
+attached to each :class:`PoseDataSample` before metric evaluation.
 """
 
 from mmpose.compat.transformers_v5 import install_transformers_v5_shims

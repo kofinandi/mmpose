@@ -83,6 +83,37 @@ def is_valid_instance(gt: GTInstance) -> bool:
     return True
 
 
+def _resize_prefetch_image(
+    image: np.ndarray,
+    scale: float,
+) -> Tuple[np.ndarray, float, float]:
+    """Resize ``image`` by ``scale`` and return actual axis scale factors."""
+    orig_h, orig_w = image.shape[:2]
+    new_w = max(1, int(round(orig_w * scale)))
+    new_h = max(1, int(round(orig_h * scale)))
+    sx = new_w / orig_w
+    sy = new_h / orig_h
+    resized = mmcv.imresize(image, (new_w, new_h))
+    return resized, sx, sy
+
+
+def _scale_gt_instances(
+    gt_instances: List[GTInstance],
+    sx: float,
+    sy: float,
+) -> None:
+    """Scale GT bboxes/keypoints/areas in place to match a resized image."""
+    area_scale = sx * sy
+    for gt in gt_instances:
+        gt.keypoints[:, 0] *= sx
+        gt.keypoints[:, 1] *= sy
+        gt.bbox[0] *= sx
+        gt.bbox[1] *= sy
+        gt.bbox[2] *= sx
+        gt.bbox[3] *= sy
+        gt.area *= area_scale
+
+
 # ---------------------------------------------------------------------------
 # Unified loader
 # ---------------------------------------------------------------------------
@@ -113,6 +144,11 @@ def load_unified_samples(
     init_default_scope('mmpose')
 
     spec = BENCHMARK_TEST_DATASETS[dataset_name]
+    prefetch_scale = spec.prefetch_scale
+    if prefetch_scale is not None and not (0.0 < prefetch_scale <= 1.0):
+        raise ValueError(
+            f'prefetch_scale for {dataset_name!r} must be in (0, 1], '
+            f'got {prefetch_scale}.')
 
     # ── Resolve dataset build config ───────────────────────────────────────
     ds_cfg = dict(
@@ -252,7 +288,11 @@ def load_unified_samples(
         )
 
     # ── Prefetch images ───────────────────────────────────────────────────
-    print(f'Prefetching {len(seen_img_ids)} images ...')
+    if prefetch_scale is not None and prefetch_scale != 1.0:
+        print(f'Prefetching {len(seen_img_ids)} images '
+              f'at scale {prefetch_scale} ...')
+    else:
+        print(f'Prefetching {len(seen_img_ids)} images ...')
     samples: List[UnifiedSample] = []
     for img_id in seen_img_ids:
         info = img_info.get(img_id)
@@ -271,11 +311,16 @@ def load_unified_samples(
         if image is None:
             print(f'Warning: could not read {img_path}, skipping.')
             continue
-        h, w = image.shape[:2]
 
         gt_instances = [
             _parse_instance(inst) for inst in img_to_instances[img_id]
         ]
+
+        if prefetch_scale is not None and prefetch_scale != 1.0:
+            image, sx, sy = _resize_prefetch_image(image, prefetch_scale)
+            _scale_gt_instances(gt_instances, sx, sy)
+
+        h, w = image.shape[:2]
 
         samples.append(UnifiedSample(
             img_id=img_id,
