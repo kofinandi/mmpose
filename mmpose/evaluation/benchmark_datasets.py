@@ -13,8 +13,8 @@ Halpe models need a different destination convention and are out of scope.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Dict, Optional
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional
 
 from mmengine.config import Config
 
@@ -42,6 +42,10 @@ class BenchmarkTestDataset:
     extended_meta_keys: bool = True
     dataset_kwargs: Optional[dict] = None
     preserve_evaluator: bool = False
+    # Extra metric configs appended to the evaluator by build_evaluator in
+    # benchmark_e2e.py.  These metrics receive dataset_meta but NOT
+    # gt_from_samples (they manage their own state via process()).
+    extra_metrics: Optional[List[dict]] = None
 
 
 BENCHMARK_TEST_DATASETS: Dict[str, BenchmarkTestDataset] = {
@@ -94,5 +98,11 @@ BENCHMARK_TEST_DATASETS: Dict[str, BenchmarkTestDataset] = {
             emdb2=False,
             good_frame_mask=True,
         ),
+        extra_metrics=[
+            dict(type='MPJVE', prefix='emdb'),
+            dict(type='MPJAE', prefix='emdb'),
+            dict(type='MPJVE', norm_item=['bbox', 'torso'], prefix='emdb'),
+            dict(type='MPJAE', norm_item=['bbox', 'torso'], prefix='emdb'),
+        ],
     ),
 }

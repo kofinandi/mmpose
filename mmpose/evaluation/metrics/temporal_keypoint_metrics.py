@@ -10,6 +10,7 @@ from mmengine.logging import MMLogger
 
 from mmpose.registry import METRICS
 from ..functional import keypoint_mpjae, keypoint_mpjve
+from ..functional.frame_metrics import match_instances_oks
 
 # COCO-17 keypoint indices used for torso-diameter normalisation.
 # Torso diameter is the mean of the two cross-torso diagonals:
@@ -46,6 +47,21 @@ class _TemporalBaseMetric(BaseMetric):
     Supports optional normalisation of the error by a body-size scale factor
     to make metrics comparable across subjects and viewing distances.
 
+    The ``process()`` method handles two modes automatically:
+
+    **Single-instance mode** (``tools/test.py`` path): ``pred_instances``
+    and ``gt_instances`` each have exactly one instance after the dataset
+    pipeline crops to the GT bbox.  OKS matching still runs but is trivially
+    a 1-vs-1 comparison.
+
+    **Multi-instance mode** (``tools/benchmark_e2e.py`` path): the frame
+    carries *N* predicted poses and *M* GT tracks.  Greedy OKS matching
+    assigns each predicted pose to at most one GT track; only matched pairs
+    contribute to the temporal error for that frame.  ``gt_instances`` must
+    carry ``track_ids`` (an integer array of shape ``[M]``).  Frames whose
+    best match falls below ``match_thr`` are silently skipped, which is
+    correct behaviour for a real detector that may miss a frame.
+
     Args:
         norm_item (str | Sequence[str] | None): Normalisation method(s) to
             apply.  Valid values:
@@ -61,6 +77,10 @@ class _TemporalBaseMetric(BaseMetric):
             Multiple items may be given as a list; all normalised variants
             are reported together.
 
+        match_thr (float): Minimum OKS score to accept a pred-to-GT match.
+            Predicted poses whose best-match OKS is below this threshold are
+            dropped for the current frame.  Default: ``0.5``.
+
         collect_device (str): Device for distributed result collection.
             Default: ``'cpu'``.
         prefix (str, optional): Metric name prefix.  Default: ``None``.
@@ -72,6 +92,7 @@ class _TemporalBaseMetric(BaseMetric):
 
     def __init__(self,
                  norm_item: Union[str, Sequence[str], None] = None,
+                 match_thr: float = 0.5,
                  collect_device: str = 'cpu',
                  prefix: Optional[str] = None) -> None:
         super().__init__(collect_device=collect_device, prefix=prefix)
@@ -90,76 +111,179 @@ class _TemporalBaseMetric(BaseMetric):
                     f'{self.__class__.__name__}. '
                     f"Must be None, 'bbox', 'head', or 'torso'.")
 
+        self.match_thr = float(match_thr)
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _build_gt_list(self, gt: dict, n_gt: int) -> List[dict]:
+        """Build the list of GT dicts expected by :func:`match_instances_oks`.
+
+        Each entry carries ``keypoints``, ``keypoints_visible``,
+        optionally ``keypoints_visible_coco``, ``bbox`` (xyxy), ``orig_area``,
+        and ``iscrowd``.
+        """
+        kpts = np.asarray(gt['keypoints'])      # (M, K, 2)
+        kv = np.asarray(gt['keypoints_visible'])  # (M, K) or (M, K, 2)
+        if kv.ndim == 3:
+            kv = kv[:, :, 0]
+
+        bboxes = gt.get('bboxes')
+        areas = gt.get('orig_areas')
+        iscrowd_arr = gt.get('iscrowd', np.zeros(n_gt, dtype=np.int32))
+        kv_coco_arr = gt.get('keypoints_visible_coco')  # (M, K) or None
+        track_ids_arr = gt.get('track_ids')              # (M,)   or None
+
+        gt_list = []
+        for i in range(n_gt):
+            entry: dict = {
+                'keypoints': kpts[i],        # (K, 2)
+                'keypoints_visible': kv[i],  # (K,)
+                'iscrowd': int(iscrowd_arr[i]) if iscrowd_arr is not None else 0,
+            }
+            if kv_coco_arr is not None:
+                entry['keypoints_visible_coco'] = np.asarray(kv_coco_arr[i])
+
+            if bboxes is not None and len(bboxes) > i:
+                b = np.asarray(bboxes[i]).reshape(-1)[:4]
+                entry['bbox'] = b
+                w = float(b[2] - b[0])
+                h = float(b[3] - b[1])
+                entry['orig_area'] = float(
+                    areas[i] if areas is not None and len(areas) > i
+                    else max(w * h, 1.0))
+            else:
+                entry['orig_area'] = 1.0
+
+            if track_ids_arr is not None:
+                entry['_track_id'] = int(track_ids_arr[i])
+            else:
+                entry['_track_id'] = i  # fall back: use instance index
+
+            gt_list.append(entry)
+        return gt_list
+
+    def _build_pred_list(self, pred: dict, n_pred: int) -> List[dict]:
+        """Build the list of pred dicts expected by :func:`match_instances_oks`."""
+        kpts = np.asarray(pred['keypoints'])  # (N, K, 2)
+        pred_list = []
+        for i in range(n_pred):
+            pred_list.append({'keypoints': kpts[i]})
+        return pred_list
+
     def process(self, data_batch: Sequence[dict],
                 data_samples: Sequence[dict]) -> None:
-        """Accumulate per-sample prediction/GT pairs.
+        """Accumulate per-sample prediction/GT pairs via OKS matching.
+
+        Works for both the single-instance (``tools/test.py``) and
+        multi-instance (``tools/benchmark_e2e.py``) cases.
 
         Args:
-            data_batch (Sequence[dict]): A batch of data from the dataloader.
-                Unused; present for API compatibility.
+            data_batch (Sequence[dict]): Unused; present for API compatibility.
             data_samples (Sequence[dict]): Model outputs for a batch.
         """
+        sigmas = np.asarray(
+            self.dataset_meta.get('sigmas', []), dtype=np.float32)
+        if len(sigmas) == 0:
+            return  # no keypoint metadata → skip silently
+
         for data_sample in data_samples:
-            pred_coords = data_sample['pred_instances']['keypoints']
-            if pred_coords.ndim == 3 and pred_coords.shape[0] == 1:
-                pred_coords = pred_coords[0]
-
+            pred = data_sample['pred_instances']
             gt = data_sample['gt_instances']
-            gt_coords = gt['keypoints']
-            if gt_coords.ndim == 3 and gt_coords.shape[0] == 1:
-                gt_coords = gt_coords[0]
 
-            mask = gt['keypoints_visible'].astype(bool)
-            if mask.ndim == 2 and mask.shape[0] == 1:
-                mask = mask[0]
+            pred_kpts = np.asarray(pred['keypoints'])
+            gt_kpts = np.asarray(gt['keypoints'])
 
-            img_path = data_sample['img_path']
+            # Normalise leading singleton dims (single-instance topdown path)
+            if pred_kpts.ndim == 2:
+                pred_kpts = pred_kpts[None]   # (1, K, 2)
+            if gt_kpts.ndim == 2:
+                gt_kpts = gt_kpts[None]       # (1, K, 2)
+
+            n_pred = pred_kpts.shape[0]
+            n_gt = gt_kpts.shape[0]
+
+            if n_pred == 0 or n_gt == 0:
+                continue
+
+            img_path = data_sample.get('img_path', '')
             frame_id = _parse_frame_id(img_path)
-            track_id = data_sample['raw_ann_info']['track_id']
 
-            result = dict(
-                track_id=track_id,
-                frame_id=frame_id,
-                pred_coords=pred_coords,
-                gt_coords=gt_coords,
-                mask=mask,
-            )
+            gt_list = self._build_gt_list(gt, n_gt)
+            pred_list = self._build_pred_list(
+                {'keypoints': pred_kpts}, n_pred)
 
-            if 'bbox' in self.norm_item:
-                assert 'bboxes' in gt, (
-                    'The ground truth data info does not have the expected '
-                    'normalized_item ``"bbox"``.')
-                bbox_size = float(
-                    np.max(gt['bboxes'][0][2:] - gt['bboxes'][0][:2]))
-                result['bbox_size'] = bbox_size
+            matches, _ = match_instances_oks(
+                gt_list, pred_list, sigmas, match_thr=self.match_thr)
 
-            if 'head' in self.norm_item:
-                assert 'head_size' in gt, (
-                    'The ground truth data info does not have the expected '
-                    'normalized_item ``"head_size"``.')
-                result['head_size'] = float(gt['head_size'])
+            gt_kv = np.asarray(gt['keypoints_visible'])
+            if gt_kv.ndim == 3:
+                gt_kv = gt_kv[:, :, 0]
+            if gt_kv.ndim == 1:
+                gt_kv = gt_kv[None]
 
-            if 'torso' in self.norm_item:
-                # Per-frame torso size: mean of cross-torso diagonals.
-                sizes = []
-                for i, j in _TORSO_KP_PAIRS:
-                    if mask[i] and mask[j]:
-                        sizes.append(
-                            float(np.linalg.norm(gt_coords[i] - gt_coords[j])))
-                if not sizes:
-                    # Fall back to predicted keypoints (mirrors PCKAccuracy).
-                    for i, j in _TORSO_KP_PAIRS:
-                        sizes.append(
-                            float(
-                                np.linalg.norm(pred_coords[i] -
-                                               pred_coords[j])))
-                    warnings.warn(
-                        'Ground truth torso size < 1 for at least one frame. '
-                        'Using predicted keypoints to estimate torso size.')
-                torso_size = float(np.mean(sizes)) if sizes else 1.0
-                result['torso_size'] = max(torso_size, 1.0)
+            for m in matches:
+                gi = m['gt_idx']
+                pi = m['pred_idx']
 
-            self.results.append(result)
+                gt_entry = gt_list[gi]
+                track_id = gt_entry['_track_id']
+
+                pred_coords = pred_kpts[pi]      # (K, 2)
+                gt_coords = gt_kpts[gi]          # (K, 2)
+                mask = gt_kv[gi].astype(bool)    # (K,)
+
+                result = dict(
+                    track_id=track_id,
+                    frame_id=frame_id,
+                    pred_coords=pred_coords,
+                    gt_coords=gt_coords,
+                    mask=mask,
+                )
+
+                if 'bbox' in self.norm_item:
+                    b = gt_entry.get('bbox')
+                    if b is not None:
+                        b = np.asarray(b).reshape(-1)[:4]
+                        bbox_size = float(
+                            np.max(b[2:] - b[:2]))
+                    else:
+                        # fall back to bboxes field in gt
+                        bboxes = gt.get('bboxes')
+                        if bboxes is not None and len(bboxes) > gi:
+                            b2 = np.asarray(bboxes[gi]).reshape(-1)[:4]
+                            bbox_size = float(np.max(b2[2:] - b2[:2]))
+                        else:
+                            bbox_size = 1.0
+                    result['bbox_size'] = max(bbox_size, 1.0)
+
+                if 'head' in self.norm_item:
+                    assert 'head_size' in gt, (
+                        'The ground truth data info does not have the expected '
+                        'normalized_item ``"head_size"``.')
+                    result['head_size'] = float(gt['head_size'])
+
+                if 'torso' in self.norm_item:
+                    sizes = []
+                    for i_idx, j_idx in _TORSO_KP_PAIRS:
+                        if mask[i_idx] and mask[j_idx]:
+                            sizes.append(
+                                float(np.linalg.norm(
+                                    gt_coords[i_idx] - gt_coords[j_idx])))
+                    if not sizes:
+                        for i_idx, j_idx in _TORSO_KP_PAIRS:
+                            sizes.append(
+                                float(np.linalg.norm(
+                                    pred_coords[i_idx] - pred_coords[j_idx])))
+                        warnings.warn(
+                            'Ground truth torso size < 1 for at least one '
+                            'frame. Using predicted keypoints to estimate '
+                            'torso size.')
+                    torso_size = float(np.mean(sizes)) if sizes else 1.0
+                    result['torso_size'] = max(torso_size, 1.0)
+
+                self.results.append(result)
 
     def _build_tracks(
         self, results: List[dict]
@@ -234,6 +358,13 @@ class MPJVE(_TemporalBaseMetric):
     ground-truth velocity vectors over all visible joints and all
     consecutive frame pairs across every person-track in the dataset.
 
+    An OKS-based matching step (threshold ``match_thr``) is applied in
+    ``process()`` before accumulating predictions, so the metric works
+    correctly when the data sample carries multiple unmatched predicted
+    instances alongside multiple GT tracks (e.g. from
+    ``tools/benchmark_e2e.py``).  For the single-instance topdown path
+    (``tools/test.py``) the matching is trivially 1-vs-1.
+
     Optionally, errors can be normalised by a body-size scale factor via
     ``norm_item`` (see :class:`_TemporalBaseMetric`).  When multiple
     ``norm_item`` values are given, all variants are reported together.
@@ -246,12 +377,17 @@ class MPJVE(_TemporalBaseMetric):
     - ``norm_item='torso'``   → ``'tMPJVE'``
 
     .. note::
-        Requires ``track_id`` in ``raw_ann_info`` and ``img_path`` following
-        the 3DPW naming convention ``*/<seq_name>/image_XXXXX.jpg``.
+        Requires ``img_path`` following the naming convention
+        ``*/<seq_name>/image_XXXXX.jpg`` (3DPW) or ``*/XXXXX.jpg`` (EMDB).
+        In ``tools/test.py`` mode, ``track_id`` must be present in
+        ``raw_ann_info``.  In ``tools/benchmark_e2e.py`` mode,
+        ``track_ids`` must be set on ``gt_instances``.
 
     Args:
         norm_item (str | Sequence[str] | None): Normalisation method(s).
             Default: ``None`` (raw pixel-space error).
+        match_thr (float): OKS threshold for pred-to-GT matching.
+            Default: ``0.5``.
         collect_device (str): Device for distributed result collection.
             Default: ``'cpu'``.
         prefix (str, optional): Metric name prefix.  Default: ``None``.
@@ -302,6 +438,10 @@ class MPJAE(_TemporalBaseMetric):
     ground-truth acceleration vectors over all visible joints and all
     valid frame triplets across every person-track in the dataset.
 
+    An OKS-based matching step (threshold ``match_thr``) is applied in
+    ``process()`` before accumulating predictions.  See :class:`MPJVE`
+    for details.
+
     Optionally, errors can be normalised by a body-size scale factor via
     ``norm_item`` (see :class:`_TemporalBaseMetric`).  When multiple
     ``norm_item`` values are given, all variants are reported together.
@@ -313,13 +453,11 @@ class MPJAE(_TemporalBaseMetric):
     - ``norm_item='head'``    → ``'hMPJAE'``
     - ``norm_item='torso'``   → ``'tMPJAE'``
 
-    .. note::
-        Requires ``track_id`` in ``raw_ann_info`` and ``img_path`` following
-        the 3DPW naming convention ``*/<seq_name>/image_XXXXX.jpg``.
-
     Args:
         norm_item (str | Sequence[str] | None): Normalisation method(s).
             Default: ``None`` (raw pixel-space error).
+        match_thr (float): OKS threshold for pred-to-GT matching.
+            Default: ``0.5``.
         collect_device (str): Device for distributed result collection.
             Default: ``'cpu'``.
         prefix (str, optional): Metric name prefix.  Default: ``None``.

@@ -42,6 +42,9 @@ class GTInstance:
     # Raw COCO visibility (0=unlabeled, 1=occluded, 2=visible), when
     # available from raw_ann_info. None for non-COCO / converted datasets.
     keypoints_visible_coco: Optional[np.ndarray] = None
+    # Video-track identifier; set from raw_ann_info['track_id'] when
+    # available (e.g. EMDB, 3DPW).  Defaults to 0 for single-image datasets.
+    track_id: int = 0
 
 
 @dataclass
@@ -233,6 +236,8 @@ def load_unified_samples(
                 if len(raw_arr) == len(kpts_final):
                     kv_coco = raw_arr[:, 2]  # raw v column: 0/1/2
 
+        track_id = int(inst.get('raw_ann_info', {}).get('track_id', 0))
+
         return GTInstance(
             keypoints=kpts_final,
             keypoints_visible=kv_final,
@@ -243,6 +248,7 @@ def load_unified_samples(
             iscrowd=iscrowd,
             num_keypoints=num_kpts,
             keypoints_visible_coco=kv_coco,
+            track_id=track_id,
         )
 
     # ── Prefetch images ───────────────────────────────────────────────────

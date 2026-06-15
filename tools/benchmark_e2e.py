@@ -123,13 +123,22 @@ def _data_root_for_dataset(dataset_name: str) -> str:
 
 # ── Evaluator helpers ──────────────────────────────────────────────────────
 
-def build_evaluator(pose_cfg: Config, dataset_meta: dict) -> Evaluator:
+def build_evaluator(
+    pose_cfg: Config,
+    dataset_meta: dict,
+    test_dataset: Optional[str] = None,
+) -> Evaluator:
     """Build an mmengine Evaluator from the config's test_evaluator section.
 
     Forces ``gt_from_samples=True`` and removes ``ann_file`` on every metric
     so that ground truth is always synthesised from the unified loader data
     rather than read from the dataset's annotation file.  This makes every
     dataset (including COCO) behave consistently.
+
+    When ``test_dataset`` is provided and the corresponding
+    :class:`BenchmarkTestDataset` specifies ``extra_metrics``, those metrics
+    are appended to the evaluator **without** ``gt_from_samples`` injection
+    (temporal metrics manage their own state via ``process()``).
     """
     _init_scope(pose_cfg)
     ev_cfg = pose_cfg.test_evaluator
@@ -144,6 +153,14 @@ def build_evaluator(pose_cfg: Config, dataset_meta: dict) -> Evaluator:
         m = METRICS.build(m_cfg)
         m.dataset_meta = dataset_meta
         metrics.append(m)
+
+    if test_dataset is not None:
+        spec = BENCHMARK_TEST_DATASETS.get(test_dataset)
+        if spec is not None and spec.extra_metrics:
+            for m_cfg in spec.extra_metrics:
+                m = METRICS.build(dict(m_cfg))
+                m.dataset_meta = dataset_meta
+                metrics.append(m)
 
     return Evaluator(metrics)
 
@@ -291,6 +308,15 @@ def _attach_gt_to_posedatasample(
             [g.area for g in gt_insts], dtype=np.float32)
         gt.iscrowd = np.array(
             [g.iscrowd for g in gt_insts], dtype=np.int32)
+        gt.track_ids = np.array(
+            [g.track_id for g in gt_insts], dtype=np.int32)
+        # Raw COCO visibility (0/1/2) used by OKS matching in temporal metrics
+        kv_coco_list = [g.keypoints_visible_coco for g in gt_insts]
+        if any(v is not None for v in kv_coco_list):
+            gt.keypoints_visible_coco = np.stack(
+                [v if v is not None else g.keypoints_visible
+                 for v, g in zip(kv_coco_list, gt_insts)],
+                axis=0).astype(np.float32)
 
     ds.gt_instances = gt
 
@@ -1170,7 +1196,7 @@ def main():
         kp_model = init_model(
             args.pose_config, args.pose_checkpoint, device=args.device)
         dataset_meta = kp_model.dataset_meta
-        evaluator = build_evaluator(pose_cfg, dataset_meta)
+        evaluator = build_evaluator(pose_cfg, dataset_meta, args.test_dataset)
 
         det_evaluator = (build_det_evaluator(samples)
                           if getattr(args, 'det_metrics', False) else None)
@@ -1202,7 +1228,7 @@ def main():
         model = init_model(
             args.pose_config, args.pose_checkpoint, device=args.device)
         dataset_meta = model.dataset_meta
-        evaluator = build_evaluator(pose_cfg, dataset_meta)
+        evaluator = build_evaluator(pose_cfg, dataset_meta, args.test_dataset)
         det_evaluator = None
 
         val_pipeline = Compose(pipeline_cfg)
