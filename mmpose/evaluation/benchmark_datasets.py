@@ -27,7 +27,7 @@ EXTENDED_PACK_META_KEYS = (
 )
 
 BENCHMARK_TEST_DATASET_NAMES = (
-    'coco', 'crowdpose', 'mpii', 'aic', 'ochuman', 'emdb')
+    'coco', 'crowdpose', 'mpii', 'aic', 'ochuman', 'emdb', 'emdb-mini')
 
 
 @dataclass(frozen=True)
@@ -97,6 +97,25 @@ BENCHMARK_TEST_DATASETS: Dict[str, BenchmarkTestDataset] = {
             emdb1=True,
             emdb2=False,
             good_frame_mask=True,
+        ),
+        extra_metrics=[
+            dict(type='MPJVE', prefix='emdb'),
+            dict(type='MPJAE', prefix='emdb'),
+            dict(type='MPJVE', norm_item=['bbox', 'torso'], prefix='emdb'),
+            dict(type='MPJAE', norm_item=['bbox', 'torso'], prefix='emdb'),
+        ],
+    ),
+    'emdb-mini': BenchmarkTestDataset(
+        dataset_type='EmdbDataset',
+        data_root='data/emdb/',
+        ann_file='annotations/emdb_all.json',
+        data_prefix=dict(img=''),
+        keypoint_src='emdb',
+        dataset_kwargs=dict(
+            emdb1=True,
+            emdb2=False,
+            good_frame_mask=True,
+            max_frames_per_sequence=300,
         ),
         extra_metrics=[
             dict(type='MPJVE', prefix='emdb'),
