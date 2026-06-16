@@ -198,6 +198,23 @@ def _upscale_image(img: np.ndarray, scale: float) -> np.ndarray:
     return mmcv.imresize(img, new_size, interpolation='bicubic')
 
 
+def _resize_to_ori_shape(img: np.ndarray, ori_shape: Optional[List[int]]) -> np.ndarray:
+    """Resize *img* to ``ori_shape`` when it differs from the file on disk.
+
+    Benchmark runs may prefetch EMDB (and other datasets) at reduced
+    resolution; predictions and GT in ``frames.json`` are stored in that
+    inference coordinate space while ``img_path`` still points at the
+    original file.
+    """
+    if not ori_shape or len(ori_shape) < 2:
+        return img
+    target_h, target_w = int(ori_shape[0]), int(ori_shape[1])
+    h, w = img.shape[:2]
+    if (h, w) == (target_h, target_w):
+        return img
+    return mmcv.imresize(img, (target_w, target_h))
+
+
 def _bbox_iou(box_a: np.ndarray, box_b: np.ndarray) -> float:
     """Axis-aligned IoU of two [x1, y1, x2, y2] boxes."""
     ix1 = max(float(box_a[0]), float(box_b[0]))
@@ -492,7 +509,8 @@ class PredictionBrowser:
         if not osp.isfile(path):
             raise FileNotFoundError(
                 f'Image not found: {path} (data_root={self.data_root})')
-        return mmcv.imread(path, channel_order='rgb')
+        img = mmcv.imread(path, channel_order='rgb')
+        return _resize_to_ori_shape(img, frame.get('ori_shape'))
 
     def _render(self) -> None:
         if not self.frames:
