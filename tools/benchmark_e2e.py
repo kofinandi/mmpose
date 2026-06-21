@@ -991,6 +991,46 @@ def _prediction_out_dir(args, run_date: str, is_topdown: bool) -> str:
     return osp.join('benchmark', 'predictions', tag, model_label)
 
 
+def _filter_pred_for_saving(
+    ds: PoseDataSample,
+    score_thr: float,
+) -> PoseDataSample:
+    """Return a copy of *ds* with low-confidence predictions removed.
+
+    Only ``pred_instances`` is filtered; all metainfo and GT fields are
+    preserved unchanged.  The original *ds* is not modified, so COCO
+    evaluation that already consumed it is unaffected.
+
+    Filtering is based on ``bbox_scores`` when present, otherwise
+    ``keypoint_scores`` mean is used as a fallback.
+    """
+    if score_thr <= 0:
+        return ds
+
+    instances = ds.pred_instances
+    if instances is None or len(instances) == 0:
+        return ds
+
+    if hasattr(instances, 'bbox_scores') and instances.bbox_scores is not None:
+        scores = np.asarray(instances.bbox_scores)
+    elif (hasattr(instances, 'keypoint_scores')
+          and instances.keypoint_scores is not None):
+        scores = np.asarray(instances.keypoint_scores).mean(axis=-1)
+    else:
+        return ds
+
+    keep = scores >= score_thr
+    if keep.all():
+        return ds
+
+    filtered_ds = ds.new()
+    filtered_ds.set_metainfo(ds.metainfo)
+    filtered_ds.pred_instances = instances[keep]
+    if hasattr(ds, 'gt_instances'):
+        filtered_ds.gt_instances = ds.gt_instances
+    return filtered_ds
+
+
 def _save_predictions(
     args,
     data_root: str,
@@ -1020,6 +1060,7 @@ def _save_predictions(
         'perf': perf,
         'data_root': data_root,
         'dataset_meta': sanitize_dataset_meta(dataset_meta),
+        'save_score_thr': args.save_score_thr,
         'badcase_defaults': {
             'metric_key': 'mean_oks',
             'metric_type': 'accuracy',
@@ -1117,6 +1158,11 @@ def _parse_args():
                         'class (topdown mode only).')
     p.add_argument('--log-interval', type=int, default=100,
                    help='Print a progress line every N batches (default: 100)')
+    p.add_argument(
+        '--save-score-thr', type=float, default=0.0,
+        help='Minimum bbox_score for a prediction to be included in the '
+             'saved prediction bundle (does NOT affect COCO eval, '
+             'default: 0.0)')
     p.add_argument(
         '--cfg-options', nargs='+', action=DictAction, default={},
         help='Override config options, e.g. model.backbone.depth=18')
@@ -1258,12 +1304,13 @@ def main():
         evaluator.process(data_samples=[ds], data_batch=None)
 
         if frame_records is not None:
+            pred_ds_save = _filter_pred_for_saving(ds, args.save_score_thr)
             frame_records.append(build_frame_record(
                 img_id=int(img_id),
                 frame_id=fid,
                 img_path=sample.img_path,
                 data_root=data_root,
-                pred_ds=ds,
+                pred_ds=pred_ds_save,
                 gt_instances=_pose_dicts_from_unifiedsample(sample),
                 dataset_meta=dataset_meta,
             ))

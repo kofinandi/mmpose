@@ -11,3 +11,4 @@ configs/body_2d_keypoint/yolo26pose/coco/yolo26s-pose_coco-640.py,data/models/yo
 configs/body_2d_keypoint/yolo26pose/coco/yolo26m-pose_coco-640.py,data/models/yolo26m-pose.pt,YOLO26-Pose,medium
 configs/body_2d_keypoint/yolo26pose/coco/yolo26l-pose_coco-640.py,data/models/yolo26l-pose.pt,YOLO26-Pose,large
 configs/body_2d_keypoint/yolo26pose/coco/yolo26x-pose_coco-640.py,data/models/yolo26x-pose.pt,YOLO26-Pose,xlarge
+configs/body_2d_keypoint/rfdetrpose/coco/rfdetr-pose_coco-576.py,data/models/rf-detr-keypoint-preview-xlarge.pth,RF-DETR-Pose,xlarge

@@ -18,9 +18,13 @@ from mmpose.models.builder import build_pose_estimator
 from mmpose.structures import PoseDataSample
 from mmpose.structures.bbox import bbox_xywh2xyxy
 
-CUSTOM_POSE_WRAPPER_TYPES = frozenset({'UltralyticsYOLOPoseEstimator'})
+CUSTOM_POSE_WRAPPER_TYPES = frozenset({
+    'UltralyticsYOLOPoseEstimator',
+    'RFDETRPoseEstimator',
+})
 _POSE_WRAPPER_CHECKPOINT_FIELDS = {
     'UltralyticsYOLOPoseEstimator': 'weights',
+    'RFDETRPoseEstimator': 'pretrain_weights',
 }
 
 
