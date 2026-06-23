@@ -97,7 +97,7 @@ BENCHMARK_TEST_DATASETS: Dict[str, BenchmarkTestDataset] = {
         ann_file='annotations/emdb_all.json',
         data_prefix=dict(img=''),
         keypoint_src='emdb',
-        prefetch_scale=0.5,
+        prefetch_scale=0.33333,
         dataset_kwargs=dict(
             emdb1=True,
             emdb2=False,

@@ -65,6 +65,7 @@ from mmpose.evaluation.functional.frame_metrics import (
     save_prediction_bundle,
     sanitize_dataset_meta,
 )
+from mmpose.postprocessing import PostProcessingPipeline, build_post_processor
 from mmpose.structures import PoseDataSample, merge_data_samples
 
 try:
@@ -342,11 +343,86 @@ def _pose_dicts_from_unifiedsample(sample: UnifiedSample) -> List[dict]:
             'bbox': g.bbox,
             'orig_area': g.area,
             'iscrowd': int(g.iscrowd),
+            'track_id': int(g.track_id),
         }
         if g.keypoints_visible_coco is not None:
             d['keypoints_visible_coco'] = g.keypoints_visible_coco
         result.append(d)
     return result
+
+
+# ── Post-processing helper ────────────────────────────────────────────────
+
+def _run_post_processing(
+    pipeline: PostProcessingPipeline,
+    samples: List[UnifiedSample],
+    pred_by_img_id: Dict[int, PoseDataSample],
+) -> Tuple[Dict[int, PoseDataSample], dict]:
+    """Apply a post-processing pipeline to per-image predictions.
+
+    Iterates *samples* in order (preserving sequence order for temporal
+    filters), feeds prediction-only :class:`PoseDataSample`s into the
+    pipeline, and returns the post-processed map plus a timing perf dict.
+
+    For an **online** pipeline each :meth:`~PostProcessingPipeline.process`
+    call is individually timed; for an **offline** pipeline a single
+    :meth:`~PostProcessingPipeline.evaluate` call is timed.
+
+    Args:
+        pipeline: Built :class:`PostProcessingPipeline`.
+        samples: Ordered unified samples (same order as inference run).
+        pred_by_img_id: Mapping ``img_id → PoseDataSample`` from inference.
+
+    Returns:
+        Tuple of the post-processed ``img_id → PoseDataSample`` mapping and
+        a flat perf dict.
+    """
+    pipeline.reset()
+
+    postproc_by_img_id: Dict[int, PoseDataSample] = {}
+
+    if pipeline.is_online:
+        for sample in samples:
+            img_id = sample.img_id
+            ds = pred_by_img_id.get(img_id)
+            if ds is None:
+                continue
+            result = pipeline.process(ds)
+            if result is not None:
+                postproc_by_img_id[img_id] = result
+
+        n = len(pipeline._frame_times)
+        perf = {
+            'postproc/latency_ms_per_frame': pipeline.per_frame_ms,
+            'postproc/total_s': pipeline.total_s,
+            'postproc/fps': n / pipeline.total_s if pipeline.total_s > 0 else 0.0,
+        }
+    else:
+        for sample in samples:
+            img_id = sample.img_id
+            ds = pred_by_img_id.get(img_id)
+            if ds is None:
+                continue
+            pipeline.process(ds)
+
+        results = pipeline.evaluate()
+        # Reassociate processed frames with img_ids in insertion order
+        img_ids_ordered = [
+            s.img_id for s in samples if s.img_id in pred_by_img_id
+        ]
+        for img_id, processed_ds in zip(img_ids_ordered, results):
+            postproc_by_img_id[img_id] = processed_ds
+
+        n = len(results)
+        total_s = pipeline.total_s
+        perf = {
+            'postproc/latency_ms_per_frame': (
+                1000.0 * total_s / n if n > 0 else 0.0),
+            'postproc/total_s': total_s,
+            'postproc/fps': n / total_s if total_s > 0 else 0.0,
+        }
+
+    return postproc_by_img_id, perf
 
 
 # ── Bottomup pipeline ──────────────────────────────────────────────────────
@@ -952,7 +1028,14 @@ def _print_results(quality: dict, perf: dict, mode: str) -> None:
     print(f'{sep}\n')
 
 
-def _save_out(quality: dict, perf: dict, mode: str, args) -> None:
+def _save_out(
+    quality: dict,
+    perf: dict,
+    mode: str,
+    args,
+    pp_quality: Optional[dict] = None,
+) -> None:
+    post_config = getattr(args, 'post_config', None)
     payload = {
         'mode': mode,
         'quality': quality,
@@ -965,10 +1048,14 @@ def _save_out(quality: dict, perf: dict, mode: str, args) -> None:
             'det_checkpoint': (
                 osp.abspath(args.det_checkpoint)
                 if args.det_checkpoint else None),
+            'post_config': (
+                osp.abspath(post_config) if post_config else None),
         },
         'test_dataset': args.test_dataset,
         'timestamp': datetime.now().isoformat(timespec='seconds'),
     }
+    if pp_quality is not None:
+        payload['post_processed_quality'] = pp_quality
     out_dir = osp.dirname(osp.abspath(args.out))
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
@@ -1073,7 +1160,59 @@ def _save_predictions(
     print(f'Predictions saved to {osp.abspath(out_dir)}')
 
 
-def _append_to_results_file(quality: dict, perf: dict, args) -> None:
+def _save_predictions_postproc(
+    args,
+    data_root: str,
+    mode: str,
+    is_topdown: bool,
+    quality: dict,
+    perf: dict,
+    frame_records: List[dict],
+    dataset_meta: dict,
+    run_date: str,
+    post_config: Optional[str] = None,
+) -> None:
+    """Save the post-processed prediction bundle to a sibling __postproc dir."""
+    base_dir = _prediction_out_dir(args, run_date, is_topdown)
+    out_dir = base_dir + '__postproc'
+
+    manifest = {
+        'timestamp': datetime.now().isoformat(timespec='seconds'),
+        'mode': mode,
+        'mode_tag': _prediction_mode_tag(is_topdown),
+        'test_dataset': args.test_dataset,
+        'model_name': args.model_name,
+        'model_variant': args.model_variant,
+        'pose_config': osp.abspath(args.pose_config),
+        'pose_checkpoint': osp.abspath(args.pose_checkpoint),
+        'det_config': (
+            osp.abspath(args.det_config) if args.det_config else None),
+        'det_checkpoint': (
+            osp.abspath(args.det_checkpoint)
+            if args.det_checkpoint else None),
+        'post_config': osp.abspath(post_config) if post_config else None,
+        'quality': quality,
+        'perf': perf,
+        'data_root': data_root,
+        'dataset_meta': sanitize_dataset_meta(dataset_meta),
+        'save_score_thr': args.save_score_thr,
+        'badcase_defaults': {
+            'metric_key': 'mean_oks',
+            'metric_type': 'accuracy',
+            'thr': 0.5,
+        },
+        'num_frames': len(frame_records),
+    }
+    save_prediction_bundle(manifest, frame_records, out_dir)
+    print(f'Post-processed predictions saved to {osp.abspath(out_dir)}')
+
+
+def _append_to_results_file(
+    quality: dict,
+    perf: dict,
+    args,
+    pp_quality: Optional[dict] = None,
+) -> None:
     results_file = args.results_file
     if osp.isfile(results_file):
         with open(results_file, 'r') as f:
@@ -1087,16 +1226,36 @@ def _append_to_results_file(quality: dict, perf: dict, args) -> None:
         'config': osp.abspath(args.pose_config),
         'checkpoint': osp.abspath(args.pose_checkpoint),
         'test_dataset': args.test_dataset,
+        'post_processed': False,
+        'post_config': None,
         'metrics': metrics,
     }
-    data.setdefault(args.model_name, {}).setdefault(
-        args.model_variant, []).append(entry)
+    entries = data.setdefault(args.model_name, {}).setdefault(
+        args.model_variant, [])
+    entries.append(entry)
+
+    # Append a second entry for post-processed results in the same call when
+    # both raw and pp quality are available (avoids a second file read/write).
+    post_config = getattr(args, 'post_config', None)
+    if pp_quality is not None:
+        pp_metrics = {**pp_quality, **{f'perf/{k}': v for k, v in perf.items()}}
+        pp_entry = {
+            'timestamp': entry['timestamp'],
+            'config': entry['config'],
+            'checkpoint': entry['checkpoint'],
+            'test_dataset': entry['test_dataset'],
+            'post_processed': True,
+            'post_config': osp.abspath(post_config) if post_config else None,
+            'metrics': pp_metrics,
+        }
+        entries.append(pp_entry)
 
     os.makedirs(osp.dirname(osp.abspath(results_file)), exist_ok=True)
     with open(results_file, 'w') as f:
         json.dump(data, f, indent=2)
+    suffix = ' + post-processed' if pp_quality is not None else ''
     print(f'Results appended to {results_file} '
-          f'({args.model_name} / {args.model_variant})')
+          f'({args.model_name} / {args.model_variant}){suffix}')
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────
@@ -1170,6 +1329,12 @@ def _parse_args():
         '--test-dataset', default='coco',
         choices=list(BENCHMARK_TEST_DATASETS),
         help='Override test set and metric (default: use config as-is)')
+    p.add_argument(
+        '--post-config', default=None,
+        help='Path to a post-processing pipeline config '
+             '(e.g. configs/post_processing/oks_track_one_euro.py). '
+             'When provided both raw and post-processed outputs are '
+             'evaluated and saved separately.')
     return p.parse_args()
 
 
@@ -1187,6 +1352,15 @@ def main():
 
     _init_scope(pose_cfg)
     MMLogger.get_current_instance()
+
+    # ── Optional post-processing pipeline ────────────────────────────────
+    post_pipeline: Optional[PostProcessingPipeline] = None
+    if getattr(args, 'post_config', None):
+        print(f'\nBuilding post-processing pipeline from: {args.post_config}')
+        post_pipeline = build_post_processor(args.post_config)
+        mode_label = 'online' if post_pipeline.is_online else 'offline'
+        print(f'  Pipeline mode : {mode_label}')
+        print(f'  Filters       : {[type(f).__name__ for f in post_pipeline.filters]}')
 
     use_real_detector = bool(args.det_config and args.det_checkpoint)
     is_topdown = args.mock_detector or use_real_detector
@@ -1293,29 +1467,69 @@ def main():
 
         mode = 'bottomup'
 
-    # ── Unified post-processing (both modes) ───────────────────────────────
+    # ── Post-processing (both modes) ────────────────────────────────────────
+    postproc_by_img_id: Optional[Dict[int, PoseDataSample]] = None
+    if post_pipeline is not None:
+        postproc_by_img_id, pp_perf = _run_post_processing(
+            post_pipeline, samples, pred_by_img_id)
+        perf.update(pp_perf)
+
+    # ── Unified evaluation (both modes) ────────────────────────────────────
+    frame_records_pp: Optional[List[dict]] = (
+        [] if (args.model_name and postproc_by_img_id is not None) else None
+    )
+    pp_evaluator = (
+        build_evaluator(pose_cfg, dataset_meta, args.test_dataset)
+        if postproc_by_img_id is not None else None
+    )
+
     for fid, sample in enumerate(samples):
         img_id = sample.img_id
+        gt_dicts = _pose_dicts_from_unifiedsample(sample)
+
+        # ── Regular predictions ────────────────────────────────────────
         pred_ds = pred_by_img_id.get(img_id)
-        if pred_ds is None:
-            continue
+        if pred_ds is not None:
+            ds = _attach_gt_to_posedatasample(pred_ds, sample)
+            evaluator.process(data_samples=[ds], data_batch=None)
 
-        ds = _attach_gt_to_posedatasample(pred_ds, sample)
-        evaluator.process(data_samples=[ds], data_batch=None)
+            if frame_records is not None:
+                pred_ds_save = _filter_pred_for_saving(ds, args.save_score_thr)
+                frame_records.append(build_frame_record(
+                    img_id=int(img_id),
+                    frame_id=fid,
+                    img_path=sample.img_path,
+                    data_root=data_root,
+                    pred_ds=pred_ds_save,
+                    gt_instances=gt_dicts,
+                    dataset_meta=dataset_meta,
+                ))
 
-        if frame_records is not None:
-            pred_ds_save = _filter_pred_for_saving(ds, args.save_score_thr)
-            frame_records.append(build_frame_record(
-                img_id=int(img_id),
-                frame_id=fid,
-                img_path=sample.img_path,
-                data_root=data_root,
-                pred_ds=pred_ds_save,
-                gt_instances=_pose_dicts_from_unifiedsample(sample),
-                dataset_meta=dataset_meta,
-            ))
+        # ── Post-processed predictions ─────────────────────────────────
+        if postproc_by_img_id is not None:
+            pp_ds = postproc_by_img_id.get(img_id)
+            if pp_ds is not None:
+                pp_ds_gt = _attach_gt_to_posedatasample(pp_ds, sample)
+                pp_evaluator.process(
+                    data_samples=[pp_ds_gt], data_batch=None)
+
+                if frame_records_pp is not None:
+                    pp_ds_save = _filter_pred_for_saving(
+                        pp_ds_gt, args.save_score_thr)
+                    frame_records_pp.append(build_frame_record(
+                        img_id=int(img_id),
+                        frame_id=fid,
+                        img_path=sample.img_path,
+                        data_root=data_root,
+                        pred_ds=pp_ds_save,
+                        gt_instances=gt_dicts,
+                        dataset_meta=dataset_meta,
+                    ))
 
     quality = evaluator.evaluate(n_images)
+    pp_quality: Optional[dict] = None
+    if pp_evaluator is not None:
+        pp_quality = pp_evaluator.evaluate(n_images)
 
     # Optional detection AP/AR (topdown only — reads from pred_ds.metainfo)
     if det_evaluator is not None:
@@ -1346,20 +1560,29 @@ def main():
 
     # ── Output ─────────────────────────────────────────────────────────────
     _print_results(quality, perf, mode)
+    if pp_quality is not None:
+        _print_results(pp_quality, perf, f'{mode} [post-processed]')
 
     if args.out:
-        _save_out(quality, perf, mode, args)
+        _save_out(quality, perf, mode, args, pp_quality=pp_quality)
 
     if args.results_file:
         assert args.model_name and args.model_variant, (
             '--model-name and --model-variant are required when '
             '--results-file is specified')
-        _append_to_results_file(quality, perf, args)
+        _append_to_results_file(quality, perf, args, pp_quality=pp_quality)
 
     if args.model_name and frame_records is not None:
         _save_predictions(
             args, data_root, mode, is_topdown, quality, perf,
             frame_records, dataset_meta, run_date)
+
+    # ── Post-processed bundle ───────────────────────────────────────────
+    if args.model_name and frame_records_pp is not None and pp_quality is not None:
+        _save_predictions_postproc(
+            args, data_root, mode, is_topdown, pp_quality, perf,
+            frame_records_pp, dataset_meta, run_date,
+            post_config=getattr(args, 'post_config', None))
 
 
 if __name__ == '__main__':
