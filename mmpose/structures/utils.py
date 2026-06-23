@@ -131,6 +131,8 @@ def split_instances(instances: InstanceData) -> List[InstanceData]:
             result['bbox'] = instances.bboxes[i].tolist(),
             if 'bbox_scores' in instances:
                 result['bbox_score'] = instances.bbox_scores[i]
+        if 'track_ids' in instances:
+            result['track_id'] = int(instances.track_ids[i])
         results.append(result)
 
     return results

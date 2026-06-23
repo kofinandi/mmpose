@@ -13,16 +13,20 @@ Local::
     python tools/vis_benchmark_predictions.py preds/ --data-root data/ \\
         --badcase --badcase-thr 0.5
 
+    # Compare original vs post-processed predictions:
+    python tools/vis_benchmark_predictions.py preds/ \\
+        --postproc-dir preds__postproc/  # auto-detected if sibling exists
+
 Controls: Left/Right arrows navigate; ``p`` pred keypoints; ``g`` GT keypoints;
 ``b`` bboxes; ``v`` visibility markers; ``m`` match OKS/IoU labels;
-``c`` iscrowd coloring; ``q`` quit.
+``c`` iscrowd coloring; ``t`` track-id labels; ``o`` toggle orig/postproc source;
+``q`` quit.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import os.path as osp
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -49,6 +53,12 @@ def parse_args():
     parser.add_argument(
         'pred_dir',
         help='Directory containing manifest.json and frames.json')
+    parser.add_argument(
+        '--postproc-dir',
+        default=None,
+        help='Directory with post-processed predictions (manifest.json + '
+        'frames.json). When omitted, the sibling directory '
+        '"<pred_dir>__postproc" is used automatically if it exists.')
     parser.add_argument(
         '--data-root',
         default=None,
@@ -118,7 +128,8 @@ def _parse_instances(instances_json: List[dict]) -> List[dict]:
 
     Each returned dict may contain:
         keypoints (K, 2), keypoint_scores (K,), keypoints_visible (K,),
-        bbox (4,) [x1,y1,x2,y2], bbox_score (float), iscrowd (int 0/1).
+        bbox (4,) [x1,y1,x2,y2], bbox_score (float), iscrowd (int 0/1),
+        track_id (int, optional – only present in post-processed bundles).
 
     When ``keypoints_visible_coco`` is present in the JSON (raw COCO 0/1/2
     flags), it is stored as ``keypoints_visible`` and ``_coco_vis=True`` is
@@ -156,6 +167,8 @@ def _parse_instances(instances_json: List[dict]) -> List[dict]:
         if 'bbox_score' in item:
             inst['bbox_score'] = float(item['bbox_score'])
         inst['iscrowd'] = int(item.get('iscrowd', 0))
+        if 'track_id' in item:
+            inst['track_id'] = int(item['track_id'])
         result.append(inst)
     return result
 
@@ -442,6 +455,68 @@ def _draw_match_labels(
         )
 
 
+def _draw_track_ids(
+    ax,
+    pred_insts: List[dict],
+    scale: float,
+) -> None:
+    """Draw track ID labels over predicted instances.
+
+    The label is anchored at the top-right corner of the bbox when available,
+    falling back to the topmost valid keypoint.  Uses the pred color on a dark
+    background, deliberately placed to the right to avoid colliding with the
+    OKS/IoU label that sits at the bbox top-left.
+    """
+    fontsize = max(7, int(8 * scale))
+    for inst in pred_insts:
+        track_id = inst.get('track_id')
+        if track_id is None:
+            continue
+
+        bbox = inst.get('bbox')
+        if bbox is not None:
+            # Top-right corner of bbox
+            tx = float(bbox[2]) * scale
+            ty = float(bbox[1]) * scale
+            ha = 'right'
+        else:
+            # Fall back to the topmost valid keypoint
+            kpts = inst.get('keypoints')
+            scores = inst.get('keypoint_scores')
+            if kpts is None:
+                continue
+            best_y = None
+            best_x = None
+            for k_idx in range(len(kpts)):
+                sc = float(scores[k_idx]) if scores is not None and k_idx < len(scores) else 1.0
+                if sc < 0.01:
+                    continue
+                ky = float(kpts[k_idx, 1])
+                kx = float(kpts[k_idx, 0])
+                if best_y is None or ky < best_y:
+                    best_y = ky
+                    best_x = kx
+            if best_y is None:
+                continue
+            tx = best_x * scale
+            ty = best_y * scale
+            ha = 'center'
+
+        ax.text(
+            tx, ty,
+            f'#{track_id}',
+            color=_PRED_COLOR,
+            fontsize=fontsize,
+            ha=ha, va='bottom',
+            zorder=7,
+            bbox=dict(
+                facecolor='black', alpha=0.6,
+                boxstyle='round,pad=0.15',
+                edgecolor='none',
+            ),
+        )
+
+
 # ---- Frame filtering / metrics -----------------------------------------------
 
 def _filter_frames(frames: List[dict], manifest: dict, args) -> List[dict]:
@@ -479,12 +554,23 @@ def _format_metrics(metrics: dict) -> str:
 class PredictionBrowser:
     """Matplotlib browser for benchmark prediction frames."""
 
-    def __init__(self, frames: List[dict], manifest: dict, args):
+    def __init__(
+        self,
+        frames: List[dict],
+        manifest: dict,
+        args,
+        postproc_by_img_id: Optional[Dict[int, dict]] = None,
+    ):
         self.frames = frames
         self.manifest = manifest
         self.args = args
         self.data_root = args.data_root or manifest.get('data_root', 'data/')
         self.index = min(max(args.start_index, 0), max(len(frames) - 1, 0))
+
+        # Post-processed frames indexed by img_id (None when not loaded)
+        self.postproc_by_img_id: Optional[Dict[int, dict]] = postproc_by_img_id
+        # Active prediction source: 'orig' or 'postproc'
+        self.active_source: str = 'orig'
 
         self.show_pred = True
         self.show_gt = True
@@ -492,6 +578,7 @@ class PredictionBrowser:
         self.show_visibility = True   # v: empty circles for occluded GT kpts
         self.show_match_labels = True  # m: OKS + IoU text labels
         self.show_iscrowd = True      # c: orange bboxes for iscrowd GT
+        self.show_track_ids = True    # t: track ID labels on pred instances
 
         self.render_scale = max(float(args.render_scale), 1.0)
 
@@ -503,6 +590,24 @@ class PredictionBrowser:
         self.fig, self.ax = plt.subplots(figsize=(12, 8))
         self.fig.canvas.mpl_connect('key_press_event', self._on_key)
         self._render()
+
+    # ------------------------------------------------------------------
+
+    def _active_pred_frame(self, orig_frame: dict) -> dict:
+        """Return the frame dict to use for predictions.
+
+        When active source is 'postproc' and a post-processed frame for this
+        img_id is available, that frame is returned.  Otherwise the original
+        frame is used (graceful fallback).
+        """
+        if self.active_source == 'postproc' and self.postproc_by_img_id:
+            img_id = orig_frame.get('img_id')
+            pp_frame = self.postproc_by_img_id.get(img_id)
+            if pp_frame is not None:
+                return pp_frame
+        return orig_frame
+
+    # ------------------------------------------------------------------
 
     def _load_image(self, frame: dict) -> np.ndarray:
         path = _resolve_image_path(frame, self.data_root)
@@ -519,17 +624,19 @@ class PredictionBrowser:
             self.fig.canvas.draw_idle()
             return
 
-        frame = self.frames[self.index]
-        img = self._load_image(frame)
+        orig_frame = self.frames[self.index]
+        pred_frame = self._active_pred_frame(orig_frame)
+
+        img = self._load_image(orig_frame)
         img = _upscale_image(img, self.render_scale)
 
-        pred_json = frame['predictions']['instances']
-        gt_json = frame['ground_truth']['instances']
+        pred_json = pred_frame['predictions']['instances']
+        gt_json = orig_frame['ground_truth']['instances']
         pred_insts = _parse_instances(pred_json)
         gt_insts = _parse_instances(gt_json)
 
-        # Build match lookups from stored metrics
-        matches: List[dict] = frame.get('metrics', {}).get('matches', [])
+        # Build match lookups from the active source's metrics
+        matches: List[dict] = pred_frame.get('metrics', {}).get('matches', [])
         gt_matched, pred_matched, gt_to_match = _build_match_lookups(matches)
 
         # Render base image
@@ -571,6 +678,8 @@ class PredictionBrowser:
                 scale=scale,
                 show_visibility=False,
             )
+            if self.show_track_ids:
+                _draw_track_ids(self.ax, pred_insts, scale=scale)
 
         # Match labels (OKS + IoU)
         if self.show_match_labels and matches:
@@ -582,6 +691,11 @@ class PredictionBrowser:
         num_valid_gt = _count_valid_gt(gt_insts)
 
         # Title
+        source_label = self.active_source.upper()
+        has_postproc = self.postproc_by_img_id is not None
+        source_toggle = (
+            f'source={source_label}' if has_postproc else 'source=ORIG[only]'
+        )
         toggles = [
             f'pred={"ON" if self.show_pred else "off"}',
             f'gt={"ON" if self.show_gt else "off"}',
@@ -589,17 +703,19 @@ class PredictionBrowser:
             f'vis={"ON" if self.show_visibility else "off"}',
             f'labels={"ON" if self.show_match_labels else "off"}',
             f'crowd={"ON" if self.show_iscrowd else "off"}',
+            f'trackid={"ON" if self.show_track_ids else "off"}',
+            source_toggle,
         ]
-        metrics_str = _format_metrics(frame.get('metrics', {}))
+        metrics_str = _format_metrics(pred_frame.get('metrics', {}))
         # Append live num_valid_gt (may differ from stored num_gt which counts
         # all GT annotations including crowd / zero-keypoint instances).
         metrics_str += f'  num_valid_gt={num_valid_gt}'
         title = (
             f'[{self.index + 1}/{len(self.frames)}] '
-            f'img_id={frame["img_id"]}  {frame["img_path"]}\n'
+            f'img_id={orig_frame["img_id"]}  {orig_frame["img_path"]}\n'
             f'{metrics_str}\n'
             f'{"  ".join(toggles)}  |  '
-            f'arrows:prev/next  p/g/b/v/m/c:toggle  q:quit'
+            f'arrows:prev/next  p/g/b/v/m/c/t:toggle  o:orig/postproc  q:quit'
         )
         self.ax.set_title(title, fontsize=9)
         self.fig.canvas.draw_idle()
@@ -631,6 +747,15 @@ class PredictionBrowser:
         elif event.key == 'c':
             self.show_iscrowd = not self.show_iscrowd
             self._render()
+        elif event.key == 't':
+            self.show_track_ids = not self.show_track_ids
+            self._render()
+        elif event.key == 'o':
+            if self.postproc_by_img_id is not None:
+                self.active_source = (
+                    'postproc' if self.active_source == 'orig' else 'orig'
+                )
+                self._render()
         elif event.key == 'q':
             plt.close(self.fig)
 
@@ -649,7 +774,35 @@ def main():
         return
 
     print(f'Loaded {len(frames)} frames from {pred_dir}')
-    browser = PredictionBrowser(frames, manifest, args)
+
+    # Resolve post-processed bundle directory
+    postproc_dir = args.postproc_dir
+    if postproc_dir is None:
+        candidate = pred_dir + '__postproc'
+        if osp.isdir(candidate) and osp.isfile(osp.join(candidate, 'manifest.json')):
+            postproc_dir = candidate
+            print(f'Auto-detected post-processed bundle: {postproc_dir}')
+
+    postproc_by_img_id: Optional[Dict[int, dict]] = None
+    if postproc_dir is not None:
+        postproc_dir = osp.abspath(postproc_dir)
+        if not osp.isdir(postproc_dir):
+            print(f'Warning: --postproc-dir does not exist: {postproc_dir}')
+        else:
+            try:
+                _, pp_frames = load_bundle(postproc_dir)
+                postproc_by_img_id = {f['img_id']: f for f in pp_frames}
+                print(
+                    f'Loaded {len(pp_frames)} post-processed frames '
+                    f'from {postproc_dir}'
+                )
+            except Exception as exc:
+                print(f'Warning: could not load post-processed bundle: {exc}')
+
+    browser = PredictionBrowser(
+        frames, manifest, args,
+        postproc_by_img_id=postproc_by_img_id,
+    )
     browser.show()
 
 
