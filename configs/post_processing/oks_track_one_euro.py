@@ -23,9 +23,9 @@ post_processor = dict(
         dict(
             type='OneEuroSmoother',
             # Low min_cutoff → more smoothing on slow/static joints.
-            min_cutoff=0.004,
+            min_cutoff=0.001,
             # Higher beta → less lag when joints move fast.
-            beta=0.7,
+            beta=0.001,
         ),
     ],
 )

@@ -19,6 +19,10 @@ Usage::
         benchmark/predictions/20260615_emdb-mini_e2e/YOLO-Pose-tiny \\
         --post-config configs/post_processing/oks_track_one_euro.py \\
         --metrics CocoMetric MPJVE MPJAE
+
+    python tools/postprocess_predictions.py PRED_DIR \\
+        --post-config configs/post_processing/oks_track_one_euro.py \\
+        --results-file benchmark/results/20260615_coco_postproc.json
 """
 
 from mmpose.compat.transformers_v5 import install_transformers_v5_shims
@@ -225,7 +229,7 @@ def _build_metric(metric_type: str, dataset_meta: dict) -> object:
     if metric_type == 'CocoMetric':
         cfg['type'] = 'CocoMetric'
     elif metric_type in ('MPJVE', 'MPJAE'):
-        cfg = {'type': metric_type}
+        cfg = {'type': metric_type, 'norm_item': [None, 'bbox', 'torso']}
     else:
         cfg['type'] = metric_type
 
@@ -294,6 +298,49 @@ def reconstruct_pose_data_samples(
     return pred_samples, full_samples
 
 
+# ── Results file ──────────────────────────────────────────────────────────
+
+def _append_to_results_file(
+    results_file: str,
+    model_name: str,
+    model_variant: str,
+    quality: dict,
+    perf: dict,
+    *,
+    test_dataset: str,
+    pose_config: str,
+    pose_checkpoint: str,
+    post_config: str,
+) -> None:
+    """Append a post-processed entry to a benchmark-style results JSON file."""
+    if osp.isfile(results_file):
+        with open(results_file, 'r') as f:
+            data = json.load(f)
+    else:
+        data = {}
+
+    metrics = {**quality, **{f'perf/{k}': v for k, v in perf.items()}}
+    entry = {
+        'timestamp': datetime.now().isoformat(timespec='seconds'),
+        'config': osp.abspath(pose_config) if pose_config else '',
+        'checkpoint': osp.abspath(pose_checkpoint) if pose_checkpoint else '',
+        'test_dataset': test_dataset,
+        'post_processed': True,
+        'post_config': osp.abspath(post_config),
+        'metrics': metrics,
+    }
+    data.setdefault(model_name, {}).setdefault(model_variant, []).append(entry)
+
+    parent = osp.dirname(osp.abspath(results_file))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(results_file, 'w') as f:
+        json.dump(data, f, indent=2)
+
+    print(f'Results appended to {results_file} '
+          f'({model_name} / {model_variant})')
+
+
 # ── Main ──────────────────────────────────────────────────────────────────
 
 def _parse_args() -> argparse.Namespace:
@@ -316,6 +363,10 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         '--num-frames', type=int, default=None,
         help='Limit to the first N frames (for quick tests)')
+    p.add_argument(
+        '--results-file', default=None,
+        help='Append post-processed metrics to this JSON file '
+             '(same nested format as tools/benchmark_e2e.py)')
     return p.parse_args()
 
 
@@ -477,6 +528,25 @@ def main() -> None:
 
     save_prediction_bundle(pp_manifest, pp_frame_records, out_dir)
     print(f'Bundle saved to {osp.abspath(out_dir)}')
+
+    if args.results_file:
+        model_name = manifest.get('model_name', '')
+        model_variant = manifest.get('model_variant', '')
+        if not model_name or not model_variant:
+            raise ValueError(
+                'manifest.json must contain model_name and model_variant '
+                'when --results-file is specified')
+        _append_to_results_file(
+            args.results_file,
+            model_name,
+            model_variant,
+            quality,
+            pp_manifest['perf'],
+            test_dataset=test_dataset,
+            pose_config=manifest.get('pose_config', ''),
+            pose_checkpoint=manifest.get('pose_checkpoint', ''),
+            post_config=args.post_config,
+        )
 
 
 if __name__ == '__main__':
