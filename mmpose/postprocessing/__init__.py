@@ -18,7 +18,7 @@ Example usage::
 """
 
 from .base import BaseFilter, sequence_key_from_path
-from .filters import OKSTracker, OneEuroSmoother
+from .filters import OKSTracker, OneEuroSmoother, SmoothNetSmoother
 from .pipeline import PostProcessingPipeline, build_post_processor
 from .registry import POST_PROCESS_FILTERS
 
@@ -27,6 +27,7 @@ __all__ = [
     'sequence_key_from_path',
     'OKSTracker',
     'OneEuroSmoother',
+    'SmoothNetSmoother',
     'PostProcessingPipeline',
     'build_post_processor',
     'POST_PROCESS_FILTERS',

@@ -48,6 +48,7 @@ import mmpose.datasets   # noqa: F401
 import mmpose.evaluation  # noqa: F401
 import mmpose.models      # noqa: F401
 from mmengine.registry import METRICS
+from mmpose.evaluation.benchmark_datasets import BENCHMARK_TEST_DATASETS
 from mmpose.evaluation.functional.frame_metrics import (
     build_frame_record,
     save_prediction_bundle,
@@ -241,9 +242,38 @@ def _build_metric(metric_type: str, dataset_meta: dict) -> object:
 def build_evaluator_from_types(
     metric_types: List[str],
     dataset_meta: dict,
+    test_dataset: str = '',
 ) -> Evaluator:
-    metrics = [_build_metric(t, dataset_meta) for t in metric_types]
+    """Build an evaluator, matching benchmark_e2e extra_metrics when available."""
+    temporal_types = {'MPJVE', 'MPJAE'}
+    requested_temporal = temporal_types & set(metric_types)
+
+    metrics = [
+        _build_metric(t, dataset_meta)
+        for t in metric_types
+        if t not in temporal_types
+    ]
+
+    spec = BENCHMARK_TEST_DATASETS.get(test_dataset)
+    if spec is not None and spec.extra_metrics and requested_temporal:
+        for m_cfg in spec.extra_metrics:
+            if m_cfg['type'] in requested_temporal:
+                m = METRICS.build(dict(m_cfg))
+                m.dataset_meta = dataset_meta
+                metrics.append(m)
+    else:
+        for metric_type in sorted(requested_temporal):
+            metrics.append(_build_metric(metric_type, dataset_meta))
+
     return Evaluator(metrics)
+
+
+def _e2e_perf_from_manifest(manifest: dict) -> dict:
+    """Return e2e perf entries from a source prediction bundle manifest."""
+    return {
+        k: v for k, v in manifest.get('perf', {}).items()
+        if k.startswith('e2e/')
+    }
 
 
 # ── Attach GT to ds ───────────────────────────────────────────────────────
@@ -438,7 +468,8 @@ def main() -> None:
 
     # ── Evaluate ───────────────────────────────────────────────────────────
     print(f'\nEvaluating with metrics: {args.metrics}')
-    evaluator = build_evaluator_from_types(args.metrics, dataset_meta)
+    evaluator = build_evaluator_from_types(
+        args.metrics, dataset_meta, test_dataset)
 
     # Attach GT from the full_samples (which have GT from frame records)
     num_kpts = dataset_meta.get('num_keypoints', 17)
@@ -496,6 +527,7 @@ def main() -> None:
             dataset_meta=dataset_meta,
         ))
 
+    e2e_perf = _e2e_perf_from_manifest(manifest)
     pp_manifest = {
         'timestamp': datetime.now().isoformat(timespec='seconds'),
         'source_pred_dir': osp.abspath(args.pred_dir),
@@ -512,6 +544,7 @@ def main() -> None:
         'pipeline_filters': [type(f).__name__ for f in pipeline.filters],
         'quality': quality,
         'perf': {
+            **e2e_perf,
             'postproc/latency_ms_per_frame': per_frame_ms,
             'postproc/total_s': total_s,
             'postproc/fps': fps,
