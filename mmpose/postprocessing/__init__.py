@@ -18,13 +18,14 @@ Example usage::
 """
 
 from .base import BaseFilter, sequence_key_from_path
-from .filters import OKSTracker, OneEuroSmoother, SmoothNetSmoother
+from .filters import GPKalmanSmoother, OKSTracker, OneEuroSmoother, SmoothNetSmoother
 from .pipeline import PostProcessingPipeline, build_post_processor
 from .registry import POST_PROCESS_FILTERS
 
 __all__ = [
     'BaseFilter',
     'sequence_key_from_path',
+    'GPKalmanSmoother',
     'OKSTracker',
     'OneEuroSmoother',
     'SmoothNetSmoother',

@@ -34,15 +34,20 @@ KEYPOINT_NAMES = [
     "left_knee", "right_knee", "left_ankle", "right_ankle",
 ]
 
+WINDOW_SIZE = 60
+N_FORECAST  = 20
+PIXEL_SCALE = 1.0
+GP_LENGTH_SCALE = 15.0
+GP_SIGNAL_VAR   = 2000.0
 
 # ── Noise model ────────────────────────────────────────────────────────────────
 
-def measurement_variance(score: float, pixel_scale: float) -> float:
+def measurement_variance(score: float) -> float:
     """
     Convert score to variance.
     """
 
-    return (1.0 - score) ** 2 * pixel_scale
+    return (1.0 - score) ** 2 * PIXEL_SCALE
 
 
 # ── GP helper ──────────────────────────────────────────────────────────────────
@@ -52,8 +57,6 @@ def gp_predict_at(
     y_buf: list,
     V_buf: list,
     t_queries: list,
-    gp_length_scale: float,
-    gp_signal_var: float,
 ) -> tuple:
     """
     Fit a heteroscedastic GP to (T_buf, y_buf) with per-point noise V_buf,
@@ -73,14 +76,14 @@ def gp_predict_at(
     """
     if not T_buf or not t_queries:
         n = len(t_queries)
-        return np.zeros(n), np.full(n, gp_signal_var ** 0.5)
+        return np.zeros(n), np.full(n, GP_SIGNAL_VAR ** 0.5)
 
     T_arr = np.array(T_buf,     dtype=float).reshape(-1, 1)
     y_arr = np.array(y_buf,     dtype=float)
     V_arr = np.array(V_buf,     dtype=float)
     y_mean = float(np.mean(y_arr))
 
-    kernel = RBF(gp_length_scale, length_scale_bounds="fixed")
+    kernel = RBF(GP_LENGTH_SCALE, length_scale_bounds="fixed")
     gp = GaussianProcessRegressor(
         kernel=kernel,
         alpha=V_arr,
@@ -165,12 +168,8 @@ def run_filter(
     measurements: list,
     scores: list,
     *,
-    window_size: int,
-    n_forecast: int,
-    pixel_scale: float,
-    gp_length_scale: float,
-    gp_signal_var: float,
     precompute_forecast: bool = False,
+    verbose: bool = False,
 ) -> list:
     """
     Run the GP-Kalman filter over the full sequence.
@@ -186,11 +185,6 @@ def run_filter(
     frame_ids    : sorted list of integer frame identifiers
     measurements : per-frame predicted coordinate (float or None)
     scores       : per-frame keypoint confidence score
-    window_size  : sliding-window length N
-    n_forecast   : number of frames to project forward at each step
-    pixel_scale  : heatmap→pixel scale for measurement variance
-    gp_length_scale : RBF kernel length-scale in frames
-    gp_signal_var   : GP prior signal variance (used for bootstrap)
     precompute_forecast : if True, evaluate the GP over the next *n_forecast*
         frames at every step and store the results in each record (fwd_t,
         fwd_mus, fwd_stds).  Enables instant rendering in the step-by-step
@@ -213,24 +207,22 @@ def run_filter(
     max_t   = frame_ids[-1]
     n_total = len(frame_ids)
 
-    _gp_kw = dict(gp_length_scale=gp_length_scale, gp_signal_var=gp_signal_var)
-
     for idx, t in enumerate(frame_ids):
-        if idx % 100 == 0:
+        if verbose and idx % 100 == 0:
             print(f"  filtering … {idx}/{n_total}", end="\r", flush=True)
 
         z = measurements[idx]
-        R = measurement_variance(scores[idx], pixel_scale) if z is not None else None
+        R = measurement_variance(scores[idx]) if z is not None else None
 
         # ── Step 1: Prediction (heteroscedastic GP time update) ──────────────
         if T_buf:
-            (mu_p,), (std_p,) = gp_predict_at(T_buf, z_buf, R_buf, [t], **_gp_kw)
+            (mu_p,), (std_p,) = gp_predict_at(T_buf, z_buf, R_buf, [t])
             sigma_p = float(std_p ** 2)
             mu_p    = float(mu_p)
         else:
             # Bootstrap: no history yet → prior centred on the first measurement
             mu_p    = float(z) if z is not None else 0.0
-            sigma_p = gp_signal_var
+            sigma_p = GP_SIGNAL_VAR
 
         # ── Steps 2 & 3: Bayesian update (measurement available) ─────────────
         if z is not None:
@@ -241,7 +233,7 @@ def run_filter(
             # Store the raw measurement (not the posterior) to keep the GP
             # training data independent of its own predictions.
             T_buf.append(t);  z_buf.append(z);  R_buf.append(R)
-            if len(T_buf) > window_size:
+            if len(T_buf) > WINDOW_SIZE:
                 T_buf.pop(0);  z_buf.pop(0);  R_buf.pop(0)
 
         else:
@@ -253,9 +245,9 @@ def run_filter(
         fwd_t: list = []
         fwd_mus = fwd_stds = None
         if precompute_forecast and T_buf:
-            fwd_t = list(range(t, min(max_t + 1, t + n_forecast + 1)))
+            fwd_t = list(range(t, min(max_t + 1, t + N_FORECAST + 1)))
             fwd_mus, fwd_stds = gp_predict_at(
-                list(T_buf), list(z_buf), list(R_buf), fwd_t, **_gp_kw
+                list(T_buf), list(z_buf), list(R_buf), fwd_t
             )
 
         records.append({
@@ -273,5 +265,6 @@ def run_filter(
             "fwd_stds":   fwd_stds,
         })
 
-    print(f"  filtering … {n_total}/{n_total}  ✓")
+    if verbose:
+        print(f"  filtering … {n_total}/{n_total}  ✓")
     return records
