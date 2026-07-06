@@ -34,7 +34,7 @@ KEYPOINT_NAMES = [
     "left_knee", "right_knee", "left_ankle", "right_ankle",
 ]
 
-WINDOW_SIZE = 30
+WINDOW_SIZE = 15
 N_FORECAST  = 20
 PIXEL_SCALE = 1.0
 GP_LENGTH_SCALE = 6.0
