@@ -9,7 +9,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$REPO_ROOT"
 
-TIMEOUT_SECONDS=600
+TIMEOUT_SECONDS=900
 RESULT_LOG="$SCRIPT_DIR/run_evaluation.log"
 RAW_LOG="$(mktemp)"
 TIMEOUT_FLAG="$(mktemp -u)"

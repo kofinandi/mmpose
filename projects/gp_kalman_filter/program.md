@@ -20,7 +20,7 @@ Once you get confirmation, kick off the experimentation.
 
 ## Experimentation
 
-Each experiment runs the post processing and the evaluation with the GP-Kalman filter on one set of model predictions. The pipeline runs with a **fixed timeout of 10 minutes**. Any evaluation that takes longer will be killed. You launch an evaluation simply as: `./projects/gp_kalman_filter/run_evaluation.sh`.
+Each experiment runs the post processing and the evaluation with the GP-Kalman filter on one set of model predictions. The pipeline runs with a **fixed timeout of 15 minutes**. Any evaluation that takes longer will be killed. You launch an evaluation simply as: `./projects/gp_kalman_filter/run_evaluation.sh`.
 
 **What you CAN do:**
 - Modify `projects/gp_kalman_filter/filter.py` — this is the only file you edit. Everything is fair game: the filter architecture and its steps, parameters, GP kernel, model score interpretation, etc.
@@ -34,7 +34,7 @@ Each experiment runs the post processing and the evaluation with the GP-Kalman f
 
 **The goal is simple: get the highest score.** The score is computed as `AR - 10*bMPJVE - 10*bMPJAE`, where AR is the Average Recall computed in the CocoMetric standard metric computation, bMPJVE is the EMDB dataset box size normalized joint velocity error, and bMPJAE is the EMDB dataset box size normalized joint acceleration error. You want to maximize AR and minimize bMPJVE and bMPJAE (the scalars are arbitrary to balance the scale of the three metrics). The score is used to rank the experiments and select the best ones, but you will see the individual metrics in the output to help you understand the impact of your changes.
 
-**10 minutes** is a hard constraint. In the end this will be a realtime filter. You get the runtime of the filter as a metric to help you understand the impact of your changes. All else being equal, you want to keep the runtime as low as possible.
+**15 minutes** is a hard constraint. In the end this will be a realtime filter. You get the runtime of the filter as a metric to help you understand the impact of your changes. All else being equal, you want to keep the runtime as low as possible.
 
 **Simplicity criterion**: All else being equal, simpler is better. A small improvement that adds ugly complexity is not worth it. Conversely, removing something and getting equal or better results is a great outcome — that's a simplification win. When evaluating whether to keep a change, weigh the complexity cost against the improvement magnitude. A 0.001 score improvement that adds 20 lines of hacky code? Probably not worth it. A 0.001 score improvement from deleting code? Definitely keep. An improvement of ~0 but much simpler code? Keep.
 
@@ -52,7 +52,7 @@ emdb/bMPJAE: 0.0062
 score: 0.9266
 ```
 
-Note that the script is configured to kill the pipeline after 10 minutes. You can read its results from the log file:
+Note that the script is configured to kill the pipeline after 15 minutes. You can read its results from the log file:
 
 ```
 cat projects/gp_kalman_filter/run_evaluation.log
@@ -112,4 +112,4 @@ The idea is that you are a completely autonomous researcher trying things out. I
 
 **Hints**: The filter concept is very similar to the Kalman filter, but designed to handle the smooth but hard to model motion of human keypoints. You can use standard improvements to the Kalman filter as a reference point for your experiments. But also feel free to get wild and crazy with the filter. The keypoint score predicted by the model is a noisy proxy for measurement variance, you might need to find better ways to interpret it or use it in a different way.
 
-As an example use case, a user might leave you running while they sleep. If each experiment takes you up to 5-10 minutes then you can run approx 6-12/hour, for a total of about 100 over one night. The user then wakes up to experimental results, all completed by you while they slept!
+As an example use case, a user might leave you running while they sleep. If each experiment takes you up to 10-15 minutes then you can run approx 4-6/hour, for a total of about 50 over one night. The user then wakes up to experimental results, all completed by you while they slept!
