@@ -134,3 +134,4 @@ docs/**/modelzoo.md
 *.DS_Store
 
 benchmark/
+*.tsv
