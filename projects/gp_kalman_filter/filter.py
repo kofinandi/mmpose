@@ -37,7 +37,7 @@ KEYPOINT_NAMES = [
 WINDOW_SIZE = 60
 N_FORECAST  = 20
 PIXEL_SCALE = 1.0
-GP_LENGTH_SCALE = 15.0
+GP_LENGTH_SCALE = 8.0
 GP_SIGNAL_VAR   = 2000.0
 
 # ── Noise model ────────────────────────────────────────────────────────────────
