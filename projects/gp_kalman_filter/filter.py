@@ -34,6 +34,7 @@ GP_LENGTH_SCALE = 16.0
 GP_SIGNAL_VAR   = 4000.0
 INFLATION_FACTOR = 8.0
 MIN_R = 0.0003
+OSC_INFLATE = 2.0
 
 # ── Noise model ────────────────────────────────────────────────────────────────
 
@@ -227,6 +228,7 @@ def run_filter(
     T_buf: list = []   # time steps of buffered measurements
     z_buf: list = []   # raw measurements  z_t  (NOT posteriors)
     R_buf: list = []   # measurement variances  R_t
+    prev_innovation = None
 
     records: list = []
     max_t   = frame_ids[-1]
@@ -253,9 +255,17 @@ def run_filter(
             innovation = z - mu_p
             R = measurement_variance(scores[idx])
             R = R * (1 + (innovation ** 2) / INFLATION_FACTOR)
+            # An innovation that flips sign from the previous step looks like
+            # oscillatory jitter rather than sustained motion (a real moving
+            # target tends to keep under/over-shooting the GP's lagging
+            # estimate in the same direction for a few steps) — inflate R
+            # extra in that case since it disproportionately drives acceleration error.
+            if prev_innovation is not None and innovation * prev_innovation < 0:
+                R = R * OSC_INFLATE
             K_gain  = sigma_p / (sigma_p + R)
             mu_t    = mu_p + K_gain * innovation
             sigma_t = (1.0 - K_gain) * sigma_p
+            prev_innovation = innovation
 
             # Store the raw measurement (not the posterior) to keep the GP
             # training data independent of its own predictions.
