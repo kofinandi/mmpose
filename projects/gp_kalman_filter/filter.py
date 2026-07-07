@@ -21,7 +21,7 @@ import warnings
 import numpy as np
 from sklearn.exceptions import ConvergenceWarning
 from sklearn.gaussian_process import GaussianProcessRegressor
-from sklearn.gaussian_process.kernels import RBF
+from sklearn.gaussian_process.kernels import Matern
 
 # Suppress the optimizer ConvergenceWarning – hyperparameters are always fixed
 # (optimizer=None), so this warning should never fire; kept as a safety net.
@@ -83,7 +83,7 @@ def gp_predict_at(
     V_arr = np.array(V_buf,     dtype=float)
     y_mean = float(np.mean(y_arr))
 
-    kernel = RBF(GP_LENGTH_SCALE, length_scale_bounds="fixed")
+    kernel = Matern(GP_LENGTH_SCALE, length_scale_bounds="fixed", nu=1.5)
     gp = GaussianProcessRegressor(
         kernel=kernel,
         alpha=V_arr,
