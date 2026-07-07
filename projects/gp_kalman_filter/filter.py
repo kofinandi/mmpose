@@ -48,7 +48,7 @@ def measurement_variance(score: float) -> float:
     # ~1 (near-total pass-through of the raw, jittery detection). A small
     # floor well below sigma_pred nudges the gain down slightly for the most
     # "confident" points without collapsing trust the way a larger floor did.
-    return (1.0 - score) ** 6 * PIXEL_SCALE + MIN_R
+    return (1.0 - score) ** 8 * PIXEL_SCALE + MIN_R
 
 
 # ── GP helper ──────────────────────────────────────────────────────────────────
