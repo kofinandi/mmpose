@@ -36,7 +36,7 @@ KEYPOINT_NAMES = [
 
 WINDOW_SIZE = 8
 N_FORECAST  = 20
-PIXEL_SCALE = 4.0
+PIXEL_SCALE = 3.0
 GP_LENGTH_SCALE = 10.0
 GP_SIGNAL_VAR   = 2000.0
 GATE_K = 12.0           # robust-outlier threshold, in units of scaled MAD
