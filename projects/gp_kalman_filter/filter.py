@@ -21,7 +21,7 @@ import warnings
 import numpy as np
 from sklearn.exceptions import ConvergenceWarning
 from sklearn.gaussian_process import GaussianProcessRegressor
-from sklearn.gaussian_process.kernels import RBF
+from sklearn.gaussian_process.kernels import Matern
 
 # Suppress the optimizer ConvergenceWarning – hyperparameters are always fixed
 # (optimizer=None), so this warning should never fire; kept as a safety net.
@@ -34,11 +34,12 @@ KEYPOINT_NAMES = [
     "left_knee", "right_knee", "left_ankle", "right_ankle",
 ]
 
-WINDOW_SIZE = 60
+WINDOW_SIZE = 40
 N_FORECAST  = 20
 PIXEL_SCALE = 1.0
-GP_LENGTH_SCALE = 15.0
-GP_SIGNAL_VAR   = 2000.0
+GP_LENGTH_SCALE = 32.0
+GP_SIGNAL_VAR   = 4000.0
+INFLATION_FACTOR = 8.0
 
 # ── Noise model ────────────────────────────────────────────────────────────────
 
@@ -47,7 +48,8 @@ def measurement_variance(score: float) -> float:
     Convert score to variance.
     """
 
-    return (1.0 - score) ** 2 * PIXEL_SCALE
+    # This exponent seems to provide a steep enough curve to separate low-confidence measurements from high-confidence ones.
+    return (1.0 - score) ** 6 * PIXEL_SCALE
 
 
 # ── GP helper ──────────────────────────────────────────────────────────────────
@@ -83,7 +85,7 @@ def gp_predict_at(
     V_arr = np.array(V_buf,     dtype=float)
     y_mean = float(np.mean(y_arr))
 
-    kernel = RBF(GP_LENGTH_SCALE, length_scale_bounds="fixed")
+    kernel = Matern(GP_LENGTH_SCALE, length_scale_bounds="fixed", nu=1.5)
     gp = GaussianProcessRegressor(
         kernel=kernel,
         alpha=V_arr,
@@ -212,7 +214,6 @@ def run_filter(
             print(f"  filtering … {idx}/{n_total}", end="\r", flush=True)
 
         z = measurements[idx]
-        R = measurement_variance(scores[idx]) if z is not None else None
 
         # ── Step 1: Prediction (heteroscedastic GP time update) ──────────────
         if T_buf:
@@ -226,8 +227,11 @@ def run_filter(
 
         # ── Steps 2 & 3: Bayesian update (measurement available) ─────────────
         if z is not None:
+            innovation = z - mu_p
+            R = measurement_variance(scores[idx])
+            R = R * (1 + (innovation ** 2) / INFLATION_FACTOR)
             K_gain  = sigma_p / (sigma_p + R)
-            mu_t    = mu_p + K_gain * (z - mu_p)
+            mu_t    = mu_p + K_gain * innovation
             sigma_t = (1.0 - K_gain) * sigma_p
 
             # Store the raw measurement (not the posterior) to keep the GP
@@ -255,6 +259,7 @@ def run_filter(
             "z":          z,
             "R":          R,
             "score":      scores[idx],
+            "innovation": innovation,
             "mu_pred":    mu_p,
             "sigma_pred": sigma_p,
             "mu_post":    mu_t,

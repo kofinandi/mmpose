@@ -221,6 +221,7 @@ class StepViewer:
 
         sp = rec["sigma_pred"]
         st = rec["sigma_post"]
+        inn = rec["innovation"]
         mp = rec["mu_pred"]
         mt = rec["mu_post"]
 
@@ -247,6 +248,7 @@ class StepViewer:
                 f"  score   = {rec['score']:>9.4f}",
                 f"  R (σ²)  = {R:>9.4f}  px²",
                 f"  R (σ)   = {R**0.5:>9.3f}  px",
+                f"  innovation = {inn:>9.3f}  px",
             ]
         else:
             lines.append("  (no measurement)")
