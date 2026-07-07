@@ -39,7 +39,7 @@ N_FORECAST  = 20
 PIXEL_SCALE = 4.0
 GP_LENGTH_SCALE = 10.0
 GP_SIGNAL_VAR   = 2000.0
-GATE_K = 8.0            # robust-outlier threshold, in units of scaled MAD
+GATE_K = 12.0           # robust-outlier threshold, in units of scaled MAD
 GATE_MAD_FLOOR = 5.0    # pixels; prevents the gate from tightening on a static buffer
 GATE_INFLATE = 25.0     # variance inflation for suspected outliers (soft down-weight, not rejection)
 
