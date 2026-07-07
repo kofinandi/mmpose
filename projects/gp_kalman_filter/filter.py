@@ -43,7 +43,7 @@ GP_SIGNAL_VAR   = 2000.0
 GATE_K = 12.0           # robust-outlier threshold, in units of scaled MAD
 GATE_MAD_FLOOR = 5.0    # pixels; prevents the gate from tightening on a static buffer
 GATE_INFLATE = 25.0     # variance inflation for suspected outliers (soft down-weight, not rejection)
-MIN_SIGMA_P = 0.1       # floor on the GP predicted variance, prevents overconfidence stalling updates
+MIN_SIGMA_P = 0.3       # floor on the GP predicted variance, prevents overconfidence stalling updates
 
 # ── Noise model ────────────────────────────────────────────────────────────────
 
