@@ -39,6 +39,9 @@ N_FORECAST  = 20
 PIXEL_SCALE = 4.0
 GP_LENGTH_SCALE = 10.0
 GP_SIGNAL_VAR   = 2000.0
+GATE_K = 8.0            # robust-outlier threshold, in units of scaled MAD
+GATE_MAD_FLOOR = 5.0    # pixels; prevents the gate from tightening on a static buffer
+GATE_INFLATE = 25.0     # variance inflation for suspected outliers (soft down-weight, not rejection)
 
 # ── Noise model ────────────────────────────────────────────────────────────────
 
@@ -223,6 +226,18 @@ def run_filter(
             # Bootstrap: no history yet → prior centred on the first measurement
             mu_p    = float(z) if z is not None else 0.0
             sigma_p = GP_SIGNAL_VAR
+
+        # ── Outlier soft-gate: down-weight (never freeze) measurements that
+        # fall far outside the buffer's own robust (MAD-based) spread, in raw
+        # pixel units. Unlike a hard reject, the point is still stored, so
+        # the buffer keeps adapting and cannot get permanently stuck.
+        if z is not None and len(z_buf) >= 3:
+            arr = np.array(z_buf)
+            med = np.median(arr)
+            mad = np.median(np.abs(arr - med))
+            robust_std = max(mad * 1.4826, GATE_MAD_FLOOR)
+            if abs(z - med) > GATE_K * robust_std:
+                R = R * GATE_INFLATE
 
         # ── Steps 2 & 3: Bayesian update (measurement available) ─────────────
         if z is not None:
