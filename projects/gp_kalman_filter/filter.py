@@ -15,6 +15,7 @@ Public API
         → list[dict]  (one record per time step)
 """
 
+import bisect
 import json
 import warnings
 
@@ -176,23 +177,29 @@ def run_filter(
     verbose: bool = False,
 ) -> list:
     """
-    Run the GP-Kalman filter over the full sequence.
+    Run the GP-Kalman filter over the full sequence, using a symmetric
+    (past + future) neighbor window for the GP prediction at each frame.
+    This is an offline filter with the full sequence available up front, so
+    unlike a causal running buffer, each frame's prediction can draw on
+    nearby future measurements too — recovering information a forward-only
+    filter loses to lag, in a single pass (one GP fit per frame, same as a
+    causal window).
 
-    Implements all four steps from GP_Kalman_Filter_Steps.md:
+    Implements the four steps from GP_Kalman_Filter_Steps.md, with the
+    buffer for Step 1 gathered symmetrically instead of causally:
       1. Heteroscedastic GP prediction
       2. Kalman gain
       3. Bayesian mean/variance update
-      4. Extrapolation (no-measurement case, buffer frozen)
+      4. Extrapolation (no neighbors and no measurement at this frame)
 
     Parameters
     ----------
     frame_ids    : sorted list of integer frame identifiers
     measurements : per-frame predicted coordinate (float or None)
     scores       : per-frame keypoint confidence score
-    precompute_forecast : if True, evaluate the GP over the next *n_forecast*
-        frames at every step and store the results in each record (fwd_t,
-        fwd_mus, fwd_stds).  Enables instant rendering in the step-by-step
-        viewer at the cost of roughly doubling GP evaluations.  Default: False.
+    precompute_forecast : if True, additionally evaluate the GP over the next
+        *n_forecast* frames at every step (fwd_t, fwd_mus, fwd_stds), for the
+        step-by-step viewer.  Default: False.
 
     Returns
     -------
@@ -203,13 +210,16 @@ def run_filter(
         T_post,
         fwd_t, fwd_mus, fwd_stds  (non-None only when precompute_forecast=True)
     """
-    T_buf: list = []   # time steps of buffered measurements
-    z_buf: list = []   # raw measurements  z_t  (NOT posteriors)
-    R_buf: list = []   # measurement variances  R_t
+    n_total = len(frame_ids)
+    max_t = frame_ids[-1]
+    half = WINDOW_SIZE // 2
+
+    # Positions (indices into frame_ids/measurements) that have a real
+    # detection, in ascending order — lets us binary-search for the nearest
+    # past/future neighbors of any frame without rescanning the sequence.
+    valid_positions = [i for i, z in enumerate(measurements) if z is not None]
 
     records: list = []
-    max_t   = frame_ids[-1]
-    n_total = len(frame_ids)
 
     for idx, t in enumerate(frame_ids):
         if verbose and idx % 100 == 0:
@@ -218,20 +228,29 @@ def run_filter(
         z = measurements[idx]
         R = measurement_variance(scores[idx]) if z is not None else None
 
-        # ── Step 1: Prediction (heteroscedastic GP time update) ──────────────
+        pos = bisect.bisect_left(valid_positions, idx)
+        left_positions  = valid_positions[max(0, pos - half):pos]
+        right_start     = pos + 1 if (pos < len(valid_positions) and valid_positions[pos] == idx) else pos
+        right_positions = valid_positions[right_start:right_start + half]
+        neighbor_positions = left_positions + right_positions
+
+        T_buf = [frame_ids[i] for i in neighbor_positions]
+        z_buf = [measurements[i] for i in neighbor_positions]
+        R_buf = [measurement_variance(scores[i]) for i in neighbor_positions]
+
+        # ── Step 1: Prediction (heteroscedastic GP, symmetric neighbors) ─────
         if T_buf:
             (mu_p,), (std_p,) = gp_predict_at(T_buf, z_buf, R_buf, [t])
             sigma_p = max(float(std_p ** 2), MIN_SIGMA_P)
             mu_p    = float(mu_p)
         else:
-            # Bootstrap: no history yet → prior centred on the first measurement
+            # No neighbors at all (isolated detection or empty sequence)
             mu_p    = float(z) if z is not None else 0.0
             sigma_p = GP_SIGNAL_VAR
 
-        # ── Outlier soft-gate: down-weight (never freeze) measurements that
-        # fall far outside the buffer's own robust (MAD-based) spread, in raw
-        # pixel units. Unlike a hard reject, the point is still stored, so
-        # the buffer keeps adapting and cannot get permanently stuck.
+        # ── Outlier soft-gate: down-weight (never reject) measurements that
+        # fall far outside the neighbor buffer's own robust (MAD-based)
+        # spread, in raw pixel units.
         if z is not None and len(z_buf) >= 3:
             arr = np.array(z_buf)
             med = np.median(arr)
@@ -245,15 +264,8 @@ def run_filter(
             K_gain  = sigma_p / (sigma_p + R)
             mu_t    = mu_p + K_gain * (z - mu_p)
             sigma_t = (1.0 - K_gain) * sigma_p
-
-            # Store the raw measurement (not the posterior) to keep the GP
-            # training data independent of its own predictions.
-            T_buf.append(t);  z_buf.append(z);  R_buf.append(R)
-            if len(T_buf) > WINDOW_SIZE:
-                T_buf.pop(0);  z_buf.pop(0);  R_buf.pop(0)
-
         else:
-            # ── Step 4: Extrapolation (no measurement, buffer frozen) ─────────
+            # ── Step 4: Extrapolation (no measurement at this frame) ──────────
             mu_t    = mu_p
             sigma_t = sigma_p
 
@@ -262,9 +274,7 @@ def run_filter(
         fwd_mus = fwd_stds = None
         if precompute_forecast and T_buf:
             fwd_t = list(range(t, min(max_t + 1, t + N_FORECAST + 1)))
-            fwd_mus, fwd_stds = gp_predict_at(
-                list(T_buf), list(z_buf), list(R_buf), fwd_t
-            )
+            fwd_mus, fwd_stds = gp_predict_at(T_buf, z_buf, R_buf, fwd_t)
 
         records.append({
             "t":          t,
@@ -275,7 +285,7 @@ def run_filter(
             "sigma_pred": sigma_p,
             "mu_post":    mu_t,
             "sigma_post": sigma_t,
-            "T_post":     list(T_buf),   # window snapshot for the viewer
+            "T_post":     T_buf,   # neighbor snapshot for the viewer
             "fwd_t":      fwd_t,
             "fwd_mus":    fwd_mus,
             "fwd_stds":   fwd_stds,
