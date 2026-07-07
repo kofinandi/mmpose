@@ -33,6 +33,7 @@ PIXEL_SCALE = 1.0
 GP_LENGTH_SCALE = 16.0
 GP_SIGNAL_VAR   = 4000.0
 INFLATION_FACTOR = 8.0
+MIN_R = 0.0003
 
 # ── Noise model ────────────────────────────────────────────────────────────────
 
@@ -42,7 +43,12 @@ def measurement_variance(score: float) -> float:
     """
 
     # This exponent seems to provide a steep enough curve to separate low-confidence measurements from high-confidence ones.
-    return (1.0 - score) ** 6 * PIXEL_SCALE
+    # MIN_R: typical one-step GP predictive variance (sigma_pred) is ~0.0026,
+    # while R for high-score points is often <<1e-5 — the Kalman gain is then
+    # ~1 (near-total pass-through of the raw, jittery detection). A small
+    # floor well below sigma_pred nudges the gain down slightly for the most
+    # "confident" points without collapsing trust the way a larger floor did.
+    return (1.0 - score) ** 6 * PIXEL_SCALE + MIN_R
 
 
 # ── GP helper ──────────────────────────────────────────────────────────────────
