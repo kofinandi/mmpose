@@ -42,6 +42,7 @@ GP_SIGNAL_VAR   = 2000.0
 GATE_K = 12.0           # robust-outlier threshold, in units of scaled MAD
 GATE_MAD_FLOOR = 5.0    # pixels; prevents the gate from tightening on a static buffer
 GATE_INFLATE = 25.0     # variance inflation for suspected outliers (soft down-weight, not rejection)
+MIN_SIGMA_P = 0.1       # floor on the GP predicted variance, prevents overconfidence stalling updates
 
 # ── Noise model ────────────────────────────────────────────────────────────────
 
@@ -220,7 +221,7 @@ def run_filter(
         # ── Step 1: Prediction (heteroscedastic GP time update) ──────────────
         if T_buf:
             (mu_p,), (std_p,) = gp_predict_at(T_buf, z_buf, R_buf, [t])
-            sigma_p = float(std_p ** 2)
+            sigma_p = max(float(std_p ** 2), MIN_SIGMA_P)
             mu_p    = float(mu_p)
         else:
             # Bootstrap: no history yet → prior centred on the first measurement
