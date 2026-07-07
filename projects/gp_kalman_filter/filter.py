@@ -16,16 +16,9 @@ Public API
 """
 
 import json
-import warnings
 
 import numpy as np
-from sklearn.exceptions import ConvergenceWarning
-from sklearn.gaussian_process import GaussianProcessRegressor
-from sklearn.gaussian_process.kernels import Matern
-
-# Suppress the optimizer ConvergenceWarning – hyperparameters are always fixed
-# (optimizer=None), so this warning should never fire; kept as a safety net.
-warnings.filterwarnings("ignore", category=ConvergenceWarning)
+from scipy.linalg import LinAlgError, cho_factor, cho_solve
 
 KEYPOINT_NAMES = [
     "nose", "left_eye", "right_eye", "left_ear", "right_ear",
@@ -34,12 +27,14 @@ KEYPOINT_NAMES = [
     "left_knee", "right_knee", "left_ankle", "right_ankle",
 ]
 
-WINDOW_SIZE = 40
+WINDOW_SIZE = 20
 N_FORECAST  = 20
 PIXEL_SCALE = 1.0
-GP_LENGTH_SCALE = 32.0
+GP_LENGTH_SCALE = 16.0
 GP_SIGNAL_VAR   = 4000.0
 INFLATION_FACTOR = 8.0
+MIN_R = 0.0003
+OSC_INFLATE = 2.0
 
 # ── Noise model ────────────────────────────────────────────────────────────────
 
@@ -49,10 +44,24 @@ def measurement_variance(score: float) -> float:
     """
 
     # This exponent seems to provide a steep enough curve to separate low-confidence measurements from high-confidence ones.
-    return (1.0 - score) ** 6 * PIXEL_SCALE
+    # MIN_R: typical one-step GP predictive variance (sigma_pred) is ~0.0026,
+    # while R for high-score points is often <<1e-5 — the Kalman gain is then
+    # ~1 (near-total pass-through of the raw, jittery detection). A small
+    # floor well below sigma_pred nudges the gain down slightly for the most
+    # "confident" points without collapsing trust the way a larger floor did.
+    return (1.0 - score) ** 8 * PIXEL_SCALE + MIN_R
 
 
 # ── GP helper ──────────────────────────────────────────────────────────────────
+
+_MATERN_SQRT3 = 3.0 ** 0.5
+
+
+def _matern32(dist: np.ndarray) -> np.ndarray:
+    """Matérn(nu=1.5) kernel, unit signal variance, GP_LENGTH_SCALE lengthscale."""
+    z = _MATERN_SQRT3 * dist / GP_LENGTH_SCALE
+    return (1.0 + z) * np.exp(-z)
+
 
 def gp_predict_at(
     T_buf: list,
@@ -64,12 +73,14 @@ def gp_predict_at(
     Fit a heteroscedastic GP to (T_buf, y_buf) with per-point noise V_buf,
     then evaluate at *t_queries*.
 
-    The kernel is a fixed-hyperparameter RBF.  *V_buf* values are passed as
-    ``alpha`` to GaussianProcessRegressor, implementing the diagonal noise
-    matrix **V** from the filter specification.
+    Direct closed-form Matern(nu=1.5) GP regression via Cholesky, equivalent
+    to the previous sklearn GaussianProcessRegressor(alpha=V_buf) call but
+    without its per-call validation/construction overhead — the buffers here
+    are at most WINDOW_SIZE long, so the linear algebra itself is cheap and
+    sklearn's generic-estimator overhead dominated runtime.
 
-    Manual mean-centering replaces ``normalize_y=True`` to avoid the std=0
-    singularity when the buffer contains only one point.
+    *V_buf* values sit on the kernel-matrix diagonal, implementing the
+    heteroscedastic noise matrix **V** from the filter specification.
 
     Returns
     -------
@@ -80,23 +91,36 @@ def gp_predict_at(
         n = len(t_queries)
         return np.zeros(n), np.full(n, GP_SIGNAL_VAR ** 0.5)
 
-    T_arr = np.array(T_buf,     dtype=float).reshape(-1, 1)
-    y_arr = np.array(y_buf,     dtype=float)
-    V_arr = np.array(V_buf,     dtype=float)
+    T_arr = np.array(T_buf, dtype=float)
+    y_arr = np.array(y_buf, dtype=float)
+    V_arr = np.array(V_buf, dtype=float)
     y_mean = float(np.mean(y_arr))
+    n = T_arr.shape[0]
 
-    kernel = Matern(GP_LENGTH_SCALE, length_scale_bounds="fixed", nu=1.5)
-    gp = GaussianProcessRegressor(
-        kernel=kernel,
-        alpha=V_arr,
-        optimizer=None,       # hyperparameters are fixed; skip MLE optimisation
-        normalize_y=False,
-    )
-    gp.fit(T_arr, y_arr - y_mean)
+    K = _matern32(np.abs(T_arr[:, None] - T_arr[None, :]))
+    K[np.diag_indices(n)] += V_arr
 
-    t_q = np.array(t_queries, dtype=float).reshape(-1, 1)
-    means, stds = gp.predict(t_q, return_std=True)
-    return means + y_mean, stds
+    jitter = 0.0
+    for _ in range(5):
+        try:
+            c, lower = cho_factor(K + jitter * np.eye(n), lower=True)
+            break
+        except LinAlgError:
+            jitter = 1e-10 if jitter == 0.0 else jitter * 10.0
+    else:
+        raise LinAlgError("Cholesky factorization failed to stabilize")
+
+    alpha = cho_solve((c, lower), y_arr - y_mean)
+
+    t_q = np.array(t_queries, dtype=float)
+    k_star = _matern32(np.abs(t_q[:, None] - T_arr[None, :]))  # (n_q, n)
+
+    means = k_star @ alpha + y_mean
+
+    v = cho_solve((c, lower), k_star.T)  # (n, n_q), K^-1 @ k_star.T
+    var = 1.0 - np.sum(k_star.T * v, axis=0)
+    stds = np.sqrt(np.maximum(var, 1e-12))
+    return means, stds
 
 
 # ── Data loading ───────────────────────────────────────────────────────────────
@@ -204,6 +228,7 @@ def run_filter(
     T_buf: list = []   # time steps of buffered measurements
     z_buf: list = []   # raw measurements  z_t  (NOT posteriors)
     R_buf: list = []   # measurement variances  R_t
+    prev_innovation = None
 
     records: list = []
     max_t   = frame_ids[-1]
@@ -230,9 +255,17 @@ def run_filter(
             innovation = z - mu_p
             R = measurement_variance(scores[idx])
             R = R * (1 + (innovation ** 2) / INFLATION_FACTOR)
+            # An innovation that flips sign from the previous step looks like
+            # oscillatory jitter rather than sustained motion (a real moving
+            # target tends to keep under/over-shooting the GP's lagging
+            # estimate in the same direction for a few steps) — inflate R
+            # extra in that case since it disproportionately drives acceleration error.
+            if prev_innovation is not None and innovation * prev_innovation < 0:
+                R = R * OSC_INFLATE
             K_gain  = sigma_p / (sigma_p + R)
             mu_t    = mu_p + K_gain * innovation
             sigma_t = (1.0 - K_gain) * sigma_p
+            prev_innovation = innovation
 
             # Store the raw measurement (not the posterior) to keep the GP
             # training data independent of its own predictions.
