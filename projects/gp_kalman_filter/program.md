@@ -26,6 +26,7 @@ Each experiment runs the post processing and the evaluation with the GP-Kalman f
 - Modify `projects/gp_kalman_filter/filter.py` — this is the only file you edit. Everything is fair game: the filter architecture and its steps, parameters, GP kernel, model score interpretation, etc.
 
 **What you CANNOT do:**
+- Modify the filter to non-causal. You are allowed to modify the filter logic in any way, but **it can only use past timesteps for predictions**.
 - Modify `mmpose/postprocessing/filters/gp_kalman_smoother.py`. It is read-only. It contains the wrapper that runs the filter in the post processing and evaluation pipeline. It is simple for a reason: you are working on a prototype and should only modify the filter itself.
 - Modify `projects/gp_kalman_filter/run_evaluation.sh`. It is read-only. It contains the evaluation harness that runs the filter on the model predictions.
 - Modify `tools/postprocess_predictions.py`. It is read-only. It contains the post processing pipeline that runs the filter on the model predictions.
@@ -35,6 +36,10 @@ Each experiment runs the post processing and the evaluation with the GP-Kalman f
 **The goal is simple: get the highest score.** The score is computed as `AR - 10*bMPJVE - 10*bMPJAE`, where AR is the Average Recall computed in the CocoMetric standard metric computation, bMPJVE is the EMDB dataset box size normalized joint velocity error, and bMPJAE is the EMDB dataset box size normalized joint acceleration error. You want to maximize AR and minimize bMPJVE and bMPJAE (the scalars are arbitrary to balance the scale of the three metrics). The score is used to rank the experiments and select the best ones, but you will see the individual metrics in the output to help you understand the impact of your changes.
 
 **15 minutes** is a hard constraint. In the end this will be a realtime filter. You get the runtime of the filter as a metric to help you understand the impact of your changes. All else being equal, you want to keep the runtime as low as possible.
+
+**Causal criterion**: The filter can only use past timesteps for predictions. This is a hard constraint.
+
+**Changing the algorithm instead of hyperparameter tuning**: You are encouraged to make changes to the GP Kalman filter algorithm itself, rather than just tuning hyperparameters. This is because the filter is a prototype and you are trying to understand the impact of changes that can't be covered by e.g. a simple grid search. You can still tune hyperparameters, but a change to the algorithm itself is more valuable than a slightly better hyperparameter configuration.
 
 **Simplicity criterion**: All else being equal, simpler is better. A small improvement that adds ugly complexity is not worth it. Conversely, removing something and getting equal or better results is a great outcome — that's a simplification win. When evaluating whether to keep a change, weigh the complexity cost against the improvement magnitude. A 0.001 score improvement that adds 20 lines of hacky code? Probably not worth it. A 0.001 score improvement from deleting code? Definitely keep. An improvement of ~0 but much simpler code? Keep.
 
