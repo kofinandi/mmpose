@@ -16,16 +16,9 @@ Public API
 """
 
 import json
-import warnings
 
 import numpy as np
-from sklearn.exceptions import ConvergenceWarning
-from sklearn.gaussian_process import GaussianProcessRegressor
-from sklearn.gaussian_process.kernels import Matern
-
-# Suppress the optimizer ConvergenceWarning – hyperparameters are always fixed
-# (optimizer=None), so this warning should never fire; kept as a safety net.
-warnings.filterwarnings("ignore", category=ConvergenceWarning)
+from scipy.linalg import LinAlgError, cho_factor, cho_solve
 
 KEYPOINT_NAMES = [
     "nose", "left_eye", "right_eye", "left_ear", "right_ear",
@@ -54,6 +47,15 @@ def measurement_variance(score: float) -> float:
 
 # ── GP helper ──────────────────────────────────────────────────────────────────
 
+_MATERN_SQRT3 = 3.0 ** 0.5
+
+
+def _matern32(dist: np.ndarray) -> np.ndarray:
+    """Matérn(nu=1.5) kernel, unit signal variance, GP_LENGTH_SCALE lengthscale."""
+    z = _MATERN_SQRT3 * dist / GP_LENGTH_SCALE
+    return (1.0 + z) * np.exp(-z)
+
+
 def gp_predict_at(
     T_buf: list,
     y_buf: list,
@@ -64,12 +66,14 @@ def gp_predict_at(
     Fit a heteroscedastic GP to (T_buf, y_buf) with per-point noise V_buf,
     then evaluate at *t_queries*.
 
-    The kernel is a fixed-hyperparameter RBF.  *V_buf* values are passed as
-    ``alpha`` to GaussianProcessRegressor, implementing the diagonal noise
-    matrix **V** from the filter specification.
+    Direct closed-form Matern(nu=1.5) GP regression via Cholesky, equivalent
+    to the previous sklearn GaussianProcessRegressor(alpha=V_buf) call but
+    without its per-call validation/construction overhead — the buffers here
+    are at most WINDOW_SIZE long, so the linear algebra itself is cheap and
+    sklearn's generic-estimator overhead dominated runtime.
 
-    Manual mean-centering replaces ``normalize_y=True`` to avoid the std=0
-    singularity when the buffer contains only one point.
+    *V_buf* values sit on the kernel-matrix diagonal, implementing the
+    heteroscedastic noise matrix **V** from the filter specification.
 
     Returns
     -------
@@ -80,23 +84,36 @@ def gp_predict_at(
         n = len(t_queries)
         return np.zeros(n), np.full(n, GP_SIGNAL_VAR ** 0.5)
 
-    T_arr = np.array(T_buf,     dtype=float).reshape(-1, 1)
-    y_arr = np.array(y_buf,     dtype=float)
-    V_arr = np.array(V_buf,     dtype=float)
+    T_arr = np.array(T_buf, dtype=float)
+    y_arr = np.array(y_buf, dtype=float)
+    V_arr = np.array(V_buf, dtype=float)
     y_mean = float(np.mean(y_arr))
+    n = T_arr.shape[0]
 
-    kernel = Matern(GP_LENGTH_SCALE, length_scale_bounds="fixed", nu=1.5)
-    gp = GaussianProcessRegressor(
-        kernel=kernel,
-        alpha=V_arr,
-        optimizer=None,       # hyperparameters are fixed; skip MLE optimisation
-        normalize_y=False,
-    )
-    gp.fit(T_arr, y_arr - y_mean)
+    K = _matern32(np.abs(T_arr[:, None] - T_arr[None, :]))
+    K[np.diag_indices(n)] += V_arr
 
-    t_q = np.array(t_queries, dtype=float).reshape(-1, 1)
-    means, stds = gp.predict(t_q, return_std=True)
-    return means + y_mean, stds
+    jitter = 0.0
+    for _ in range(5):
+        try:
+            c, lower = cho_factor(K + jitter * np.eye(n), lower=True)
+            break
+        except LinAlgError:
+            jitter = 1e-10 if jitter == 0.0 else jitter * 10.0
+    else:
+        raise LinAlgError("Cholesky factorization failed to stabilize")
+
+    alpha = cho_solve((c, lower), y_arr - y_mean)
+
+    t_q = np.array(t_queries, dtype=float)
+    k_star = _matern32(np.abs(t_q[:, None] - T_arr[None, :]))  # (n_q, n)
+
+    means = k_star @ alpha + y_mean
+
+    v = cho_solve((c, lower), k_star.T)  # (n, n_q), K^-1 @ k_star.T
+    var = 1.0 - np.sum(k_star.T * v, axis=0)
+    stds = np.sqrt(np.maximum(var, 1e-12))
+    return means, stds
 
 
 # ── Data loading ───────────────────────────────────────────────────────────────
