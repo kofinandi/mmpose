@@ -2,7 +2,7 @@
 """Registry and helpers for cross-dataset benchmark evaluation.
 
 Maps standard COCO-trained model configs onto alternate test datasets
-(CrowdPose, MPII, AIC, OCHuman, EMDB) without duplicating per-model config
+(CrowdPose, MPII, AIC, OCHuman, EMDB, 3DPW) without duplicating per-model config
 files.  Swap ``test_dataloader.dataset``, insert ``KeypointConverter`` before
 ``PackPoseInputs``, and use ``CocoMetric(gt_from_samples=True)`` unless
 ``preserve_evaluator`` is set on the dataset spec (e.g. EMDB temporal metrics).
@@ -27,7 +27,8 @@ EXTENDED_PACK_META_KEYS = (
 )
 
 BENCHMARK_TEST_DATASET_NAMES = (
-    'coco', 'crowdpose', 'mpii', 'aic', 'ochuman', 'emdb', 'emdb-mini')
+    'coco', 'crowdpose', 'mpii', 'aic', 'ochuman', 'emdb', 'emdb-mini',
+    '3dpw')
 
 
 @dataclass(frozen=True)
@@ -128,6 +129,19 @@ BENCHMARK_TEST_DATASETS: Dict[str, BenchmarkTestDataset] = {
             dict(type='MPJAE', prefix='emdb'),
             dict(type='MPJVE', norm_item=['bbox', 'torso'], prefix='emdb'),
             dict(type='MPJAE', norm_item=['bbox', 'torso'], prefix='emdb'),
+        ],
+    ),
+    '3dpw': BenchmarkTestDataset(
+        dataset_type='ThreeDPWDataset',
+        data_root='data/3dpw/',
+        ann_file='annotations/threedpw_test.json',
+        data_prefix=dict(img='imageFiles/'),
+        keypoint_src='coco',
+        extra_metrics=[
+            dict(type='MPJVE', prefix='3dpw'),
+            dict(type='MPJAE', prefix='3dpw'),
+            dict(type='MPJVE', norm_item=['bbox', 'torso'], prefix='3dpw'),
+            dict(type='MPJAE', norm_item=['bbox', 'torso'], prefix='3dpw'),
         ],
     ),
 }

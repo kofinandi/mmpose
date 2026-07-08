@@ -18,7 +18,7 @@ Usage::
     python tools/postprocess_predictions.py \\
         benchmark/predictions/20260615_emdb-mini_e2e/YOLO-Pose-tiny \\
         --post-config configs/post_processing/oks_track_one_euro.py \\
-        --metrics CocoMetric MPJVE MPJAE
+        --metrics CocoMetric MPJVE MPJAE IDSwitch
 
     python tools/postprocess_predictions.py PRED_DIR \\
         --post-config configs/post_processing/oks_track_one_euro.py \\
@@ -231,6 +231,8 @@ def _build_metric(metric_type: str, dataset_meta: dict) -> object:
         cfg['type'] = 'CocoMetric'
     elif metric_type in ('MPJVE', 'MPJAE'):
         cfg = {'type': metric_type, 'norm_item': [None, 'bbox', 'torso']}
+    elif metric_type == 'IDSwitch':
+        cfg = {'type': metric_type}
     else:
         cfg['type'] = metric_type
 
@@ -245,25 +247,34 @@ def build_evaluator_from_types(
     test_dataset: str = '',
 ) -> Evaluator:
     """Build an evaluator, matching benchmark_e2e extra_metrics when available."""
-    temporal_types = {'MPJVE', 'MPJAE'}
-    requested_temporal = temporal_types & set(metric_types)
+    # Metric types that manage their own state via process() (no
+    # gt_from_samples injection); some of these have dataset-specific
+    # presets in BENCHMARK_TEST_DATASETS.extra_metrics (e.g. MPJVE/MPJAE for
+    # emdb), others (e.g. IDSwitch) never do and always fall back to
+    # _build_metric below.
+    stateful_types = {'MPJVE', 'MPJAE', 'IDSwitch'}
+    requested_stateful = stateful_types & set(metric_types)
 
     metrics = [
         _build_metric(t, dataset_meta)
         for t in metric_types
-        if t not in temporal_types
+        if t not in stateful_types
     ]
 
     spec = BENCHMARK_TEST_DATASETS.get(test_dataset)
-    if spec is not None and spec.extra_metrics and requested_temporal:
+    covered_types: set = set()
+    if spec is not None and spec.extra_metrics and requested_stateful:
         for m_cfg in spec.extra_metrics:
-            if m_cfg['type'] in requested_temporal:
+            if m_cfg['type'] in requested_stateful:
                 m = METRICS.build(dict(m_cfg))
                 m.dataset_meta = dataset_meta
                 metrics.append(m)
-    else:
-        for metric_type in sorted(requested_temporal):
-            metrics.append(_build_metric(metric_type, dataset_meta))
+                covered_types.add(m_cfg['type'])
+
+    # Any requested stateful metric not covered by a dataset preset above
+    # (e.g. IDSwitch, which has no per-dataset preset) is still built.
+    for metric_type in sorted(requested_stateful - covered_types):
+        metrics.append(_build_metric(metric_type, dataset_meta))
 
     return Evaluator(metrics)
 
@@ -384,8 +395,9 @@ def _parse_args() -> argparse.Namespace:
                         '(e.g. configs/post_processing/oks_track_one_euro.py)')
     p.add_argument(
         '--metrics', nargs='+',
-        default=['CocoMetric', 'MPJVE', 'MPJAE'],
-        help='Metric types to evaluate (default: CocoMetric MPJVE MPJAE)')
+        default=['CocoMetric', 'MPJVE', 'MPJAE', 'IDSwitch'],
+        help='Metric types to evaluate '
+             '(default: CocoMetric MPJVE MPJAE IDSwitch)')
     p.add_argument(
         '--out-dir', default=None,
         help='Output directory for the post-processed bundle '

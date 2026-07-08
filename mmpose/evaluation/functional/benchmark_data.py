@@ -135,7 +135,7 @@ def load_unified_samples(
 
     Args:
         dataset_name: One of ``'coco', 'crowdpose', 'mpii', 'aic',
-            'ochuman', 'emdb', 'emdb-mini'``.
+            'ochuman', 'emdb', 'emdb-mini', '3dpw'``.
         num_frames: If set, cap the number of unique images loaded.
 
     Returns:

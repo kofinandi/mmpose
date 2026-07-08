@@ -209,36 +209,34 @@ def _instance_area(inst: dict) -> float:
     return 1.0
 
 
-def match_instances_oks(
+def compute_oks_pairs(
     gt_list: List[dict],
     pred_list: List[dict],
     sigmas: np.ndarray,
-    match_thr: float = 0.5,
-) -> Tuple[List[dict], dict]:
-    """Greedy OKS matching aligned with COCOeval semantics.
+) -> Tuple[List[Tuple[float, int, int]], List[int], List[int]]:
+    """Compute all-pairs OKS scores between valid GT and predicted instances.
 
-    Differences from a naive implementation:
+    Shared building block for :func:`match_instances_oks` and any custom
+    assignment strategy (e.g. identity-aware "sticky" matching in tracking
+    metrics) that needs the full pairwise OKS score matrix rather than just
+    the greedily-selected matches.
 
-    * **Non-labeled keypoints excluded** – only GT keypoints with visibility
-      > 0 contribute to the OKS numerator and denominator (matches
-      ``COCOeval`` which applies ``e = e[vg > 0]``).
-    * **GT area only** – OKS is normalised by the GT object area, not the
-      average of GT and predicted areas.
-    * **iscrowd GT skipped** – crowd regions are not counted in ``num_gt``
-      and do not generate false negatives (matching ``COCOeval`` which
-      ignores crowd GT for recall).
-    * **k1 == 0 guard** – if a GT instance has no labeled keypoints, OKS is
-      0 (no match).
+    "Valid" GT excludes crowd regions and GT with no labeled keypoints;
+    "valid" pred excludes instances with no keypoints at all — see
+    :func:`match_instances_oks` for the exact semantics.
 
-    The GT visibility flag is taken from ``keypoints_visible_coco`` (raw COCO
-    0/1/2) when present, otherwise from ``keypoints_visible`` (binary 0/1).
-    Both representations mark labeled keypoints as v > 0.
+    Returns:
+        Tuple of:
+
+        - ``pairs``: ``(oks, gt_idx, pred_idx)`` tuples for every valid GT
+          x valid pred combination, sorted by OKS descending.
+        - ``valid_gt_idx``: indices into ``gt_list`` considered for matching.
+        - ``valid_pred_idx``: indices into ``pred_list`` considered for
+          matching.
     """
     sigmas = np.asarray(sigmas, dtype=np.float32)
     num_kpts = len(sigmas)
     oks_vars = (sigmas * 2.0) ** 2  # (K,)
-
-    num_pred = len(pred_list)
 
     # Separate valid GT from crowd / keypoint-free GT
     valid_gt_idx: List[int] = []
@@ -256,17 +254,8 @@ def match_instances_oks(
                 continue  # no labeled keypoints → can't match
         valid_gt_idx.append(gi)
 
-    num_valid_gt = len(valid_gt_idx)
-
-    base_metrics = {
-        'mean_oks': 0.0,
-        'num_pred': num_pred,
-        'num_gt': num_valid_gt,
-        'num_matched': 0,
-        'gt_recall': 0.0,
-    }
-    if num_valid_gt == 0 or num_pred == 0 or num_kpts == 0:
-        return [], base_metrics
+    if not valid_gt_idx or not pred_list or num_kpts == 0:
+        return [], valid_gt_idx, []
 
     # Pre-build pred keypoint array (N, K, 2) and track original indices
     pred_kpts_list: List[np.ndarray] = []
@@ -279,7 +268,7 @@ def match_instances_oks(
         valid_pred_idx.append(pi)
 
     if not pred_kpts_list:
-        return [], base_metrics
+        return [], valid_gt_idx, []
 
     pred_kpts_arr = np.stack(pred_kpts_list, axis=0)  # (N, K, 2)
 
@@ -304,6 +293,50 @@ def match_instances_oks(
             pairs.append((float(oks_val), gi, valid_pred_idx[row_pi]))
 
     pairs.sort(key=lambda x: x[0], reverse=True)
+    return pairs, valid_gt_idx, valid_pred_idx
+
+
+def match_instances_oks(
+    gt_list: List[dict],
+    pred_list: List[dict],
+    sigmas: np.ndarray,
+    match_thr: float = 0.5,
+) -> Tuple[List[dict], dict]:
+    """Greedy OKS matching aligned with COCOeval semantics.
+
+    Differences from a naive implementation:
+
+    * **Non-labeled keypoints excluded** – only GT keypoints with visibility
+      > 0 contribute to the OKS numerator and denominator (matches
+      ``COCOeval`` which applies ``e = e[vg > 0]``).
+    * **GT area only** – OKS is normalised by the GT object area, not the
+      average of GT and predicted areas.
+    * **iscrowd GT skipped** – crowd regions are not counted in ``num_gt``
+      and do not generate false negatives (matching ``COCOeval`` which
+      ignores crowd GT for recall).
+    * **k1 == 0 guard** – if a GT instance has no labeled keypoints, OKS is
+      0 (no match).
+
+    The GT visibility flag is taken from ``keypoints_visible_coco`` (raw COCO
+    0/1/2) when present, otherwise from ``keypoints_visible`` (binary 0/1).
+    Both representations mark labeled keypoints as v > 0.
+
+    See :func:`compute_oks_pairs` for the underlying pairwise-score
+    computation shared with other matching strategies.
+    """
+    num_pred = len(pred_list)
+    pairs, valid_gt_idx, _ = compute_oks_pairs(gt_list, pred_list, sigmas)
+    num_valid_gt = len(valid_gt_idx)
+
+    base_metrics = {
+        'mean_oks': 0.0,
+        'num_pred': num_pred,
+        'num_gt': num_valid_gt,
+        'num_matched': 0,
+        'gt_recall': 0.0,
+    }
+    if not pairs:
+        return [], base_metrics
 
     matched_gt: set = set()
     matched_pred: set = set()

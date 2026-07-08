@@ -11,7 +11,7 @@ Performance metrics cover FPS and per-frame/per-location latency at
 whole-pipeline and per-stage granularity.
 
 Data loading is unified via :func:`load_unified_samples`: all datasets
-(coco, crowdpose, mpii, aic, ochuman, emdb) go through one code path that
+(coco, crowdpose, mpii, aic, ochuman, emdb, 3dpw) go through one code path that
 loads every annotation unfiltered, converts keypoints to COCO-17 format,
 and prefetches images.  EMDB splits downscale prefetched images (default
 0.5×) to reduce RAM; GT annotations are scaled to match.  GT is never read
@@ -129,6 +129,7 @@ def build_evaluator(
     pose_cfg: Config,
     dataset_meta: dict,
     test_dataset: Optional[str] = None,
+    include_tracking_metrics: bool = False,
 ) -> Evaluator:
     """Build an mmengine Evaluator from the config's test_evaluator section.
 
@@ -141,6 +142,20 @@ def build_evaluator(
     :class:`BenchmarkTestDataset` specifies ``extra_metrics``, those metrics
     are appended to the evaluator **without** ``gt_from_samples`` injection
     (temporal metrics manage their own state via ``process()``).
+
+    Args:
+        pose_cfg: Pose config providing ``test_evaluator``.
+        dataset_meta: Dataset meta info (e.g. keypoint sigmas) assigned to
+            every built metric.
+        test_dataset: Optional benchmark dataset name used to look up
+            ``extra_metrics``.
+        include_tracking_metrics: When ``True``, unconditionally appends an
+            :class:`~mmpose.evaluation.metrics.IDSwitch` metric, independent
+            of ``test_dataset``.  It manages its own state via ``process()``
+            and reports zero switches when the evaluated predictions carry
+            no ``track_ids`` (e.g. no tracker in the post-processing
+            pipeline), so it is safe to enable whenever post-processed
+            (potentially tracked) predictions are being evaluated.
     """
     _init_scope(pose_cfg)
     ev_cfg = pose_cfg.test_evaluator
@@ -163,6 +178,11 @@ def build_evaluator(
                 m = METRICS.build(dict(m_cfg))
                 m.dataset_meta = dataset_meta
                 metrics.append(m)
+
+    if include_tracking_metrics:
+        m = METRICS.build(dict(type='IDSwitch'))
+        m.dataset_meta = dataset_meta
+        metrics.append(m)
 
     return Evaluator(metrics)
 
@@ -1479,7 +1499,8 @@ def main():
         [] if (args.model_name and postproc_by_img_id is not None) else None
     )
     pp_evaluator = (
-        build_evaluator(pose_cfg, dataset_meta, args.test_dataset)
+        build_evaluator(pose_cfg, dataset_meta, args.test_dataset,
+                        include_tracking_metrics=True)
         if postproc_by_img_id is not None else None
     )
 
