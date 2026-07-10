@@ -45,7 +45,7 @@ class BenchmarkTestDataset:
     preserve_evaluator: bool = False
     # Downscale factor applied when prefetching images (e.g. 0.5 halves
     # width/height).  GT bboxes/keypoints are scaled to match.  Reduces
-    # RAM and I/O for high-resolution datasets such as EMDB.
+    # RAM and I/O for high-resolution datasets.
     prefetch_scale: Optional[float] = None
     # Extra metric configs appended to the evaluator by build_evaluator in
     # benchmark_e2e.py.  These metrics receive dataset_meta but NOT
@@ -137,6 +137,7 @@ BENCHMARK_TEST_DATASETS: Dict[str, BenchmarkTestDataset] = {
         ann_file='annotations/threedpw_test.json',
         data_prefix=dict(img='imageFiles/'),
         keypoint_src='coco',
+        prefetch_scale=0.33333,
         extra_metrics=[
             dict(type='MPJVE', prefix='3dpw'),
             dict(type='MPJAE', prefix='3dpw'),
