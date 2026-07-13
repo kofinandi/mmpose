@@ -33,6 +33,7 @@ post_processor = dict(
         dict(
             type='OKSTracker',
             match_thr=0.5,
+            remember_frames=30,
         ),
         dict(
             type='SmoothNetSmoother',
