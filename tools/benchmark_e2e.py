@@ -505,17 +505,27 @@ def run_bottomup(
     pred_by_img_id: Dict[int, PoseDataSample] = {}
 
     for i, (batch, img_ids) in enumerate(batches):
-        batch['inputs'] = [t.to(device) for t in batch['inputs']]
+        # Build a per-iteration batch with GPU inputs.  Do NOT write the GPU
+        # tensors back into ``batch`` (which lives in the persistent
+        # ``batches`` list), otherwise every batch's inputs stay resident on
+        # the GPU for the whole loop and memory grows until it OOMs.
+        gpu_batch = dict(batch)
+        gpu_batch['inputs'] = [t.to(device) for t in batch['inputs']]
 
         with torch.no_grad():
             with _CudaTimer() as timer:
-                results = model.test_step(batch)
+                results = model.test_step(gpu_batch)
 
         if i >= warmup_batches:
             batch_latencies.append((timer.elapsed_s, len(results)))
 
         for ds, img_id in zip(results, img_ids):
             pred_by_img_id[img_id] = ds
+
+        # Release the GPU input tensors for this batch before moving on.
+        del gpu_batch, results
+        # Drop the CPU copy too so the prefetched batch is not kept twice.
+        batches[i] = None
 
         if (i + 1) % log_interval == 0 or (i + 1) == n_batches:
             frames_done = sum(k for _, k in batch_latencies)
