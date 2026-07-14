@@ -459,8 +459,12 @@ def run_bottomup(
 ) -> Tuple[Dict[int, PoseDataSample], dict]:
     """Run bottomup inference on unified samples.
 
-    Pre-builds all batches (images are already prefetched) then runs the
-    timed model loop.  GT and evaluation are handled in :func:`main`.
+    Builds each batch lazily right before it is consumed (images are
+    already prefetched, so this only pays pipeline/collation cost, not
+    disk I/O) instead of pre-building every batch up front.  This keeps
+    peak RAM at roughly one batch's worth of preprocessed tensors instead
+    of the whole dataset at model-input resolution.  GT and evaluation are
+    handled in :func:`main`.
 
     Args:
         model: Bottomup pose estimator.
@@ -477,11 +481,16 @@ def run_bottomup(
         pred_by_img_id: Mapping ``img_id → PoseDataSample`` (prediction only).
         perf: Performance-metric dict.
     """
-    print('Building bottomup batches ...')
-    batches: List[Tuple[dict, List[int]]] = []
     n = len(samples)
-    for start in range(0, n, kp_batch_size):
+    n_batches = (n + kp_batch_size - 1) // kp_batch_size
+
+    batch_latencies: List[Tuple[float, int]] = []
+    pred_by_img_id: Dict[int, PoseDataSample] = {}
+
+    for i in range(n_batches):
+        start = i * kp_batch_size
         end = min(start + kp_batch_size, n)
+
         items = []
         img_ids = []
         for sample in samples[start:end]:
@@ -498,19 +507,16 @@ def run_bottomup(
             di.update(dataset_meta)
             items.append(val_pipeline(di))
             img_ids.append(sample.img_id)
-        batches.append((pseudo_collate(items), img_ids))
+        batch = pseudo_collate(items)
+        del items
 
-    batch_latencies: List[Tuple[float, int]] = []
-    n_batches = len(batches)
-    pred_by_img_id: Dict[int, PoseDataSample] = {}
-
-    for i, (batch, img_ids) in enumerate(batches):
         # Build a per-iteration batch with GPU inputs.  Do NOT write the GPU
-        # tensors back into ``batch`` (which lives in the persistent
-        # ``batches`` list), otherwise every batch's inputs stay resident on
-        # the GPU for the whole loop and memory grows until it OOMs.
+        # tensors back into ``batch``, otherwise every batch's inputs stay
+        # resident on the GPU for the whole loop and memory grows until it
+        # OOMs.
         gpu_batch = dict(batch)
         gpu_batch['inputs'] = [t.to(device) for t in batch['inputs']]
+        del batch
 
         with torch.no_grad():
             with _CudaTimer() as timer:
@@ -524,8 +530,6 @@ def run_bottomup(
 
         # Release the GPU input tensors for this batch before moving on.
         del gpu_batch, results
-        # Drop the CPU copy too so the prefetched batch is not kept twice.
-        batches[i] = None
 
         if (i + 1) % log_interval == 0 or (i + 1) == n_batches:
             frames_done = sum(k for _, k in batch_latencies)
