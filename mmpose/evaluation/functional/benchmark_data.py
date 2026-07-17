@@ -22,6 +22,10 @@ from mmengine.registry import DATASETS, TRANSFORMS, init_default_scope
 from mmpose.evaluation.benchmark_datasets import BENCHMARK_TEST_DATASETS
 from mmpose.structures.bbox import bbox_xyxy2xywh
 
+# Dataset types that accept a `good_frame_mask` kwarg (see EmdbDataset /
+# ThreeDPWDataset). Only these support --include-bad-frames.
+_SUPPORTS_GOOD_FRAME_MASK = {'EmdbDataset', 'ThreeDPWDataset'}
+
 
 # ---------------------------------------------------------------------------
 # Data containers
@@ -121,6 +125,7 @@ def _scale_gt_instances(
 def load_unified_samples(
     dataset_name: str,
     num_frames: Optional[int] = None,
+    include_bad_frames: bool = False,
 ) -> List[UnifiedSample]:
     """Load GT annotations and prefetch images for all supported datasets.
 
@@ -137,6 +142,18 @@ def load_unified_samples(
         dataset_name: One of ``'coco', 'crowdpose', 'mpii', 'aic',
             'ochuman', 'emdb', 'emdb-mini', '3dpw'``.
         num_frames: If set, cap the number of unique images loaded.
+        include_bad_frames: Only meaningful for datasets whose loader
+            supports a ``good_frame_mask`` kwarg (EMDB, 3DPW). When
+            ``True``, overrides that kwarg to ``False`` so frames dropped
+            for lacking reliable GT (e.g. EMDB ``invalid_idxs``, 3DPW
+            frames with no valid actor) are still loaded -- with an image
+            but no GT instances -- giving downstream consumers (e.g. the
+            post-processing tracker) a temporally continuous frame
+            sequence. These frames may produce false-positive detections
+            that affect detection/pose metrics; temporal metrics
+            (MPJVE/MPJAE) exclude them regardless, via frame_id-gap
+            masking. Ignored (with a warning) for datasets that don't
+            support the kwarg. Default: ``False``.
 
     Returns:
         List of :class:`UnifiedSample` in dataset order.
@@ -163,6 +180,14 @@ def load_unified_samples(
     )
     if spec.dataset_kwargs:
         ds_cfg.update(spec.dataset_kwargs)
+    if include_bad_frames:
+        if spec.dataset_type in _SUPPORTS_GOOD_FRAME_MASK:
+            ds_cfg['good_frame_mask'] = False
+        else:
+            print(
+                f'Warning: --include-bad-frames has no effect on '
+                f'{dataset_name!r} ({spec.dataset_type!r} has no '
+                f'good_frame_mask concept); ignoring.')
     keypoint_src = spec.keypoint_src
 
     # Build dataset with lazy_init=True so full_init (which calls

@@ -102,7 +102,7 @@ BENCHMARK_TEST_DATASETS: Dict[str, BenchmarkTestDataset] = {
         dataset_kwargs=dict(
             emdb1=True,
             emdb2=False,
-            good_frame_mask=False,
+            good_frame_mask=True,
         ),
         extra_metrics=[
             dict(type='MPJVE', prefix='emdb'),
@@ -121,7 +121,7 @@ BENCHMARK_TEST_DATASETS: Dict[str, BenchmarkTestDataset] = {
         dataset_kwargs=dict(
             emdb1=True,
             emdb2=False,
-            good_frame_mask=False,
+            good_frame_mask=True,
             max_frames_per_sequence=300,
         ),
         extra_metrics=[
@@ -138,6 +138,7 @@ BENCHMARK_TEST_DATASETS: Dict[str, BenchmarkTestDataset] = {
         data_prefix=dict(img='imageFiles/'),
         keypoint_src='coco',
         prefetch_scale=0.33333,
+        dataset_kwargs=dict(good_frame_mask=True),
         extra_metrics=[
             dict(type='MPJVE', prefix='3dpw'),
             dict(type='MPJAE', prefix='3dpw'),

@@ -317,6 +317,7 @@ def _attach_gt_to_posedatasample(
     """
     gt_insts = sample.gt_instances
     n = len(gt_insts)
+    num_kpts = 17  # COCO default; may be overridden if model differs
 
     gt = InstanceData()
     if n > 0:
@@ -339,6 +340,15 @@ def _attach_gt_to_posedatasample(
                 [v if v is not None else g.keypoints_visible
                  for v, g in zip(kv_coco_list, gt_insts)],
                 axis=0).astype(np.float32)
+    else:
+        # No GT this frame (e.g. a "bad" EMDB/3DPW frame loaded via
+        # --include-bad-frames), set explicit zero-length arrays.
+        gt.keypoints = np.zeros((0, num_kpts, 2), dtype=np.float32)
+        gt.keypoints_visible = np.zeros((0, num_kpts), dtype=np.float32)
+        gt.bboxes = np.zeros((0, 4), dtype=np.float32)
+        gt.orig_areas = np.zeros(0, dtype=np.float32)
+        gt.iscrowd = np.zeros(0, dtype=np.int32)
+        gt.track_ids = np.zeros(0, dtype=np.int32)
 
     ds.gt_instances = gt
 
@@ -1325,6 +1335,15 @@ def _parse_args():
                    help='Inference device (default: cuda:0)')
     p.add_argument('--num-frames', type=int, default=None,
                    help='Cap number of images evaluated (default: full val set)')
+    p.add_argument(
+        '--include-bad-frames', action='store_true',
+        help='EMDB/3DPW only: also load frames normally excluded for '
+             'lacking reliable GT (e.g. EMDB invalid_idxs, 3DPW frames with '
+             'no valid actor), so post-processing sees a temporally '
+             'continuous frame sequence. These frames have no GT and may '
+             'produce false-positive detections that affect detection/pose '
+             'metrics; temporal metrics (MPJVE/MPJAE) still exclude them '
+             'via frame_id-gap masking. No effect on other datasets.')
     p.add_argument('--warmup-batches', type=int, default=3,
                    help='Leading batches excluded from timing (default: 3)')
     p.add_argument('--bbox-thr', type=float, default=0.3,
@@ -1416,7 +1435,9 @@ def main():
 
     # ── Unified data loading ───────────────────────────────────────────────
     print(f'\nLoading dataset: {args.test_dataset}')
-    samples = load_unified_samples(args.test_dataset, args.num_frames)
+    samples = load_unified_samples(
+        args.test_dataset, args.num_frames,
+        include_bad_frames=args.include_bad_frames)
     n_images = len(samples)
     data_root = _data_root_for_dataset(args.test_dataset)
 

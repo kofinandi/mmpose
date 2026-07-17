@@ -132,26 +132,36 @@ def process_emdb(data_root, out_dir):
         rel_prefix = osp.join(subject_dir, sequence_dir, 'images')
 
         for frame_idx in range(n_frames):
-            if frame_idx in invalid_idxs:
-                continue
-
-            bbox_xyxy = bboxes_xyxy[frame_idx]
-            bw = bbox_xyxy[2] - bbox_xyxy[0]
-            bh = bbox_xyxy[3] - bbox_xyxy[1]
-            if bw <= 0 or bh <= 0:
-                continue
-
+            # Hard drop: without pixels on disk there is nothing to load,
+            # regardless of good/bad status. This is the only condition
+            # that removes a frame from the annotation file entirely.
             img_filename = osp.join(rel_prefix, f'{frame_idx:05d}.jpg')
             abs_img_path = osp.join(data_root, img_filename)
             if not osp.exists(abs_img_path):
                 continue
 
-            kpts_coco17 = _smpl24_to_coco17(kp2d[frame_idx])
-            if kpts_coco17[:, 2].sum() == 0:
-                continue
+            # Soft validity: everything below marks the frame as a "bad"
+            # frame (good_frame=False) but the frame is still kept -- with
+            # an image entry and no annotation -- so downstream consumers
+            # can optionally include it for temporal continuity (e.g. the
+            # post-processing tracker) while excluding it from GT-based
+            # metrics by default.
+            #
+            # `good_frame` is intentionally defined as "would have been
+            # kept by the previous (drop-only) preprocessing logic", not
+            # merely EMDB's raw `good_frames_mask`, so that the default
+            # (good_frame_mask=True) load-time filter reproduces the
+            # previous frame set exactly.
+            bbox_xyxy = bboxes_xyxy[frame_idx]
+            bw = bbox_xyxy[2] - bbox_xyxy[0]
+            bh = bbox_xyxy[3] - bbox_xyxy[1]
+            bbox_ok = bw > 0 and bh > 0
 
-            bbox = _xyxy_to_xywh(bbox_xyxy)
-            good_frame = bool(good_frames_mask[frame_idx])
+            kpts_coco17 = _smpl24_to_coco17(kp2d[frame_idx])
+            kpts_ok = bool(kpts_coco17[:, 2].sum() > 0)
+
+            is_invalid_idx = frame_idx in invalid_idxs
+            good_frame = (not is_invalid_idx) and bbox_ok and kpts_ok
 
             img_id_counter += 1
             img_entry = {
@@ -168,6 +178,10 @@ def process_emdb(data_root, out_dir):
             }
             images.append(img_entry)
 
+            if not good_frame:
+                continue
+
+            bbox = _xyxy_to_xywh(bbox_xyxy)
             kpts_flat = kpts_coco17.reshape(-1).tolist()
             num_visible = int((kpts_coco17[:, 2] > 0).sum())
 

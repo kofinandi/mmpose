@@ -151,9 +151,6 @@ def process_split(data_root, split, out_dir):
     ann_id_counter = 0
     track_id_counter = 0
 
-    # Map (seq_name, frame_idx) -> image_id to deduplicate image entries when
-    # multiple actors share the same frame.
-    img_key_to_id = {}
     # Map (seq_name, actor_idx) -> track_id; each actor in a sequence is a
     # single persistent track across all frames.
     track_key_to_id = {}
@@ -172,63 +169,73 @@ def process_split(data_root, split, out_dir):
 
         n_frames = poses2d_list[0].shape[0]
 
+        # Assign a globally unique track ID for every (sequence, actor),
+        # regardless of per-frame validity.
+        track_ids = []
         for actor_idx in range(n_actors):
-            actor_kpts = poses2d_list[actor_idx]  # (n_frames, 3, 18)
-
-            # Assign a globally unique track ID for this (sequence, actor).
             track_key = (seq_name, actor_idx)
             if track_key not in track_key_to_id:
                 track_id_counter += 1
                 track_key_to_id[track_key] = track_id_counter
-            track_id = track_key_to_id[track_key]
+            track_ids.append(track_key_to_id[track_key])
 
-            for frame_idx in range(n_frames):
+        # Iterate frame-outer (rather than actor-outer) so every frame with
+        # an on-disk image gets exactly one image entry -- including "bad"
+        # frames where no actor has a valid annotation. Those are kept with
+        # `good_frame=False` and no annotations so consumers needing a
+        # continuous frame sequence (e.g. temporal post-processing) can
+        # still see every frame, while GT-based metrics exclude them by
+        # default via the `good_frame_mask` dataset filter.
+        for frame_idx in range(n_frames):
+            # Hard drop: without pixels on disk there is nothing to load.
+            img_filename = osp.join(seq_name, f'image_{frame_idx:05d}.jpg')
+            abs_img_path = osp.join(img_root, img_filename)
+            if not osp.exists(abs_img_path):
+                continue
 
-                # Only use frames with valid camera alignment
+            img_h, img_w = _get_img_dims(abs_img_path)
+            if img_h is None:
+                continue
+
+            # `good_frame` is defined as "would have been kept by the
+            # previous (drop-only) preprocessing logic", i.e. at least one
+            # actor has valid camera alignment, visible keypoints, and a
+            # usable bbox this frame. This makes the default
+            # (good_frame_mask=True) load-time filter reproduce the
+            # previous frame set exactly.
+            frame_anns = []
+            for actor_idx in range(n_actors):
                 if not campose_valid[actor_idx, frame_idx]:
                     continue
 
-                frame_kpts_op18 = actor_kpts[frame_idx]  # (3, 18)
+                frame_kpts_op18 = poses2d_list[actor_idx][frame_idx]
                 kpts_coco17 = _openpose18_to_coco17(frame_kpts_op18)
-
-                # Skip if no visible keypoints
                 if kpts_coco17[:, 2].sum() == 0:
-                    continue
-
-                # Construct image file path
-                img_filename = osp.join(
-                    seq_name, f'image_{frame_idx:05d}.jpg')
-                abs_img_path = osp.join(img_root, img_filename)
-
-                if not osp.exists(abs_img_path):
-                    continue
-
-                img_h, img_w = _get_img_dims(abs_img_path)
-                if img_h is None:
                     continue
 
                 bbox = _compute_bbox(kpts_coco17, img_h, img_w)
                 if bbox is None:
                     continue
 
-                # Register image entry (shared across actors in same frame)
-                img_key = (seq_name, frame_idx)
-                if img_key not in img_key_to_id:
-                    img_id_counter += 1
-                    img_entry = {
-                        'id': img_id_counter,
-                        'file_name': img_filename,
-                        'width': img_w,
-                        'height': img_h,
-                        'nframes': n_frames,
-                        'frame_id': frame_idx,
-                        'seq_name': seq_name,
-                    }
-                    images.append(img_entry)
-                    img_key_to_id[img_key] = img_id_counter
+                frame_anns.append((track_ids[actor_idx], kpts_coco17, bbox))
 
-                image_id = img_key_to_id[img_key]
+            good_frame = len(frame_anns) > 0
 
+            img_id_counter += 1
+            img_entry = {
+                'id': img_id_counter,
+                'file_name': img_filename,
+                'width': img_w,
+                'height': img_h,
+                'nframes': n_frames,
+                'frame_id': frame_idx,
+                'seq_name': seq_name,
+                'good_frame': good_frame,
+            }
+            images.append(img_entry)
+            image_id = img_id_counter
+
+            for track_id, kpts_coco17, bbox in frame_anns:
                 # Flatten keypoints: [x, y, v, x, y, v, ...]
                 kpts_flat = kpts_coco17.reshape(-1).tolist()
                 num_visible = int((kpts_coco17[:, 2] > 0).sum())

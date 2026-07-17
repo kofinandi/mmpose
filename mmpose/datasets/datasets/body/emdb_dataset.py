@@ -29,8 +29,15 @@ class EmdbDataset(BaseCocoStyleDataset):
             Default: ``False``.
         emdb2 (bool): If ``True``, load only EMDB 2 benchmark sequences.
             Default: ``False``. Cannot be ``True`` together with ``emdb1``.
-        good_frame_mask (bool): If ``True``, load only frames marked valid
-            in ``good_frames_mask``. Default: ``True``.
+        good_frame_mask (bool): If ``True``, load only frames whose
+            ``good_frame`` annotation field is ``True`` (i.e. exclude
+            frames dropped by ``tools/dataset_converters/preprocess_emdb.py``
+            due to EMDB's ``invalid_idxs``, a degenerate bbox, or no visible
+            keypoints). If ``False``, all frames with an existing image file
+            are loaded, including "bad" frames -- which carry no GT
+            annotations -- so that consumers needing a continuous frame
+            sequence (e.g. temporal post-processing) can still see every
+            frame. Default: ``True``.
         max_frames_per_sequence (int, optional): If set, keep at most this
             many frames per ``seq_name``, chosen by ascending ``frame_id``.
             Useful for lightweight benchmark splits (e.g. ``emdb-mini``).

@@ -1,8 +1,10 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import os.path as osp
-from typing import Callable, List, Optional, Sequence, Union
+from typing import Callable, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
+from mmengine.fileio import exists, get_local_path
+from xtcocotools.coco import COCO
 
 from mmpose.registry import DATASETS
 from ..base import BaseCocoStyleDataset
@@ -59,9 +61,62 @@ class ThreeDPWDataset(BaseCocoStyleDataset):
             Default: ``False``.
         max_refetch (int, optional): Max cycles to fetch a valid sample.
             Default: ``1000``.
+        good_frame_mask (bool): If ``True``, load only frames whose
+            ``good_frame`` annotation field is ``True`` (i.e. exclude frames
+            dropped by ``tools/dataset_converters/preprocess_threedpw.py``
+            because no actor had valid camera alignment, visible keypoints,
+            and a usable bbox that frame). If ``False``, all frames with an
+            existing image file are loaded, including "bad" frames -- which
+            carry no GT annotations -- so that consumers needing a
+            continuous frame sequence (e.g. temporal post-processing) can
+            still see every frame. Default: ``True``.
     """
 
     METAINFO: dict = dict(from_file='configs/_base_/datasets/threedpw.py')
+
+    def __init__(self,
+                 good_frame_mask: bool = True,
+                 **kwargs) -> None:
+        self.good_frame_mask = good_frame_mask
+        super().__init__(**kwargs)
+
+    def _load_annotations(self) -> Tuple[List[dict], List[dict]]:
+        """Load COCO annotations with an optional good-frame filter."""
+        assert exists(self.ann_file), (
+            f'Annotation file `{self.ann_file}`does not exist')
+
+        with get_local_path(self.ann_file) as local_path:
+            self.coco = COCO(local_path)
+        if 'categories' in self.coco.dataset:
+            self._metainfo['CLASSES'] = self.coco.loadCats(
+                self.coco.getCatIds())
+
+        instance_list = []
+        image_list = []
+
+        for img_id in self.coco.getImgIds():
+            if img_id % self.sample_interval != 0:
+                continue
+            img = self.coco.loadImgs(img_id)[0]
+
+            if self.good_frame_mask and not img.get('good_frame', True):
+                continue
+
+            img.update({
+                'img_id': img_id,
+                'img_path': osp.join(self.data_prefix['img'], img['file_name']),
+            })
+            image_list.append(img)
+
+            ann_ids = self.coco.getAnnIds(imgIds=img_id)
+            for ann in self.coco.loadAnns(ann_ids):
+                instance_info = self.parse_data_info(
+                    dict(raw_ann_info=ann, raw_img_info=img))
+                if not instance_info:
+                    continue
+                instance_list.append(instance_info)
+
+        return instance_list, image_list
 
 
 @DATASETS.register_module()

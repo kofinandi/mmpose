@@ -48,6 +48,7 @@ run_benchmark() {
         --results-file "$RESULTS_FILE" \
         --model-name "$name" \
         --model-variant "$variant" \
+        --include-bad-frames \
         >"$log_file" 2>&1; then
         PASSED=$((PASSED + 1))
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] Finished: ${name} / ${variant}"

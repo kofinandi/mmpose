@@ -192,8 +192,19 @@ class _TemporalBaseMetric(BaseMetric):
             pred = data_sample['pred_instances']
             gt = data_sample['gt_instances']
 
-            pred_kpts = np.asarray(pred['keypoints'])
-            gt_kpts = np.asarray(gt['keypoints'])
+            # `gt_instances`/`pred_instances` may have no `keypoints` field
+            # at all (rather than a zero-length array) when a frame has zero
+            # GT or zero detections -- e.g. a "bad" EMDB/3DPW frame loaded
+            # via --include-bad-frames, which carries no GT annotations.
+            # Treat a missing field the same as zero instances instead of
+            # raising a KeyError.
+            pred_kpts_raw = pred.get('keypoints')
+            gt_kpts_raw = gt.get('keypoints')
+            if pred_kpts_raw is None or gt_kpts_raw is None:
+                continue
+
+            pred_kpts = np.asarray(pred_kpts_raw)
+            gt_kpts = np.asarray(gt_kpts_raw)
 
             # Normalise leading singleton dims (single-instance topdown path)
             if pred_kpts.ndim == 2:
@@ -288,7 +299,25 @@ class _TemporalBaseMetric(BaseMetric):
     def _build_tracks(
         self, results: List[dict]
     ) -> Dict[int, Dict[str, object]]:
-        """Group and sort per-sample results into per-track dicts.
+        """Group per-sample results into per-track dicts, densified by
+        ``frame_id`` so temporal gaps become explicit masked-out rows.
+
+        A track's matched frames are not necessarily consecutive: a
+        detector miss, an OKS mismatch, or an upstream dataset gap (e.g.
+        EMDB ``invalid_idxs``, 3DPW frames with no valid actor) all leave
+        a hole in ``frame_id``. Naively stacking only the matched frames
+        would make frames on either side of such a hole appear adjacent to
+        :func:`keypoint_mpjve`/:func:`keypoint_mpjae`, which assume a
+        constant, unit frame spacing -- silently inflating the velocity /
+        acceleration error across the gap.
+
+        To avoid this, the track is expanded onto a contiguous
+        ``frame_id`` grid spanning ``[min(frame_id), max(frame_id)]``; any
+        missing ``frame_id`` becomes a row with an all-``False`` visibility
+        mask. The existing pairwise/triplet masking in
+        :func:`keypoint_mpjve`/:func:`keypoint_mpjae` then naturally
+        excludes every pair or triplet touching such a row, so only truly
+        consecutive frames contribute to the error.
 
         Returns:
             dict: Mapping from ``track_id`` to a dict with numpy arrays
@@ -303,20 +332,50 @@ class _TemporalBaseMetric(BaseMetric):
         tracks = {}
         for tid, frames in raw.items():
             frames.sort(key=lambda x: x['frame_id'])
+            by_fid = {f['frame_id']: f for f in frames}
+            first_fid = frames[0]['frame_id']
+            last_fid = frames[-1]['frame_id']
+
+            zero_kpts = np.zeros_like(frames[0]['pred_coords'])
+            false_mask = np.zeros(zero_kpts.shape[0], dtype=bool)
+            scale_keys = [
+                k for k in ('bbox_size', 'head_size', 'torso_size')
+                if k in frames[0]
+            ]
+
+            pred_rows, gt_rows, mask_rows = [], [], []
+            scale_rows: Dict[str, list] = {k: [] for k in scale_keys}
+            for fid in range(first_fid, last_fid + 1):
+                f = by_fid.get(fid)
+                if f is not None:
+                    pred_rows.append(f['pred_coords'])
+                    gt_rows.append(f['gt_coords'])
+                    mask_rows.append(f['mask'])
+                    for k in scale_keys:
+                        scale_rows[k].append(f[k])
+                else:
+                    # Gap row: mask=False excludes every pair/triplet that
+                    # touches it, so the fabricated zero coords never
+                    # contribute to the error. `1.0` scale is a neutral
+                    # placeholder (never used, but avoids a division by 0
+                    # were a neighbouring valid pair to reference it).
+                    pred_rows.append(zero_kpts)
+                    gt_rows.append(zero_kpts)
+                    mask_rows.append(false_mask)
+                    for k in scale_keys:
+                        scale_rows[k].append(1.0)
+
             entry: dict = dict(
-                pred=np.stack([f['pred_coords'] for f in frames]),
-                gt=np.stack([f['gt_coords'] for f in frames]),
-                mask=np.stack([f['mask'] for f in frames]),
+                pred=np.stack(pred_rows),
+                gt=np.stack(gt_rows),
+                mask=np.stack(mask_rows),
             )
-            if 'bbox_size' in frames[0]:
-                entry['bbox_scale'] = np.array(
-                    [f['bbox_size'] for f in frames])
-            if 'head_size' in frames[0]:
-                entry['head_scale'] = np.array(
-                    [f['head_size'] for f in frames])
-            if 'torso_size' in frames[0]:
-                entry['torso_scale'] = np.array(
-                    [f['torso_size'] for f in frames])
+            if 'bbox_size' in scale_keys:
+                entry['bbox_scale'] = np.array(scale_rows['bbox_size'])
+            if 'head_size' in scale_keys:
+                entry['head_scale'] = np.array(scale_rows['head_size'])
+            if 'torso_size' in scale_keys:
+                entry['torso_scale'] = np.array(scale_rows['torso_size'])
             tracks[tid] = entry
         return tracks
 
