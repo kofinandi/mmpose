@@ -18,9 +18,11 @@ Example usage::
 """
 
 from .base import BaseFilter, sequence_key_from_path
-from .filters import GPKalmanSmoother, OKSTracker, OneEuroSmoother, SmoothNetSmoother
+from .filters import (GPKalmanSmoother, OKSTracker, OneEuroSmoother,
+                       PredictiveTracker, SmoothNetSmoother)
 from .pipeline import PostProcessingPipeline, build_post_processor
-from .registry import POST_PROCESS_FILTERS
+from .predictors import BasePredictor, GPKalmanPredictor, build_predictor
+from .registry import POST_PROCESS_FILTERS, POST_PROCESS_PREDICTORS
 
 __all__ = [
     'BaseFilter',
@@ -29,7 +31,12 @@ __all__ = [
     'OKSTracker',
     'OneEuroSmoother',
     'SmoothNetSmoother',
+    'PredictiveTracker',
     'PostProcessingPipeline',
     'build_post_processor',
+    'BasePredictor',
+    'GPKalmanPredictor',
+    'build_predictor',
     'POST_PROCESS_FILTERS',
+    'POST_PROCESS_PREDICTORS',
 ]

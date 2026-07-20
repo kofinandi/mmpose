@@ -8,3 +8,4 @@ built without triggering the full mmpose model/dataset scope.
 from mmengine.registry import Registry
 
 POST_PROCESS_FILTERS = Registry('post_process_filters')
+POST_PROCESS_PREDICTORS = Registry('post_process_predictors')
