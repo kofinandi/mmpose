@@ -1122,6 +1122,24 @@ def _prediction_out_dir(args, run_date: str, is_topdown: bool) -> str:
     return osp.join('benchmark', 'predictions', tag, model_label)
 
 
+def _postproc_out_dir(base_dir: str, postproc_name: str) -> str:
+    """Build the post-processed output dir next to the run folder.
+
+    ``base_dir`` is the (raw) prediction bundle dir, e.g.
+    ``benchmark/predictions/20260715_emdb_e2e/YOLO-Pose-tiny``. The
+    post-processed bundle is saved as a sibling of the run folder
+    (``20260715_emdb_e2e``) with ``postproc_name`` appended to its name,
+    e.g. ``benchmark/predictions/20260715_emdb_e2e_smoothnetw8/YOLO-Pose-tiny``.
+    """
+    base_dir_abs = osp.abspath(base_dir)
+    model_label = osp.basename(base_dir_abs)
+    run_dir = osp.dirname(base_dir_abs)
+    run_name = osp.basename(run_dir)
+    predictions_dir = osp.dirname(run_dir)
+    return osp.join(predictions_dir, f'{run_name}_{postproc_name}',
+                    model_label)
+
+
 def _filter_pred_for_saving(
     ds: PoseDataSample,
     score_thr: float,
@@ -1216,9 +1234,9 @@ def _save_predictions_postproc(
     run_date: str,
     post_config: Optional[str] = None,
 ) -> None:
-    """Save the post-processed prediction bundle to a sibling __postproc dir."""
+    """Save the post-processed prediction bundle next to the run folder."""
     base_dir = _prediction_out_dir(args, run_date, is_topdown)
-    out_dir = base_dir + '__postproc'
+    out_dir = _postproc_out_dir(base_dir, args.postproc_name)
 
     manifest = {
         'timestamp': datetime.now().isoformat(timespec='seconds'),
@@ -1388,6 +1406,15 @@ def _parse_args():
              '(e.g. configs/post_processing/oks_track_one_euro.py). '
              'When provided both raw and post-processed outputs are '
              'evaluated and saved separately.')
+    p.add_argument(
+        '--postproc-name', default=None,
+        help='Name of this post-processing run (e.g. "smoothnetw8"). '
+             'Used to save the post-processed bundle next to the run '
+             'folder, with "_<postproc-name>" appended to its name (e.g. '
+             'benchmark/predictions/20260715_emdb_e2e/YOLO-Pose-tiny -> '
+             'benchmark/predictions/20260715_emdb_e2e_smoothnetw8/'
+             'YOLO-Pose-tiny). Required when --post-config and '
+             '--model-name are both specified.')
     return p.parse_args()
 
 
@@ -1432,6 +1459,12 @@ def main():
         raise ValueError(
             '--det-metrics requires topdown mode '
             '(pass --det-config/--det-checkpoint or --mock-detector).')
+    if (getattr(args, 'post_config', None) and args.model_name
+            and not getattr(args, 'postproc_name', None)):
+        raise ValueError(
+            '--postproc-name is required when both --post-config and '
+            '--model-name are specified (used to name the post-processed '
+            'output run folder).')
 
     # ── Unified data loading ───────────────────────────────────────────────
     print(f'\nLoading dataset: {args.test_dataset}')

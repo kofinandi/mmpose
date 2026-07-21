@@ -1,13 +1,18 @@
 #!/bin/bash
 # Run postprocess_predictions.py on every prediction bundle under one or more
 # directories. Each bundle must contain manifest.json and frames.json.
-# Output goes to the default sibling directory (<pred_dir>__postproc).
+# Output goes to a sibling of the run folder containing each bundle, with
+# "_<postproc-name>" appended to the run folder's name, e.g.:
+#   benchmark/predictions/20260715_emdb_e2e/YOLO-Pose-tiny
+#   -->
+#   benchmark/predictions/20260715_emdb_e2e_smoothnetw8/YOLO-Pose-tiny
 
 set -uo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TIMESTAMP="$(date '+%Y%m%d')"
 POST_CONFIG="${POST_CONFIG:-}"
+POSTPROC_NAME="${POSTPROC_NAME:-}"
 NUM_FRAMES="${NUM_FRAMES:-}"
 RESULTS_FILE="${RESULTS_FILE:-}"
 LOG_DIR="${LOG_DIR:-${ROOT_DIR}/benchmark/logs/${TIMESTAMP}_postproc}"
@@ -16,29 +21,35 @@ METRICS_WERE_SET=0
 
 usage() {
     cat <<EOF
-Usage: $(basename "$0") --post-config CONFIG [OPTIONS] PRED_PARENT_DIR [PRED_PARENT_DIR ...]
+Usage: $(basename "$0") --post-config CONFIG --postproc-name NAME [OPTIONS] PRED_PARENT_DIR [PRED_PARENT_DIR ...]
 
 Apply the same post-processing pipeline to every prediction bundle found under
 the given directories. A bundle is a directory containing manifest.json and
 frames.json (e.g. benchmark/predictions/DATE_DATASET_MODE/MODEL-VARIANT/).
 
 Options:
-  --post-config PATH   Post-processing config (required unless POST_CONFIG is set)
-  --metrics M1 M2 ...  Metrics to evaluate (default: CocoMetric MPJVE MPJAE)
-  --num-frames N       Limit to the first N frames (for quick tests)
-  --results-file PATH  Append metrics to this JSON file after each run
-  -h, --help           Show this help
+  --post-config PATH    Post-processing config (required unless POST_CONFIG is set)
+  --postproc-name NAME  Name of this post-processing run, e.g. "smoothnetw8"
+                        (required unless POSTPROC_NAME is set). Used to build
+                        the output dir by appending "_NAME" to the run folder
+                        name containing each bundle.
+  --metrics M1 M2 ...   Metrics to evaluate (default: CocoMetric MPJVE MPJAE)
+  --num-frames N        Limit to the first N frames (for quick tests)
+  --results-file PATH   Append metrics to this JSON file after each run
+  -h, --help            Show this help
 
 Environment:
-  POST_CONFIG, METRICS, NUM_FRAMES, RESULTS_FILE, LOG_DIR
+  POST_CONFIG, POSTPROC_NAME, METRICS, NUM_FRAMES, RESULTS_FILE, LOG_DIR
 
 Examples:
   $(basename "$0") \\
       --post-config configs/post_processing/oks_track_one_euro.py \\
+      --postproc-name one_euro \\
       --results-file benchmark/results/${TIMESTAMP}_postproc.json \\
       benchmark/predictions/20260615_coco_topdown
 
   POST_CONFIG=configs/post_processing/oks_track_one_euro.py \\
+      POSTPROC_NAME=one_euro \\
       RESULTS_FILE=benchmark/results/${TIMESTAMP}_postproc.json \\
       $(basename "$0") benchmark/predictions/20260615_coco_topdown \\
       benchmark/predictions/20260615_coco_e2e
@@ -62,7 +73,6 @@ collect_bundles() {
     shopt -s nullglob
     for sub in "$dir"/*; do
         [[ -d "$sub" ]] || continue
-        [[ "$sub" == *__postproc ]] && continue
         if is_prediction_bundle "$sub"; then
             printf '%s\n' "$sub"
         fi
@@ -80,6 +90,11 @@ while [[ $# -gt 0 ]]; do
         --post-config)
             [[ $# -ge 2 ]] || { echo "Error: --post-config requires a path" >&2; exit 1; }
             POST_CONFIG="$2"
+            shift 2
+            ;;
+        --postproc-name)
+            [[ $# -ge 2 ]] || { echo "Error: --postproc-name requires a value" >&2; exit 1; }
+            POSTPROC_NAME="$2"
             shift 2
             ;;
         --metrics)
@@ -131,6 +146,12 @@ if [[ -z "$POST_CONFIG" ]]; then
     exit 1
 fi
 
+if [[ -z "$POSTPROC_NAME" ]]; then
+    echo "Error: --postproc-name is required (or set POSTPROC_NAME)" >&2
+    usage >&2
+    exit 1
+fi
+
 if ((${#PRED_DIRS[@]} == 0)); then
     echo "Error: at least one prediction directory is required" >&2
     usage >&2
@@ -170,11 +191,17 @@ run_postprocess() {
     local rel="${pred_dir#${ROOT_DIR}/}"
     local log_slug="${rel//\//__}"
     local log_file="${LOG_DIR}/${log_slug}.log"
-    local out_dir="${pred_dir}__postproc"
+    local model_label run_dir run_name predictions_dir out_dir
+    model_label="$(basename "$pred_dir")"
+    run_dir="$(dirname "$pred_dir")"
+    run_name="$(basename "$run_dir")"
+    predictions_dir="$(dirname "$run_dir")"
+    out_dir="${predictions_dir}/${run_name}_${POSTPROC_NAME}/${model_label}"
     local -a cmd=(
         python tools/postprocess_predictions.py
         "$pred_dir"
         --post-config "$POST_CONFIG"
+        --postproc-name "$POSTPROC_NAME"
         --metrics "${METRIC_TYPES[@]}"
     )
 
@@ -190,6 +217,7 @@ run_postprocess() {
     echo "============================================================"
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting: ${pred_dir}"
     echo "  Post-config: ${POST_CONFIG}"
+    echo "  Postproc:    ${POSTPROC_NAME}"
     echo "  Metrics:     ${METRIC_TYPES[*]}"
     echo "  Output:      ${out_dir}"
     if [[ -n "$RESULTS_FILE" ]]; then
@@ -216,6 +244,7 @@ echo ""
 echo "============================================================"
 echo "Post-processing sweep complete"
 echo "  Post-config: ${POST_CONFIG}"
+echo "  Postproc:    ${POSTPROC_NAME}"
 echo "  Total runs:  ${TOTAL}"
 echo "  Passed:      ${PASSED}"
 echo "  Failed:      $((TOTAL - PASSED))"

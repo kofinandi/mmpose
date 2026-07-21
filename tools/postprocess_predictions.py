@@ -4,7 +4,12 @@
 Loads a ``manifest.json`` + ``frames.json`` bundle produced by
 ``tools/benchmark_e2e.py``, runs a configurable post-processing pipeline,
 evaluates chosen metrics on the post-processed predictions, and saves a new
-sibling bundle to ``<pred_dir>__postproc`` (or ``--out-dir``).
+bundle next to the run folder containing ``pred_dir``, with the
+``--postproc-name`` appended to the run folder name (or ``--out-dir``)::
+
+    benchmark/predictions/20260715_emdb_e2e/YOLO-Pose-tiny
+    -->
+    benchmark/predictions/20260715_emdb_e2e_smoothnetw8/YOLO-Pose-tiny
 
 Timing is measured the same way as in ``tools/benchmark_e2e.py``:
 
@@ -18,10 +23,12 @@ Usage::
     python tools/postprocess_predictions.py \\
         benchmark/predictions/20260615_emdb-mini_e2e/YOLO-Pose-tiny \\
         --post-config configs/post_processing/oks_track_one_euro.py \\
+        --postproc-name one_euro \\
         --metrics CocoMetric MPJVE MPJAE IDSwitch
 
     python tools/postprocess_predictions.py PRED_DIR \\
         --post-config configs/post_processing/oks_track_one_euro.py \\
+        --postproc-name smoothnetw8 \\
         --results-file benchmark/results/20260615_coco_postproc.json
 """
 
@@ -203,6 +210,26 @@ def _make_gt_instances(
         ], dtype=np.float32)
 
     return gt, gt_list
+
+
+def default_postproc_out_dir(pred_dir: str, postproc_name: str) -> str:
+    """Build the default output dir for a post-processed bundle.
+
+    The post-processed bundle is saved next to the run folder containing
+    ``pred_dir``, with ``postproc_name`` appended to the run folder's name,
+    e.g.::
+
+        benchmark/predictions/20260715_emdb_e2e/YOLO-Pose-tiny
+        -->
+        benchmark/predictions/20260715_emdb_e2e_smoothnetw8/YOLO-Pose-tiny
+    """
+    pred_dir_abs = osp.abspath(pred_dir)
+    model_label = osp.basename(pred_dir_abs)
+    run_dir = osp.dirname(pred_dir_abs)
+    run_name = osp.basename(run_dir)
+    predictions_dir = osp.dirname(run_dir)
+    return osp.join(predictions_dir, f'{run_name}_{postproc_name}',
+                    model_label)
 
 
 def load_bundle(
@@ -399,9 +426,18 @@ def _parse_args() -> argparse.Namespace:
         help='Metric types to evaluate '
              '(default: CocoMetric MPJVE MPJAE IDSwitch)')
     p.add_argument(
+        '--postproc-name', default=None,
+        help='Name of this post-processing run (e.g. "smoothnetw8"). '
+             'Used to build the default output directory by appending '
+             '"_<postproc-name>" to the run folder name containing '
+             'pred_dir (e.g. benchmark/predictions/20260715_emdb_e2e/'
+             'YOLO-Pose-tiny -> benchmark/predictions/'
+             '20260715_emdb_e2e_smoothnetw8/YOLO-Pose-tiny). '
+             'Required unless --out-dir is given.')
+    p.add_argument(
         '--out-dir', default=None,
         help='Output directory for the post-processed bundle '
-             '(default: <pred_dir>__postproc)')
+             '(default: derived from --postproc-name, see above)')
     p.add_argument(
         '--num-frames', type=int, default=None,
         help='Limit to the first N frames (for quick tests)')
@@ -414,6 +450,9 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = _parse_args()
+    if not args.out_dir and not args.postproc_name:
+        raise ValueError(
+            '--postproc-name is required when --out-dir is not specified')
     _get_logger()
     init_default_scope('mmpose')
 
@@ -514,7 +553,8 @@ def main() -> None:
     print(f'{sep}\n')
 
     # ── Save post-processed bundle ─────────────────────────────────────────
-    out_dir = args.out_dir or (osp.abspath(args.pred_dir) + '__postproc')
+    out_dir = args.out_dir or default_postproc_out_dir(
+        args.pred_dir, args.postproc_name)
     print(f'Saving post-processed bundle to: {out_dir}')
 
     pp_frame_records: List[dict] = []
