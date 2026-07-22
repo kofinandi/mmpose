@@ -32,12 +32,20 @@ class Prediction:
     """Next-step prediction for a single tracked instance.
 
     Attributes:
-        mean: Predicted keypoint coordinates, shape ``(K, 2)``.
+        mean: Predicted keypoint coordinates, shape ``(K, 2)``.  Expressed
+            in whatever coordinate system the predictor was fed (see
+            :class:`BasePredictor`) - callers such as
+            :class:`~mmpose.postprocessing.filters.PredictiveTracker` that
+            normalize coordinates before calling the predictor scale this
+            back to their own units before use.
         var: Predicted variance per keypoint, shape ``(K,)``.  When the
             underlying model predicts per-coordinate variances they are
             combined (e.g. via ``max``) into a single scalar per keypoint,
             since keypoint-level lifecycle decisions (age/variance
-            thresholds) operate per keypoint, not per coordinate.
+            thresholds) operate per keypoint, not per coordinate.  Whether
+            this is expressed in the same (normalized) coordinate units as
+            ``mean``, and thus needs rescaling alongside it, is declared by
+            :attr:`BasePredictor.var_is_normalized`.
         age: Number of frames since each keypoint was last updated with an
             observed measurement, shape ``(K,)``.  ``0`` means the keypoint
             was updated on the most recent call to :meth:`BasePredictor.update`.
@@ -56,10 +64,33 @@ class BasePredictor(metaclass=ABCMeta):
     -vectorised: an implementation tracks ``num_keypoints`` independent
     (but not necessarily identically parameterised) 2-D signals per track.
 
+    Coordinate units are whatever the caller passes in: callers such as
+    :class:`~mmpose.postprocessing.filters.PredictiveTracker` normalize
+    keypoint coordinates to ``[0, 1]`` (dividing by image width/height)
+    before calling :meth:`add_track`/:meth:`update`, and scale
+    :attr:`Prediction.mean` back to their own units after :meth:`predict`,
+    so implementations are automatically resolution-agnostic without having
+    to know about image size themselves.
+
     Args:
         num_keypoints (int): Number of keypoints tracked per instance.
             Default: ``17`` (COCO).
     """
+
+    #: Whether :attr:`Prediction.var` (and the ``variances`` arguments to
+    #: :meth:`add_track`/:meth:`update`) is expressed in the same
+    #: normalized coordinate units as keypoint positions - i.e. scales
+    #: like coordinate\ :sup:`2` (length\ :sup:`2`) - and must therefore be
+    #: rescaled by ``scale**2`` alongside ``mean`` whenever the caller
+    #: converts between normalized and pixel coordinates.
+    #:
+    #: This is the correct default for most motion models (e.g. a Kalman
+    #: filter whose covariance is propagated in the same units as its
+    #: state).  Override to ``False`` for a predictor whose variance is
+    #: intrinsically decoupled from the coordinate values it was fed (e.g.
+    #: a purely kernel-relative confidence that never actually depends on
+    #: the buffered coordinate values.
+    var_is_normalized: bool = True
 
     def __init__(self, num_keypoints: int = 17) -> None:
         self.num_keypoints = int(num_keypoints)

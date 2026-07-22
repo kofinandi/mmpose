@@ -56,8 +56,6 @@ post_processor = dict(
             # A keypoint is no longer predicted/matched/output with a real
             # score once its age (frames since last observed) exceeds this.
             keypoint_max_age=15,
-            # ...or once its predicted variance exceeds this.
-            keypoint_var_threshold=100.0,
 
             # ── Whole-instance lifecycle ─────────────────────────────────
             # The whole track is discarded once every keypoint's age

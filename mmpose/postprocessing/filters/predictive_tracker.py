@@ -17,13 +17,35 @@ Architecture (see ``configs/post_processing/gp_kalman_sort.py``):
    only), unmatched tracks are aged, and new tracks are registered with the
    predictor.
 
+Resolution-agnostic predictor coordinates
+------------------------------------------
+The owned predictor (e.g. :class:`GPKalmanPredictor`) never sees raw pixel
+coordinates. Every keypoint handed to :meth:`BasePredictor.add_track` /
+:meth:`BasePredictor.update` is first normalized to the ``[0, 1]`` range by
+dividing by the current frame's image width/height (from
+``ds.metainfo['ori_shape']``), and every ``Prediction.mean`` read back from
+:meth:`BasePredictor.predict` is scaled back to pixel coordinates before use.
+This makes any predictor implementation tolerant of the input image size
+without needing to know about it itself.
+
+Variances are handled the same way, but only for predictors that declare
+``predictor.var_is_normalized = True`` (the :class:`BasePredictor` default):
+for those, the ``variances`` passed into :meth:`add_track`/:meth:`update`
+and the ``Prediction.var`` read back from :meth:`predict` are assumed to
+scale like coordinate\ :sup:`2`, and are divided/multiplied by
+``scale_x * scale_y`` alongside ``mean``. Predictors that set
+``var_is_normalized = False``, whose variance is intrinsically decoupled
+from the coordinate values are left untouched, so this stays a no-op for
+them and keeps their output numerically identical regardless of image size.
+Ages, OKS, and everything else downstream of the predictor continue to be
+expressed in the same (pixel) units as before.
+
 Partial-occlusion handling
 ---------------------------
 Every keypoint has its own age (frames since it was last *observed*, i.e.
 had a detection score >= ``keypoint_score_thr``).  A keypoint becomes
 "dead" - excluded from association and shown with score ``0`` - once its
-age exceeds ``keypoint_max_age`` or its predicted variance exceeds
-``keypoint_var_threshold``.  This lets a track survive an instance being
+age exceeds ``keypoint_max_age``.  This lets a track survive an instance being
 partially occluded (e.g. legs behind an object) while only the occluded
 keypoints go stale; a dead keypoint revives automatically the moment it is
 observed again.  The whole instance is only dropped once *every* keypoint's
@@ -64,6 +86,32 @@ def _bbox_from_keypoints(kpts: np.ndarray) -> np.ndarray:
     return np.array([x0, y0, x1, y1], dtype=np.float32)
 
 
+def _to_normalized(
+    kpts: np.ndarray,
+    scale_x: float,
+    scale_y: float,
+) -> np.ndarray:
+    """Normalize keypoint coordinates ``(K, 2)`` to ``[0, 1]`` by dividing
+    by the image width/height, for consumption by the predictor."""
+    out = np.asarray(kpts, dtype=np.float64).copy()
+    out[:, 0] /= scale_x
+    out[:, 1] /= scale_y
+    return out
+
+
+def _to_pixels(
+    mean: np.ndarray,
+    scale_x: float,
+    scale_y: float,
+) -> np.ndarray:
+    """Inverse of :func:`_to_normalized`: scale a predictor's normalized
+    ``Prediction.mean`` back to pixel coordinates."""
+    out = np.asarray(mean, dtype=np.float32).copy()
+    out[:, 0] *= scale_x
+    out[:, 1] *= scale_y
+    return out
+
+
 @dataclass
 class _TrackMeta:
     """Post-processor-side per-track bookkeeping (not owned by the predictor)."""
@@ -92,8 +140,6 @@ class PredictiveTracker(BaseFilter):
         keypoint_max_age (float): A keypoint becomes dead (no longer
             predicted/matched/output with a real score) once its age
             (frames since last observed) exceeds this value.
-        keypoint_var_threshold (float): A keypoint becomes dead once its
-            predicted variance exceeds this value.
         instance_max_age (float): The whole track is discarded once every
             keypoint's age exceeds this value.
         min_hits_to_remember (int): Number of frames a track must have been
@@ -124,7 +170,6 @@ class PredictiveTracker(BaseFilter):
         sigmas: Optional[List[float]] = None,
         keypoint_score_thr: float = 0.3,
         keypoint_max_age: float = 15,
-        keypoint_var_threshold: float = 100.0,
         instance_max_age: float = 30,
         min_hits_to_remember: int = 1,
         pixel_scale: float = 1.0,
@@ -141,7 +186,6 @@ class PredictiveTracker(BaseFilter):
 
         self.keypoint_score_thr = float(keypoint_score_thr)
         self.keypoint_max_age = float(keypoint_max_age)
-        self.keypoint_var_threshold = float(keypoint_var_threshold)
         self.instance_max_age = float(instance_max_age)
         self.min_hits_to_remember = int(min_hits_to_remember)
 
@@ -165,6 +209,27 @@ class PredictiveTracker(BaseFilter):
 
     def _measurement_variance(self, score: float) -> float:
         return (1.0 - score) ** self.score_exp * self.pixel_scale + self.min_r
+
+    # ------------------------------------------------------------------
+    # Resolution-agnostic predictor coordinates
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _image_scale(ds: PoseDataSample) -> tuple:
+        """Return ``(scale_x, scale_y)`` = image ``(width, height)`` used to
+        normalize/denormalize keypoint coordinates around calls into the
+        predictor (see module docstring).
+
+        Falls back to ``(1.0, 1.0)`` (i.e. no normalization, matching the
+        previous pixel-coordinate behaviour) when ``ori_shape`` is missing
+        or degenerate.
+        """
+        ori_shape = ds.metainfo.get('ori_shape', None)
+        if ori_shape is not None and len(ori_shape) >= 2:
+            h, w = float(ori_shape[0]), float(ori_shape[1])
+            if h > 0 and w > 0:
+                return w, h
+        return 1.0, 1.0
 
     # ------------------------------------------------------------------
     # Association
@@ -243,14 +308,30 @@ class PredictiveTracker(BaseFilter):
         if sigmas.shape[0] != K:
             sigmas = np.full(K, 0.05, dtype=np.float32)
 
+        scale_x, scale_y = self._image_scale(ds)
+        # `var` scales like coordinate^2, but only for predictors that
+        # actually express it in the same normalized units as `mean` (see
+        # module docstring and `BasePredictor.var_is_normalized`).
+        var_scale = (
+            scale_x * scale_y if self.predictor.var_is_normalized else 1.0)
+
         # ── Step 1: Predict ─────────────────────────────────────────────
         active_ids = list(self._tracks.keys())
-        predictions: Dict[int, Prediction] = (
+        raw_predictions: Dict[int, Prediction] = (
             self.predictor.predict(active_ids) if active_ids else {})
+        # The predictor works in normalized [0, 1] coordinates; scale its
+        # prediction means (and, if applicable, variances) back to pixels
+        # so everything below operates in pixel space exactly as before.
+        predictions: Dict[int, Prediction] = {
+            tid: Prediction(
+                mean=_to_pixels(pred.mean, scale_x, scale_y),
+                var=pred.var * var_scale,
+                age=pred.age)
+            for tid, pred in raw_predictions.items()
+        }
 
         alive_masks: Dict[int, np.ndarray] = {
             tid: (pred.age <= self.keypoint_max_age)
-            & (pred.var <= self.keypoint_var_threshold)
             for tid, pred in predictions.items()
         }
 
@@ -285,11 +366,12 @@ class PredictiveTracker(BaseFilter):
 
         out_records: List[dict] = []
 
-        # ── Step 3 & 5: Matched tracks - fuse, update, manage ───────────
+        # ── Step 3 & 4: Matched tracks - fuse, update, manage ───────────
         for tid, ni in matched_pairs:
             record = self._process_matched(
                 tid, ni, predictions[tid], alive_masks[tid],
-                det_kpts, det_scores, det_bboxes, det_bbox_scores, det_areas)
+                det_kpts, det_scores, det_bboxes, det_bbox_scores, det_areas,
+                scale_x, scale_y, var_scale)
             if record is not None:
                 out_records.append(record)
 
@@ -304,7 +386,7 @@ class PredictiveTracker(BaseFilter):
         for ni in unmatched_det_idx:
             out_records.append(self._process_new(
                 ni, det_kpts, det_scores, det_bboxes, det_bbox_scores,
-                det_areas, K))
+                det_areas, K, scale_x, scale_y, var_scale))
 
         return self._build_output(ds, out_records, K)
 
@@ -323,6 +405,9 @@ class PredictiveTracker(BaseFilter):
         det_bboxes: np.ndarray,
         det_bbox_scores: np.ndarray,
         det_areas: np.ndarray,
+        scale_x: float,
+        scale_y: float,
+        var_scale: float,
     ) -> Optional[dict]:
         track = self._tracks[tid]
         K = pred.mean.shape[0]
@@ -363,7 +448,9 @@ class PredictiveTracker(BaseFilter):
                 out_scores[k] = track.last_scores[k] if alive[k] else 0.0
                 new_age[k] = pred.age[k] + 1.0
 
-        self.predictor.update(tid, upd_kpts, upd_vars, valid_mask=observed)
+        self.predictor.update(
+            tid, _to_normalized(upd_kpts, scale_x, scale_y),
+            upd_vars / var_scale, valid_mask=observed)
 
         track.last_bbox = det_bboxes[ni]
         track.last_bbox_score = float(det_bbox_scores[ni])
@@ -424,6 +511,9 @@ class PredictiveTracker(BaseFilter):
         det_bbox_scores: np.ndarray,
         det_areas: np.ndarray,
         K: int,
+        scale_x: float,
+        scale_y: float,
+        var_scale: float,
     ) -> dict:
         tid = self._next_id
         self._next_id += 1
@@ -434,7 +524,8 @@ class PredictiveTracker(BaseFilter):
             [self._measurement_variance(float(sc)) for sc in scores],
             dtype=np.float64)
 
-        self.predictor.add_track(tid, kpts.astype(np.float64), variances)
+        self.predictor.add_track(
+            tid, _to_normalized(kpts, scale_x, scale_y), variances / var_scale)
         self._tracks[tid] = _TrackMeta(
             last_bbox=det_bboxes[ni],
             last_bbox_score=float(det_bbox_scores[ni]),

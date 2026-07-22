@@ -135,6 +135,17 @@ class GPKalmanPredictor(BasePredictor):
             observation). Default: ``4000.0``.
     """
 
+    # `Prediction.var` here is `1 - k_star^T (K + diag(v))^-1 k_star` (see
+    # `_gp_eval`): a function of only the buffered *times* and injected
+    # noise `v_buf`, never of the buffered x/y coordinate values (`alpha`,
+    # which *is* linear in those values, only feeds into `mean`). It is
+    # therefore already expressed in the kernel's own unit-signal-variance
+    # scale and stays numerically identical no matter what coordinate units
+    # (pixels, normalized [0, 1], ...) the caller's keypoints are in - it
+    # must not be rescaled alongside `mean` when the caller
+    # normalizes/denormalizes coordinates around this predictor.
+    var_is_normalized = False
+
     def __init__(
         self,
         num_keypoints: int = 17,
