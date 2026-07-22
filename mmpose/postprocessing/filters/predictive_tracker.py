@@ -64,6 +64,7 @@ from scipy.optimize import linear_sum_assignment
 from mmpose.structures import PoseDataSample
 
 from ..base import BaseFilter
+from ..measurement import build_measurement_model
 from ..predictors import Prediction, build_predictor
 from ..registry import POST_PROCESS_FILTERS
 
@@ -132,6 +133,18 @@ class PredictiveTracker(BaseFilter):
         predictor (dict): Config for the predictor submodule (registered in
             ``POST_PROCESS_PREDICTORS``), e.g.
             ``dict(type='GPKalmanPredictor', num_keypoints=17, ...)``.
+        measurement_model (dict): Config for the measurement-noise model
+            submodule (registered in ``POST_PROCESS_MEASUREMENT_MODELS``)
+            that converts a detection's keypoint confidence score (and, at
+            fusion time, its innovation against the prediction) into a
+            measurement variance ``R``, e.g.
+            ``dict(type='PowerScoreMeasurementModel', pixel_scale=1.0,
+            min_r=3e-4, score_exp=8.0, inflation_factor=8.0,
+            osc_inflate=2.0)``. This is inherently heuristic and how a
+            score maps to trustworthiness varies a lot between detector
+            architectures, so it is fully swappable/tunable per model
+            rather than hard-coded - see
+            :class:`~mmpose.postprocessing.measurement.BaseMeasurementModel`.
         match_thr (float): Minimum OKS to accept an association.
         sigmas (list[float] | None): Per-keypoint OKS sigmas. Defaults to
             COCO-17 sigmas when ``None``.
@@ -151,14 +164,6 @@ class PredictiveTracker(BaseFilter):
             predicted for up to ``instance_max_age`` frames after a single
             spurious detection. Default: ``1`` (any track, including a
             single-frame detection, gets remembered).
-        pixel_scale (float): Scale of the score->variance measurement noise
-            model ``R = (1 - score)^score_exp * pixel_scale + min_r``.
-        min_r (float): Noise floor for the measurement variance model.
-        score_exp (float): Exponent of the measurement-variance model.
-        inflation_factor (float): Innovation-gating scale: large
-            prediction/detection disagreement inflates ``R``.
-        osc_inflate (float): Extra ``R`` inflation when the innovation
-            flips sign relative to the previous frame (oscillation).
     """
 
     online = True
@@ -166,19 +171,16 @@ class PredictiveTracker(BaseFilter):
     def __init__(
         self,
         predictor: dict,
+        measurement_model: dict,
         match_thr: float = 0.5,
         sigmas: Optional[List[float]] = None,
         keypoint_score_thr: float = 0.3,
         keypoint_max_age: float = 15,
         instance_max_age: float = 30,
         min_hits_to_remember: int = 1,
-        pixel_scale: float = 1.0,
-        min_r: float = 3e-4,
-        score_exp: float = 8.0,
-        inflation_factor: float = 8.0,
-        osc_inflate: float = 2.0,
     ) -> None:
         self.predictor = build_predictor(predictor)
+        self.measurement_model = build_measurement_model(measurement_model)
         self.match_thr = float(match_thr)
         self.sigmas = (
             np.asarray(sigmas, dtype=np.float32)
@@ -189,12 +191,6 @@ class PredictiveTracker(BaseFilter):
         self.instance_max_age = float(instance_max_age)
         self.min_hits_to_remember = int(min_hits_to_remember)
 
-        self.pixel_scale = float(pixel_scale)
-        self.min_r = float(min_r)
-        self.score_exp = float(score_exp)
-        self.inflation_factor = float(inflation_factor)
-        self.osc_inflate = float(osc_inflate)
-
         self._tracks: Dict[int, _TrackMeta] = {}
         self._next_id: int = 0
 
@@ -202,13 +198,6 @@ class PredictiveTracker(BaseFilter):
         self.predictor.reset()
         self._tracks = {}
         self._next_id = 0
-
-    # ------------------------------------------------------------------
-    # Measurement noise model
-    # ------------------------------------------------------------------
-
-    def _measurement_variance(self, score: float) -> float:
-        return (1.0 - score) ** self.score_exp * self.pixel_scale + self.min_r
 
     # ------------------------------------------------------------------
     # Resolution-agnostic predictor coordinates
@@ -410,43 +399,35 @@ class PredictiveTracker(BaseFilter):
         var_scale: float,
     ) -> Optional[dict]:
         track = self._tracks[tid]
-        K = pred.mean.shape[0]
 
         z = det_kpts[ni].astype(np.float64)     # (K, 2)
         s = det_scores[ni]                      # (K,)
-        observed = s >= self.keypoint_score_thr
+        observed = s >= self.keypoint_score_thr  # (K,)
 
-        out_kpts = np.zeros((K, 2), dtype=np.float32)
-        out_scores = np.zeros(K, dtype=np.float32)
-        upd_kpts = np.zeros((K, 2), dtype=np.float64)
-        upd_vars = np.zeros(K, dtype=np.float64)
-        new_age = np.zeros(K, dtype=np.float32)
+        mu_p = pred.mean.astype(np.float64)      # (K, 2)
+        var_p = pred.var.astype(np.float64)      # (K,)
+        innov = z - mu_p                         # (K, 2)
 
-        for k in range(K):
-            if observed[k]:
-                mu_p = pred.mean[k].astype(np.float64)
-                var_p = float(pred.var[k])
-                innov = z[k] - mu_p
-                r_var = self._measurement_variance(float(s[k]))
-                nu2 = float(np.dot(innov, innov))
-                r_var *= (1.0 + nu2 / self.inflation_factor)
-                if np.dot(track.prev_innovation[k], innov) < 0:
-                    r_var *= self.osc_inflate
+        base_var = self.measurement_model.variance(s.astype(np.float64))
+        r_var = self.measurement_model.inflate(
+            base_var, innov, track.prev_innovation, observed)  # (K,)
 
-                kg = var_p / (var_p + r_var)
-                mu_post = mu_p + kg * innov
+        kg = var_p / (var_p + r_var)             # (K,)
+        mu_post = mu_p + kg[:, None] * innov     # (K, 2)
 
-                out_kpts[k] = mu_post.astype(np.float32)
-                out_scores[k] = s[k]
-                upd_kpts[k] = z[k]
-                upd_vars[k] = r_var
-                track.prev_innovation[k] = innov
-                track.last_scores[k] = s[k]
-                new_age[k] = 0.0
-            else:
-                out_kpts[k] = pred.mean[k]
-                out_scores[k] = track.last_scores[k] if alive[k] else 0.0
-                new_age[k] = pred.age[k] + 1.0
+        out_kpts = np.where(observed[:, None], mu_post, mu_p).astype(
+            np.float32)
+        out_scores = np.where(
+            observed, s,
+            np.where(alive, track.last_scores, 0.0)).astype(np.float32)
+        upd_kpts = np.where(observed[:, None], z, 0.0)
+        upd_vars = np.where(observed, r_var, 0.0)
+        new_age = np.where(observed, 0.0, pred.age + 1.0).astype(np.float32)
+
+        track.prev_innovation = np.where(observed[:, None], innov,
+                                          track.prev_innovation)
+        track.last_scores = np.where(observed, s,
+                                      track.last_scores).astype(np.float32)
 
         self.predictor.update(
             tid, _to_normalized(upd_kpts, scale_x, scale_y),
@@ -520,9 +501,7 @@ class PredictiveTracker(BaseFilter):
 
         kpts = det_kpts[ni]
         scores = det_scores[ni].copy()
-        variances = np.array(
-            [self._measurement_variance(float(sc)) for sc in scores],
-            dtype=np.float64)
+        variances = self.measurement_model.variance(scores)
 
         self.predictor.add_track(
             tid, _to_normalized(kpts, scale_x, scale_y), variances / var_scale)

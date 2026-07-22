@@ -70,16 +70,25 @@ post_processor = dict(
             min_hits_to_remember=3,
 
             # ── Measurement noise model (score -> variance) ──────────────
-            # R = (1 - score)^score_exp * pixel_scale + min_r
-            pixel_scale=1.0,
-            min_r=3e-4,
-            score_exp=8.0,
-            # Innovation gating: large prediction/detection disagreement
-            # inflates R by (1 + innovation^2 / inflation_factor).
-            inflation_factor=8.0,
-            # Extra R inflation when the innovation flips sign relative to
-            # the previous frame (oscillatory jitter).
-            osc_inflate=2.0,
+            # Converts a detection's keypoint confidence into a measurement
+            # variance R (and, at fusion time, revises it using the
+            # prediction/detection innovation). This is heuristic and how a
+            # score maps to trustworthiness varies a lot between detector
+            # architectures, so it's a swappable component - see
+            # `mmpose/postprocessing/measurement/`.
+            measurement_model=dict(
+                type='PowerScoreMeasurementModel',
+                # R = (1 - score)^score_exp * pixel_scale + min_r
+                pixel_scale=1.0,
+                min_r=3e-4,
+                score_exp=8.0,
+                # Innovation gating: large prediction/detection disagreement
+                # inflates R by (1 + innovation^2 / inflation_factor).
+                inflation_factor=8.0,
+                # Extra R inflation when the innovation flips sign relative
+                # to the previous frame (oscillatory jitter).
+                osc_inflate=2.0,
+            ),
         ),
     ],
 )

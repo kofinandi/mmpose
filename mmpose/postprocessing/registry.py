@@ -9,3 +9,4 @@ from mmengine.registry import Registry
 
 POST_PROCESS_FILTERS = Registry('post_process_filters')
 POST_PROCESS_PREDICTORS = Registry('post_process_predictors')
+POST_PROCESS_MEASUREMENT_MODELS = Registry('post_process_measurement_models')
