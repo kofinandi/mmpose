@@ -2,9 +2,10 @@
 """Registry and helpers for cross-dataset benchmark evaluation.
 
 Maps standard COCO-trained model configs onto alternate test datasets
-(CrowdPose, MPII, AIC, OCHuman, EMDB, 3DPW) without duplicating per-model config
-files.  Swap ``test_dataloader.dataset``, insert ``KeypointConverter`` before
-``PackPoseInputs``, and use ``CocoMetric(gt_from_samples=True)`` unless
+(CrowdPose, MPII, AIC, OCHuman, EMDB, 3DPW, PoseTrack21) without duplicating
+per-model config files.  Swap ``test_dataloader.dataset``, insert
+``KeypointConverter`` before ``PackPoseInputs``, and use
+``CocoMetric(gt_from_samples=True)`` unless
 ``preserve_evaluator`` is set on the dataset spec (e.g. EMDB temporal metrics).
 
 ``dst='coco'`` assumes 17-keypoint COCO-trained checkpoints. Whole-body or
@@ -28,7 +29,7 @@ EXTENDED_PACK_META_KEYS = (
 
 BENCHMARK_TEST_DATASET_NAMES = (
     'coco', 'crowdpose', 'mpii', 'aic', 'ochuman', 'emdb', 'emdb-mini',
-    '3dpw')
+    '3dpw', 'posetrack21')
 
 
 @dataclass(frozen=True)
@@ -144,6 +145,23 @@ BENCHMARK_TEST_DATASETS: Dict[str, BenchmarkTestDataset] = {
             dict(type='MPJAE', prefix='3dpw'),
             dict(type='MPJVE', norm_item=['bbox', 'torso'], prefix='3dpw'),
             dict(type='MPJAE', norm_item=['bbox', 'torso'], prefix='3dpw'),
+        ],
+    ),
+    'posetrack21': BenchmarkTestDataset(
+        dataset_type='PoseTrack21Dataset',
+        data_root='data/posetrack21/',
+        ann_file='annotations/posetrack21_val.json',
+        data_prefix=dict(img=''),
+        keypoint_src='posetrack18',
+        prefetch_scale=1.0,
+        dataset_kwargs=dict(good_frame_mask=True),
+        extra_metrics=[
+            dict(type='MPJVE', prefix='posetrack21'),
+            dict(type='MPJAE', prefix='posetrack21'),
+            dict(type='MPJVE', norm_item=['bbox', 'torso'],
+                 prefix='posetrack21'),
+            dict(type='MPJAE', norm_item=['bbox', 'torso'],
+                 prefix='posetrack21'),
         ],
     ),
 }

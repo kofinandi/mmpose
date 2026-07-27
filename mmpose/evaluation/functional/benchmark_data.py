@@ -24,7 +24,8 @@ from mmpose.structures.bbox import bbox_xyxy2xywh
 
 # Dataset types that accept a `good_frame_mask` kwarg (see EmdbDataset /
 # ThreeDPWDataset). Only these support --include-bad-frames.
-_SUPPORTS_GOOD_FRAME_MASK = {'EmdbDataset', 'ThreeDPWDataset'}
+_SUPPORTS_GOOD_FRAME_MASK = {
+    'EmdbDataset', 'ThreeDPWDataset', 'PoseTrack21Dataset'}
 
 
 # ---------------------------------------------------------------------------
@@ -140,13 +141,14 @@ def load_unified_samples(
 
     Args:
         dataset_name: One of ``'coco', 'crowdpose', 'mpii', 'aic',
-            'ochuman', 'emdb', 'emdb-mini', '3dpw'``.
+            'ochuman', 'emdb', 'emdb-mini', '3dpw', 'posetrack21'``.
         num_frames: If set, cap the number of unique images loaded.
         include_bad_frames: Only meaningful for datasets whose loader
-            supports a ``good_frame_mask`` kwarg (EMDB, 3DPW). When
-            ``True``, overrides that kwarg to ``False`` so frames dropped
-            for lacking reliable GT (e.g. EMDB ``invalid_idxs``, 3DPW
-            frames with no valid actor) are still loaded -- with an image
+            supports a ``good_frame_mask`` kwarg (EMDB, 3DPW, PoseTrack21).
+            When ``True``, overrides that kwarg to ``False`` so frames
+            dropped for lacking reliable GT (e.g. EMDB ``invalid_idxs``, 3DPW
+            frames with no valid actor, PoseTrack21 unlabeled frames) are
+            still loaded -- with an image
             but no GT instances -- giving downstream consumers (e.g. the
             post-processing tracker) a temporally continuous frame
             sequence. These frames may produce false-positive detections

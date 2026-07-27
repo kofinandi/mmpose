@@ -587,6 +587,109 @@ The official evaluation tool for PoseTrack should be installed from GitHub.
 pip install git+https://github.com/svenkreiss/poseval.git
 ```
 
+## PoseTrack21
+
+<!-- [DATASET] -->
+
+<details>
+<summary align="right"><a href="https://openaccess.thecvf.com/content/CVPR2022/html/Doering_PoseTrack21_A_Dataset_for_Person_Search_Multi-Object_Tracking_and_Multi-Person_CVPR_2022_paper.html">PoseTrack21 (CVPR'2022)</a></summary>
+
+```bibtex
+@inproceedings{doering2022posetrack21,
+  title={PoseTrack21: A Dataset for Person Search, Multi-Object Tracking and Multi-Person Pose Tracking},
+  author={Doering, Andreas and Chen, Di and Zhang, Shanshan and Schiele, Bernt and Gall, Juergen},
+  booktitle={Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition},
+  pages={20963--20972},
+  year={2022}
+}
+```
+
+</details>
+
+Download PoseTrack21 by following the instructions at
+[PoseTrack21](https://github.com/anDoer/PoseTrack21). Extract it under
+`$MMPOSE/data` so that it looks like this:
+
+```text
+mmpose
+`── data
+    │── posetrack21
+        │-- PoseTrack21
+        │   │-- posetrack_data
+        │   │   │-- train
+        │   │   │   │-- 000001_bonn_train.json
+        │   │   │   │-- ...
+        │   │   `-- val
+        │   │       │-- 000342_mpii_test.json
+        │   │       │-- ...
+        │   │-- posetrack_mot
+        │   `-- posetrack_person_search
+        `-- images
+            │-- train
+            │   │-- 000001_bonn_train
+            │   │   │-- 000000.jpg
+            │   │   │-- ...
+            │   │-- ...
+            │-- val
+            │   │-- 000342_mpii_test
+            │   │   │-- 000000.jpg
+            │   │   │-- ...
+            │   │-- ...
+            `-- test
+```
+
+PoseTrack21 ships one annotation JSON per video. Merge them into a single
+COCO-format file per split:
+
+```shell
+python tools/dataset_converters/preprocess_posetrack21.py \
+    --data-root data/posetrack21 \
+    --out-dir data/posetrack21/annotations
+```
+
+This writes `data/posetrack21/annotations/posetrack21_{val,train}.json` and adds
+the fields the raw release omits: `width`/`height`, `area`, `frame_id`,
+`seq_name`, `good_frame`, and a **globally unique** `track_id` (PoseTrack
+restarts `track_id` at 0 in every video, which would otherwise merge every
+"person 0" into a single track in the temporal metrics).
+
+It also emits each **ignore region** — people the dataset deliberately leaves
+unannotated — as a keypoint-free `iscrowd=1` annotation, so COCOeval discounts
+detections that land on them rather than counting them as false positives, the
+same way COCO and CrowdPose handle crowd regions.
+
+The split is then available to the cross-dataset benchmark as
+`--test-dataset posetrack21`:
+
+```shell
+python tools/benchmark_e2e.py CONFIG CHECKPOINT \
+    --test-dataset posetrack21 \
+    --det-config demo/mmdetection_cfg/rfdetr_medium_coco-person.py \
+    --det-checkpoint data/models/rf-detr-medium.pth --det-cat-id 1 \
+    --model-name ViTPose --model-variant small-simple
+```
+
+It is the only crowded multi-person video split in the benchmark, so it is what
+exercises the tracking/smoothing post-processing configs (`MPJVE`, `MPJAE`,
+`IDSwitch`). Notes:
+
+- Keypoints use the PoseTrack-17 layout (identical to PoseTrack18). The
+  benchmark maps them onto COCO-17 via
+  `KeypointConverter(src='posetrack18', dst='coco')`. PoseTrack annotates no
+  eyes and never annotates ears, so 13 of the 17 COCO joints carry ground truth.
+- Only ~44% of frames are labeled (every 4th frame, plus a dense consecutive
+  block per video). `PoseTrack21Dataset` loads only those by default; pass
+  `--include-bad-frames` to also load the unlabeled frames, which gives the
+  post-processing tracker a temporally continuous sequence at the cost of
+  counting detections on unlabeled frames as false positives.
+- Ignore regions are reduced to their axis-aligned bounding box, which
+  COCOeval then widens 3× in each dimension before testing containment, so
+  suppression is more generous than the source polygon. Measured against exact
+  polygon containment the difference is worth ~0.3 AP — the extra discounted
+  detections are low-scoring ones that barely move the PR curve. Ignore regions
+  never reach `MPJVE`/`MPJAE`/`IDSwitch`: `compute_oks_pairs` skips crowd and
+  keypoint-free GT.
+
 ## sub-JHMDB dataset
 
 <!-- [DATASET] -->
