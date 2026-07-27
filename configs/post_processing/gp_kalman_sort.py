@@ -29,6 +29,12 @@ post_processor = dict(
     type='PostProcessingPipeline',
     filters=[
         dict(
+            type='OKSNMS',
+            score_thr=0.3,
+            oks_thr=0.9,
+            score_mode='auto',
+        ),
+        dict(
             type='PredictiveTracker',
             predictor=dict(
                 type='GPKalmanPredictor',

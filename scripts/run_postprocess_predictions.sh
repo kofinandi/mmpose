@@ -16,7 +16,7 @@ POSTPROC_NAME="${POSTPROC_NAME:-}"
 NUM_FRAMES="${NUM_FRAMES:-}"
 RESULTS_FILE="${RESULTS_FILE:-}"
 LOG_DIR="${LOG_DIR:-${ROOT_DIR}/benchmark/logs/${TIMESTAMP}_postproc}"
-METRIC_TYPES=(CocoMetric MPJVE MPJAE)
+METRIC_TYPES=(CocoMetric MPJVE MPJAE IDSwitch)
 METRICS_WERE_SET=0
 
 usage() {
@@ -33,7 +33,7 @@ Options:
                         (required unless POSTPROC_NAME is set). Used to build
                         the output dir by appending "_NAME" to the run folder
                         name containing each bundle.
-  --metrics M1 M2 ...   Metrics to evaluate (default: CocoMetric MPJVE MPJAE)
+  --metrics M1 M2 ...   Metrics to evaluate (default: CocoMetric MPJVE MPJAE IDSwitch)
   --num-frames N        Limit to the first N frames (for quick tests)
   --results-file PATH   Append metrics to this JSON file after each run
   -h, --help            Show this help
