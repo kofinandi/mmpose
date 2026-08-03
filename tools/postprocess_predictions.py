@@ -24,7 +24,7 @@ Usage::
         benchmark/predictions/20260615_emdb-mini_e2e/YOLO-Pose-tiny \\
         --post-config configs/post_processing/oks_track_one_euro.py \\
         --postproc-name one_euro \\
-        --metrics CocoMetric MPJVE MPJAE IDSwitch
+        --metrics CocoMetric MPJVE MPJAE IDSwitch MOTA IDF1 HOTA
 
     python tools/postprocess_predictions.py PRED_DIR \\
         --post-config configs/post_processing/oks_track_one_euro.py \\
@@ -258,7 +258,7 @@ def _build_metric(metric_type: str, dataset_meta: dict) -> object:
         cfg['type'] = 'CocoMetric'
     elif metric_type in ('MPJVE', 'MPJAE'):
         cfg = {'type': metric_type, 'norm_item': [None, 'bbox', 'torso']}
-    elif metric_type == 'IDSwitch':
+    elif metric_type in ('IDSwitch', 'MOTA', 'IDF1', 'HOTA'):
         cfg = {'type': metric_type}
     else:
         cfg['type'] = metric_type
@@ -277,9 +277,9 @@ def build_evaluator_from_types(
     # Metric types that manage their own state via process() (no
     # gt_from_samples injection); some of these have dataset-specific
     # presets in BENCHMARK_TEST_DATASETS.extra_metrics (e.g. MPJVE/MPJAE for
-    # emdb), others (e.g. IDSwitch) never do and always fall back to
-    # _build_metric below.
-    stateful_types = {'MPJVE', 'MPJAE', 'IDSwitch'}
+    # emdb), others (e.g. the tracking metrics) never do and always fall
+    # back to _build_metric below.
+    stateful_types = {'MPJVE', 'MPJAE', 'IDSwitch', 'MOTA', 'IDF1', 'HOTA'}
     requested_stateful = stateful_types & set(metric_types)
 
     metrics = [
@@ -422,9 +422,10 @@ def _parse_args() -> argparse.Namespace:
                         '(e.g. configs/post_processing/oks_track_one_euro.py)')
     p.add_argument(
         '--metrics', nargs='+',
-        default=['CocoMetric', 'MPJVE', 'MPJAE', 'IDSwitch'],
+        default=['CocoMetric', 'MPJVE', 'MPJAE', 'IDSwitch', 'MOTA', 'IDF1',
+                 'HOTA'],
         help='Metric types to evaluate '
-             '(default: CocoMetric MPJVE MPJAE IDSwitch)')
+             '(default: CocoMetric MPJVE MPJAE IDSwitch MOTA IDF1 HOTA)')
     p.add_argument(
         '--postproc-name', default=None,
         help='Name of this post-processing run (e.g. "smoothnetw8"). '
