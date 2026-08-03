@@ -7,3 +7,12 @@
 [submodule "external/PETR"]
 	path = external/PETR
 	url = https://github.com/hikvision-research/opera.git
+[submodule "external/lighttrack"]
+	path = external/lighttrack
+	url = https://github.com/Guanghan/lighttrack.git
+[submodule "external/DetectAndTrack"]
+	path = external/DetectAndTrack
+	url = https://github.com/facebookresearch/DetectAndTrack.git
+[submodule "external/PGPT"]
+	path = external/PGPT
+	url = https://github.com/JDAI-CV/PGPT.git
