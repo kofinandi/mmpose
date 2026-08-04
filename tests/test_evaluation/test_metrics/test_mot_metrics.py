@@ -50,6 +50,58 @@ def _metrics(match_thr: float = 0.5):
     return built
 
 
+def _data_sample(gt_keypoints,
+                  gt_track_ids,
+                  pred_keypoints,
+                  pred_track_ids,
+                  gt_iscrowd=None,
+                  gt_bboxes=None,
+                  pred_bboxes=None,
+                  img_path: str = 'seq/000001.jpg') -> dict:
+    """Build a single-frame ``data_sample`` dict for ``process()``.
+
+    Unlike :func:`_records`, this goes through ``process()`` itself, which
+    is where ignore-region suppression lives.  ``gt_keypoints`` /
+    ``pred_keypoints`` are ``(N, K, 2)``; every GT keypoint is visible
+    unless the instance is marked ``iscrowd`` (which drops it from
+    matching regardless of visibility, as in ``compute_oks_pairs``).
+    """
+    gt_kpts = np.asarray(gt_keypoints, dtype=np.float32)
+    pred_kpts = np.asarray(pred_keypoints, dtype=np.float32)
+    n_gt = gt_kpts.shape[0]
+
+    gt_instances = {
+        'keypoints': gt_kpts,
+        'keypoints_visible': np.ones(gt_kpts.shape[:2], dtype=np.float32),
+        'track_ids': np.asarray(gt_track_ids, dtype=np.int64),
+        'iscrowd': (np.asarray(gt_iscrowd, dtype=np.int64)
+                    if gt_iscrowd is not None else
+                    np.zeros(n_gt, dtype=np.int64)),
+    }
+    if gt_bboxes is not None:
+        gt_instances['bboxes'] = np.asarray(gt_bboxes, dtype=np.float64)
+
+    pred_instances = {
+        'keypoints': pred_kpts,
+        'track_ids': np.asarray(pred_track_ids, dtype=np.int64),
+    }
+    if pred_bboxes is not None:
+        pred_instances['bboxes'] = np.asarray(pred_bboxes, dtype=np.float64)
+
+    return {
+        'img_path': img_path,
+        'gt_instances': gt_instances,
+        'pred_instances': pred_instances,
+    }
+
+
+def _mota(**kwargs) -> MOTA:
+    """Build a lone :class:`MOTA` with dummy single-keypoint metadata."""
+    metric = MOTA(**kwargs)
+    metric.dataset_meta = {'sigmas': np.ones(1, dtype=np.float32)}
+    return metric
+
+
 class TestMOTMetrics(TestCase):
 
     def test_perfect_tracking(self):
@@ -237,3 +289,143 @@ class TestMOTMetrics(TestCase):
             MOTA(idsw_reference='nonsense')
         with self.assertRaises(ValueError):
             IDF1(score_mode='nope')
+        with self.assertRaises(ValueError):
+            MOTA(ignore_mode='nonsense')
+
+
+class TestMOTIgnoreRegions(TestCase):
+    """Ignore-region suppression in ``_MOTBaseMetric.process()``.
+
+    Unlike the scenarios above, these go through ``process()`` itself
+    (via :func:`_data_sample`), since that is where the suppression is
+    applied -- ``compute_metrics`` never sees an ignore region, only
+    whatever ``process()`` decided to keep.
+    """
+
+    def test_ioa_drops_prediction_fully_inside_large_ignore_region(self):
+        """Reproduces the CoMotion bug figure (arXiv:2504.12186, Appx A.1):
+        a box entirely inside a large ignore region scores a low IoU
+        (``0.0025`` here) but the full ``1.0`` under the IoA convention.
+
+        The frame has no real GT at all, only the ignore region: with no
+        suppression the lone prediction is a pure false positive
+        (``MOTA = (0 - 1 - 0) / 1``); suppressing it recovers ``MOTA = 0``.
+        This exercises ``compute_oks_pairs`` reporting the prediction as
+        valid even though ``valid_gt_idx`` is empty -- see the fix in
+        :func:`~mmpose.evaluation.functional.frame_metrics.compute_oks_pairs`.
+        """
+        sample = _data_sample(
+            gt_keypoints=[[[0.0, 0.0]]],
+            gt_track_ids=[0],
+            gt_iscrowd=[1],
+            gt_bboxes=[[0.0, 0.0, 1000.0, 1000.0]],
+            pred_keypoints=[[[400.0, 400.0]]],
+            pred_track_ids=[7],
+            pred_bboxes=[[400.0, 400.0, 450.0, 450.0]],
+        )
+
+        ioa_metric = _mota(ignore_mode='ioa')
+        ioa_metric.process(None, [sample])
+        res = ioa_metric.compute_metrics(ioa_metric.results)
+        self.assertAlmostEqual(res['CLR_FP'], 0.0)
+        self.assertAlmostEqual(res['MOTA'], 0.0)
+
+        iou_metric = _mota(ignore_mode='iou')
+        iou_metric.process(None, [sample])
+        res = iou_metric.compute_metrics(iou_metric.results)
+        self.assertAlmostEqual(res['CLR_FP'], 1.0)
+        self.assertAlmostEqual(res['MOTA'], -1.0)
+
+        disabled_metric = _mota(ignore_regions=False)
+        disabled_metric.process(None, [sample])
+        res = disabled_metric.compute_metrics(disabled_metric.results)
+        self.assertAlmostEqual(res['CLR_FP'], 1.0)
+        self.assertAlmostEqual(res['MOTA'], -1.0)
+
+    def test_zero_valid_gt_frame_counts_prediction_as_fp(self):
+        """The underlying ``compute_oks_pairs`` fix, isolated from
+        suppression: with ``ignore_regions`` off, an all-crowd frame's
+        prediction is a plain false positive -- it is no longer silently
+        dropped before ``process()`` can even attribute it to anything.
+        """
+        sample = _data_sample(
+            gt_keypoints=[[[0.0, 0.0]]],
+            gt_track_ids=[0],
+            gt_iscrowd=[1],
+            pred_keypoints=[[[0.0, 0.0]]],
+            pred_track_ids=[7],
+        )
+        metric = _mota(ignore_regions=False)
+        metric.process(None, [sample])
+        res = metric.compute_metrics(metric.results)
+        self.assertAlmostEqual(res['CLR_FP'], 1.0)
+        self.assertAlmostEqual(res['CLR_TP'], 0.0)
+        self.assertAlmostEqual(res['CLR_FN'], 0.0)
+        self.assertAlmostEqual(res['MOTA'], -1.0)
+
+    def test_matched_prediction_is_protected_even_inside_ignore_region(self):
+        """A real GT/prediction pair is kept even when an ignore region
+        happens to fully cover them too -- the "occasionally completely
+        overlap with ground-truth annotations" case CoMotion notes.
+        """
+        sample = _data_sample(
+            gt_keypoints=[[[0.0, 0.0]], [[0.0, 0.0]]],
+            gt_track_ids=[1, 0],
+            gt_iscrowd=[0, 1],
+            gt_bboxes=[[495.0, 495.0, 505.0, 505.0],
+                       [300.0, 300.0, 1300.0, 1300.0]],
+            pred_keypoints=[[[0.0, 0.0]]],
+            pred_track_ids=[1],
+            pred_bboxes=[[495.0, 495.0, 505.0, 505.0]],
+        )
+        metric = _mota()
+        metric.process(None, [sample])
+        res = metric.compute_metrics(metric.results)
+        self.assertAlmostEqual(res['CLR_TP'], 1.0)
+        self.assertAlmostEqual(res['CLR_FP'], 0.0)
+        self.assertAlmostEqual(res['MOTA'], 1.0)
+
+    def test_unmatched_prediction_dropped_alongside_a_real_match(self):
+        """A second, unmatched prediction inside an ignore region is
+        dropped while a genuine match elsewhere in the same frame stands.
+        """
+        sample = _data_sample(
+            gt_keypoints=[[[0.0, 0.0]], [[0.0, 0.0]]],
+            gt_track_ids=[1, 0],
+            gt_iscrowd=[0, 1],
+            gt_bboxes=[[0.0, 0.0, 10.0, 10.0],
+                       [300.0, 300.0, 1300.0, 1300.0]],
+            pred_keypoints=[[[0.0, 0.0]], [[999.0, 999.0]]],
+            pred_track_ids=[1, 2],
+            pred_bboxes=[[0.0, 0.0, 10.0, 10.0],
+                         [700.0, 700.0, 750.0, 750.0]],
+        )
+        metric = _mota()
+        metric.process(None, [sample])
+        res = metric.compute_metrics(metric.results)
+        self.assertAlmostEqual(res['CLR_TP'], 1.0)
+        self.assertAlmostEqual(res['CLR_FP'], 0.0)
+        self.assertAlmostEqual(res['MOTA'], 1.0)
+
+    def test_ignore_region_with_no_overlap_changes_nothing(self):
+        """An ignore region far from every prediction is a no-op."""
+        sample = _data_sample(
+            gt_keypoints=[[[0.0, 0.0]], [[0.0, 0.0]]],
+            gt_track_ids=[1, 0],
+            gt_iscrowd=[0, 1],
+            gt_bboxes=[[0.0, 0.0, 10.0, 10.0],
+                       [900.0, 900.0, 950.0, 950.0]],
+            pred_keypoints=[[[0.0, 0.0]]],
+            pred_track_ids=[1],
+            pred_bboxes=[[0.0, 0.0, 10.0, 10.0]],
+        )
+
+        enabled = _mota()
+        enabled.process(None, [sample])
+        res_enabled = enabled.compute_metrics(enabled.results)
+
+        disabled = _mota(ignore_regions=False)
+        disabled.process(None, [sample])
+        res_disabled = disabled.compute_metrics(disabled.results)
+
+        self.assertEqual(res_enabled, res_disabled)

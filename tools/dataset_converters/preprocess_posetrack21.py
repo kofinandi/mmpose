@@ -257,11 +257,18 @@ def process_split(
             # dropped from both the TP and the FP count.  ``iscrowd=1``
             # additionally lets one region absorb several detections.
             #
-            # They never reach the temporal metrics: ``compute_oks_pairs``
-            # (mmpose/evaluation/functional/frame_metrics.py) skips crowd
-            # and keypoint-free GT, so MPJVE/MPJAE/IDSwitch, ``gt_recall``
-            # and ``mean_oks`` are unaffected.  ``track_id`` is 0, a
-            # sentinel that no real track uses (those start at 1).
+            # ``compute_oks_pairs`` (mmpose/evaluation/functional/
+            # frame_metrics.py) skips crowd and keypoint-free GT when
+            # *matching*, so these never become a GT track and
+            # MPJVE/MPJAE/IDSwitch, ``gt_recall`` and ``mean_oks`` are
+            # unaffected.  MOTA/IDF1/HOTA (mmpose/evaluation/metrics/
+            # mot_metrics.py) additionally read them back out via
+            # ``iscrowd``/``bboxes`` on ``gt_instances`` to suppress
+            # unmatched predictions landing inside one, so a correct
+            # detection here is not counted as a false positive; see that
+            # module's docstring for the two overlap conventions.
+            # ``track_id`` is 0, a sentinel that no real track uses (those
+            # start at 1).
             #
             # Emitted for unlabeled frames too, so --include-bad-frames
             # gets the same false-positive suppression.

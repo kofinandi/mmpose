@@ -32,15 +32,43 @@ default to **OKS** instead, so they agree with the rest of this package
 match on OKS) and actually measure pose tracking; set ``similarity='iou'``
 for the box-based MOT convention.
 
-There is no equivalent of TrackEval's dataset-specific preprocessing, which
-on MOTChallenge removes predictions that match "distractor" annotation
-classes.  On a dataset that annotates only some of the people in frame
-(EMDB annotates a single subject), every correctly-detected bystander
-counts as a false positive.  That mostly hurts MOTA, which is a raw error
-rate over detections; ``score_thr`` is exposed so those can be traded off
-against recall, but the honest reading is that MOTA on such a dataset
-measures the detector's agreement with the annotation policy at least as
-much as it measures tracking.
+Ignore regions
+--------------
+Some datasets mark image regions that are deliberately left unannotated -
+PoseTrack21's ``ignore_regions_x/y`` polygons, converted by
+``tools/dataset_converters/preprocess_posetrack21.py`` into keypoint-free
+``iscrowd=1`` ground truth - so that a correct detection there is not
+punished as a false positive.  :class:`_MOTBaseMetric` reproduces that
+suppression (``ignore_regions=True`` by default): once each frame's normal
+OKS/IoU matching has run, any *unmatched* prediction overlapping an ignore
+region is dropped before it can count as FP, exactly as TrackEval drops
+"distractor" detections on MOTChallenge.  A prediction already matched to
+real GT is never dropped, whichever ignore region it also happens to touch.
+
+Two overlap conventions decide "overlapping enough", selected by
+``ignore_mode``:
+
+* ``'ioa'`` (default, threshold ``0.3``) - the fraction of the
+  *prediction's own area* that falls inside the region.  This is the fix
+  proposed by CoMotion (Sommer et al., 2025, `arXiv:2504.12186
+  <https://arxiv.org/abs/2504.12186>`_, Appendix A.1).
+* ``'iou'`` (threshold ``0.1``) - the official PoseTrack21 evaluation
+  convention: IoU between the prediction and the region.  CoMotion showed
+  this under-suppresses badly against a large ignore region - a box fully
+  contained in one scored an IoU of only ``0.01`` to ``0.07``, nowhere near
+  the ``0.1`` cutoff - so ``'iou'`` exists for comparability with published
+  numbers, not because it is the better default.
+
+There is no equivalent of TrackEval's *class-based* distractor
+preprocessing (MOTChallenge classes such as "static person" or
+"reflection").  On a dataset that annotates only some of the people in
+frame and has no ignore regions of its own (EMDB annotates a single
+subject), every correctly-detected bystander still counts as a false
+positive.  That mostly hurts MOTA, which is a raw error rate over
+detections; ``score_thr`` is exposed so those can be traded off against
+recall, but the honest reading is that MOTA on such a dataset measures the
+detector's agreement with the annotation policy at least as much as it
+measures tracking.
 """
 
 from collections import defaultdict
@@ -62,6 +90,37 @@ HOTA_ALPHAS = np.arange(0.05, 0.99, 0.05)
 
 _EPS = float(np.finfo('float').eps)
 
+#: Default overlap threshold per :attr:`_MOTBaseMetric.ignore_mode`; see the
+#: module docstring for where these numbers come from.
+_IGNORE_THR_DEFAULTS = {'ioa': 0.3, 'iou': 0.1}
+
+
+def _bbox_area(bboxes: np.ndarray) -> np.ndarray:
+    """``(N,)`` areas of ``xyxy`` boxes, zero-clamped against bad boxes."""
+    return ((bboxes[:, 2] - bboxes[:, 0]).clip(min=0.0) *
+            (bboxes[:, 3] - bboxes[:, 1]).clip(min=0.0))
+
+
+def _bbox_intersection(boxes_a: np.ndarray, boxes_b: np.ndarray) -> np.ndarray:
+    """Pairwise intersection area between two sets of ``xyxy`` boxes.
+
+    Args:
+        boxes_a: ``(M, 4)`` boxes.
+        boxes_b: ``(N, 4)`` boxes.
+
+    Returns:
+        ``(M, N)`` intersection area matrix.
+    """
+    m, n = boxes_a.shape[0], boxes_b.shape[0]
+    if m == 0 or n == 0:
+        return np.zeros((m, n), dtype=np.float64)
+
+    inter_w = (np.minimum(boxes_a[:, None, 2], boxes_b[None, :, 2]) -
+               np.maximum(boxes_a[:, None, 0], boxes_b[None, :, 0]))
+    inter_h = (np.minimum(boxes_a[:, None, 3], boxes_b[None, :, 3]) -
+               np.maximum(boxes_a[:, None, 1], boxes_b[None, :, 1]))
+    return inter_w.clip(min=0.0) * inter_h.clip(min=0.0)
+
 
 def bbox_iou_matrix(gt_bboxes: np.ndarray, pred_bboxes: np.ndarray
                     ) -> np.ndarray:
@@ -74,22 +133,32 @@ def bbox_iou_matrix(gt_bboxes: np.ndarray, pred_bboxes: np.ndarray
     Returns:
         ``(M, N)`` IoU matrix.
     """
-    m, n = gt_bboxes.shape[0], pred_bboxes.shape[0]
-    if m == 0 or n == 0:
-        return np.zeros((m, n), dtype=np.float64)
-
-    inter_w = (np.minimum(gt_bboxes[:, None, 2], pred_bboxes[None, :, 2]) -
-               np.maximum(gt_bboxes[:, None, 0], pred_bboxes[None, :, 0]))
-    inter_h = (np.minimum(gt_bboxes[:, None, 3], pred_bboxes[None, :, 3]) -
-               np.maximum(gt_bboxes[:, None, 1], pred_bboxes[None, :, 1]))
-    inter = inter_w.clip(min=0.0) * inter_h.clip(min=0.0)
-
-    area_gt = ((gt_bboxes[:, 2] - gt_bboxes[:, 0]) *
-               (gt_bboxes[:, 3] - gt_bboxes[:, 1]))
-    area_pred = ((pred_bboxes[:, 2] - pred_bboxes[:, 0]) *
-                 (pred_bboxes[:, 3] - pred_bboxes[:, 1]))
+    inter = _bbox_intersection(gt_bboxes, pred_bboxes)
+    area_gt = _bbox_area(gt_bboxes)
+    area_pred = _bbox_area(pred_bboxes)
     union = area_gt[:, None] + area_pred[None, :] - inter
     return inter / np.maximum(union, _EPS)
+
+
+def bbox_ioa_matrix(regions: np.ndarray, pred_bboxes: np.ndarray
+                    ) -> np.ndarray:
+    """Fraction of each predicted box's area lying inside each region.
+
+    Unlike IoU this is not symmetric: a small box entirely inside a huge
+    region scores ``1.0`` here (all of it overlaps) but a low IoU (most of
+    the union is region that the box does not cover), which is exactly the
+    case an ignore region needs to suppress and IoU does not.
+
+    Args:
+        regions: ``(M, 4)`` region boxes (e.g. ignore regions).
+        pred_bboxes: ``(N, 4)`` predicted boxes.
+
+    Returns:
+        ``(M, N)`` intersection-over-prediction-area matrix.
+    """
+    inter = _bbox_intersection(regions, pred_bboxes)
+    area_pred = _bbox_area(pred_bboxes)
+    return inter / np.maximum(area_pred[None, :], _EPS)
 
 
 @dataclass
@@ -142,6 +211,16 @@ class _MOTBaseMetric(_TemporalBaseMetric):
         score_mode (str): Where the prediction score comes from:
             ``'bbox'``, ``'keypoint'`` (mean over joints) or ``'auto'``
             (prefer bbox, fall back to keypoints).  Default: ``'auto'``.
+        ignore_regions (bool): Suppress unmatched predictions that overlap
+            an ignore-region GT (``iscrowd`` with no keypoints, e.g.
+            PoseTrack21's ``ignore_regions_x/y``) instead of counting them
+            as false positives.  See the module docstring.  A no-op on
+            datasets without such GT.  Default: ``True``.
+        ignore_mode (str): Overlap convention for ``ignore_regions``:
+            ``'ioa'`` (default) or ``'iou'``; see the module docstring.
+        ignore_thr (float, optional): Overlap threshold above which an
+            unmatched prediction is dropped.  Default: ``None``, which
+            resolves to ``0.3`` for ``'ioa'`` and ``0.1`` for ``'iou'``.
         collect_device (str): Device for distributed result collection.
             Default: ``'cpu'``.
         prefix (str, optional): Metric name prefix.  Default: ``None``
@@ -155,6 +234,9 @@ class _MOTBaseMetric(_TemporalBaseMetric):
                  similarity: str = 'oks',
                  score_thr: float = 0.0,
                  score_mode: str = 'auto',
+                 ignore_regions: bool = True,
+                 ignore_mode: str = 'ioa',
+                 ignore_thr: Optional[float] = None,
                  collect_device: str = 'cpu',
                  prefix: Optional[str] = None) -> None:
         if similarity not in ('oks', 'iou'):
@@ -164,11 +246,19 @@ class _MOTBaseMetric(_TemporalBaseMetric):
             raise ValueError(
                 "score_mode must be one of 'bbox', 'keypoint', 'auto', got "
                 f'{score_mode!r}')
+        if ignore_mode not in _IGNORE_THR_DEFAULTS:
+            raise ValueError(
+                'ignore_mode must be one of '
+                f'{sorted(_IGNORE_THR_DEFAULTS)}, got {ignore_mode!r}')
         super().__init__(
             match_thr=match_thr, collect_device=collect_device, prefix=prefix)
         self.similarity = similarity
         self.score_thr = float(score_thr)
         self.score_mode = score_mode
+        self.ignore_regions = bool(ignore_regions)
+        self.ignore_mode = ignore_mode
+        self.ignore_thr = (float(ignore_thr) if ignore_thr is not None else
+                            _IGNORE_THR_DEFAULTS[ignore_mode])
         self._frame_counter = 0
 
     # ------------------------------------------------------------------
@@ -217,6 +307,75 @@ class _MOTBaseMetric(_TemporalBaseMetric):
         pred_b = np.asarray(
             pred_bboxes, dtype=np.float64).reshape(-1, 4)[pred_idx]
         return bbox_iou_matrix(gt_b, pred_b)
+
+    @staticmethod
+    def _ignore_bboxes(gt: dict, n_gt: int) -> np.ndarray:
+        """``(R, 4)`` xyxy boxes of this frame's ignore-region GT.
+
+        An ignore region is GT with ``iscrowd`` set and a positive-extent
+        box.  Keypoint-free GT with ``iscrowd=0`` (an annotated person box
+        with no labelled joints) is deliberately not treated as one, and
+        keeps producing false positives as before.
+        """
+        iscrowd = gt.get('iscrowd')
+        bboxes = gt.get('bboxes')
+        if iscrowd is None or bboxes is None or n_gt == 0:
+            return np.zeros((0, 4), dtype=np.float64)
+        iscrowd = np.asarray(iscrowd).reshape(-1)[:n_gt]
+        boxes = np.asarray(bboxes, dtype=np.float64).reshape(-1, 4)[:n_gt]
+        valid = (iscrowd != 0) & (boxes[:, 2] > boxes[:, 0]) & (
+            boxes[:, 3] > boxes[:, 1])
+        return boxes[valid]
+
+    @staticmethod
+    def _pred_bboxes(pred: dict, pred_kpts: np.ndarray,
+                      pred_sel: np.ndarray) -> np.ndarray:
+        """``(len(pred_sel), 4)`` xyxy boxes for the selected predictions.
+
+        Prefers the model's own boxes; falls back to the keypoints'
+        bounding box for a pipeline that never attaches one.
+        """
+        bboxes = pred.get('bboxes')
+        if bboxes is not None:
+            return np.asarray(
+                bboxes, dtype=np.float64).reshape(-1, 4)[pred_sel]
+        kpts = pred_kpts[pred_sel]
+        return np.concatenate([kpts.min(axis=1), kpts.max(axis=1)], axis=1)
+
+    def _ignore_keep_mask(
+        self,
+        similarity: np.ndarray,
+        ignore_bboxes: np.ndarray,
+        pred_bboxes: np.ndarray,
+    ) -> np.ndarray:
+        """``(N,)`` boolean mask selecting which predictions to keep.
+
+        ``similarity`` is the record's ``(M, N)`` GT/prediction matrix;
+        its rows are already limited to non-crowd, OKS-valid GT.  A
+        prediction protected by a genuine match in this frame -- Hungarian
+        optimal and at least ``match_thr`` -- is always kept, mirroring
+        the recovery mechanism the PoseTrack21 evaluation code uses for
+        predictions that would otherwise fall inside an ignore region.
+        Everything else is dropped once its overlap with an ignore region
+        passes ``ignore_thr``.
+        """
+        n_gt, n_pred = similarity.shape
+        keep = np.ones(n_pred, dtype=bool)
+        if len(ignore_bboxes) == 0 or n_pred == 0:
+            return keep
+
+        protected = np.zeros(n_pred, dtype=bool)
+        if n_gt > 0:
+            rows, cols = linear_sum_assignment(-similarity)
+            accepted = similarity[rows, cols] >= self.match_thr - _EPS
+            protected[cols[accepted]] = True
+
+        overlap_fn = (bbox_ioa_matrix
+                      if self.ignore_mode == 'ioa' else bbox_iou_matrix)
+        overlap = overlap_fn(ignore_bboxes, pred_bboxes)
+        ignored = overlap.max(axis=0) > self.ignore_thr + _EPS
+        keep[~protected & ignored] = False
+        return keep
 
     def process(self, data_batch: Sequence[dict],
                 data_samples: Sequence[dict]) -> None:
@@ -296,6 +455,16 @@ class _MOTBaseMetric(_TemporalBaseMetric):
                 {'bboxes': (np.asarray(pred['bboxes'])[keep_pred]
                             if pred.get('bboxes') is not None else None)},
                 valid_gt_idx, valid_pred_idx, pairs)
+
+            if self.ignore_regions and len(pred_sel):
+                ignore_bboxes = self._ignore_bboxes(gt, n_gt)
+                if len(ignore_bboxes):
+                    pred_bboxes = self._pred_bboxes(pred, pred_kpts, pred_sel)
+                    keep = self._ignore_keep_mask(
+                        record['similarity'], ignore_bboxes, pred_bboxes)
+                    if not keep.all():
+                        record['pred_ids'] = record['pred_ids'][keep]
+                        record['similarity'] = record['similarity'][:, keep]
 
             self.results.append(record)
 

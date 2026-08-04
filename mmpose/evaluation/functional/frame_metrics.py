@@ -223,7 +223,13 @@ def compute_oks_pairs(
 
     "Valid" GT excludes crowd regions and GT with no labeled keypoints;
     "valid" pred excludes instances with no keypoints at all — see
-    :func:`match_instances_oks` for the exact semantics.
+    :func:`match_instances_oks` for the exact semantics.  The two are
+    independent: a frame with zero valid GT (e.g. all crowd, or none at
+    all) still reports every keypoint-bearing prediction in
+    ``valid_pred_idx``, so a caller that counts unmatched-but-present
+    predictions as false positives (as :class:`~mmpose.evaluation.metrics.
+    MOTA` does) attributes them correctly instead of silently dropping
+    them.
 
     Returns:
         Tuple of:
@@ -254,21 +260,23 @@ def compute_oks_pairs(
                 continue  # no labeled keypoints → can't match
         valid_gt_idx.append(gi)
 
-    if not valid_gt_idx or not pred_list or num_kpts == 0:
-        return [], valid_gt_idx, []
-
-    # Pre-build pred keypoint array (N, K, 2) and track original indices
-    pred_kpts_list: List[np.ndarray] = []
+    # Pre-build pred keypoint array (N, K, 2) and track original indices.
+    # Computed unconditionally -- *not* gated on ``valid_gt_idx`` -- so a
+    # frame with no valid GT still reports which predictions exist; see
+    # the docstring note above.
     valid_pred_idx: List[int] = []
-    for pi, pred in enumerate(pred_list):
-        kpts = pred.get('keypoints')
-        if kpts is None:
-            continue
-        pred_kpts_list.append(_pad_or_trim_kpts(np.asarray(kpts), num_kpts))
-        valid_pred_idx.append(pi)
+    pred_kpts_list: List[np.ndarray] = []
+    if num_kpts > 0:
+        for pi, pred in enumerate(pred_list):
+            kpts = pred.get('keypoints')
+            if kpts is None:
+                continue
+            pred_kpts_list.append(
+                _pad_or_trim_kpts(np.asarray(kpts), num_kpts))
+            valid_pred_idx.append(pi)
 
-    if not pred_kpts_list:
-        return [], valid_gt_idx, []
+    if not valid_gt_idx or not pred_kpts_list:
+        return [], valid_gt_idx, valid_pred_idx
 
     pred_kpts_arr = np.stack(pred_kpts_list, axis=0)  # (N, K, 2)
 
