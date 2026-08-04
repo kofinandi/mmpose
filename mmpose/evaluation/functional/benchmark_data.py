@@ -12,8 +12,12 @@ import hashlib
 import json
 import os
 import os.path as osp
+import queue
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Tuple
 
 import mmcv
 import numpy as np
@@ -54,14 +58,23 @@ class GTInstance:
 
 @dataclass
 class UnifiedSample:
-    """One image with its GT annotations and prefetched pixel data."""
+    """One image with its GT annotations and (optionally) pixel data.
+
+    ``image`` is ``None`` until pixels have been loaded (see
+    :func:`load_sample_image` / :class:`SampleImageStream`), and may be set
+    back to ``None`` once a consumer is done with it to free memory in
+    chunked-prefetch mode.
+    """
 
     img_id: int
     img_path: str
-    image: np.ndarray                   # BGR HWC uint8
+    image: Optional[np.ndarray]         # BGR HWC uint8, or None if unloaded
     ori_shape: Tuple[int, int]          # (H, W)
     gt_instances: List[GTInstance] = field(default_factory=list)
     crowd_index: Optional[float] = None  # CrowdPose crowdIndex
+    # Guards against double-scaling GT when load_sample_image is called more
+    # than once for the same sample (e.g. re-fetched after being released).
+    gt_scaled: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -123,21 +136,26 @@ def _scale_gt_instances(
 # Unified loader
 # ---------------------------------------------------------------------------
 
-def load_unified_samples(
+def build_unified_samples(
     dataset_name: str,
     num_frames: Optional[int] = None,
     include_bad_frames: bool = False,
 ) -> List[UnifiedSample]:
-    """Load GT annotations and prefetch images for all supported datasets.
+    """Load GT annotations (metadata only, no pixel data) for all datasets.
 
     Returns one :class:`UnifiedSample` per unique image (including images
-    with zero annotations so the denominator for recall is correct).
-    Keypoints are always converted to COCO-17 format.
+    with zero annotations so the denominator for recall is correct), with
+    ``image=None``. Keypoints are always converted to COCO-17 format.
 
     The raw annotation data is obtained via
     :meth:`BaseCocoStyleDataset._load_annotations` **without** any
     ``_is_valid_instance`` or ``_get_topdown_data_infos`` filtering, so
     every annotation (including ``iscrowd=1``) is preserved.
+
+    Use :func:`load_sample_image` (directly, or via :class:`SampleImageStream`)
+    to populate ``image`` before running inference. For the common case of
+    eagerly loading every image up front, use :func:`load_unified_samples`
+    instead, which wraps this function.
 
     Args:
         dataset_name: One of ``'coco', 'crowdpose', 'mpii', 'aic',
@@ -158,7 +176,7 @@ def load_unified_samples(
             support the kwarg. Default: ``False``.
 
     Returns:
-        List of :class:`UnifiedSample` in dataset order.
+        List of :class:`UnifiedSample` (``image=None``) in dataset order.
     """
     init_default_scope('mmpose')
 
@@ -206,6 +224,11 @@ def load_unified_samples(
                 'img_path': img['img_path'],
                 # CrowdPose stores crowdIndex in the raw COCO image dict
                 'crowd_index': img.get('crowdIndex') or img.get('crowd_index'),
+                # COCO-style raw image dicts carry width/height; used as a
+                # placeholder ori_shape before pixels are loaded (e.g. MPII
+                # has neither, so ori_shape stays (0, 0) until loaded).
+                'width': img.get('width'),
+                'height': img.get('height'),
             }
 
     # ── Ordered unique img_ids with optional num_frames cap ─────────────
@@ -314,12 +337,7 @@ def load_unified_samples(
             track_id=track_id,
         )
 
-    # ── Prefetch images ───────────────────────────────────────────────────
-    if prefetch_scale is not None and prefetch_scale != 1.0:
-        print(f'Prefetching {len(seen_img_ids)} images '
-              f'at scale {prefetch_scale} ...')
-    else:
-        print(f'Prefetching {len(seen_img_ids)} images ...')
+    # ── Build samples (metadata only; no pixel data yet) ────────────────────
     samples: List[UnifiedSample] = []
     for img_id in seen_img_ids:
         info = img_info.get(img_id)
@@ -328,38 +346,209 @@ def load_unified_samples(
             if insts:
                 img_path = insts[0]['img_path']
                 crowd_index = None
+                width = height = None
             else:
                 continue  # cannot determine image path
         else:
             img_path = info['img_path']
             crowd_index = info.get('crowd_index')
-
-        image = mmcv.imread(img_path)
-        if image is None:
-            print(f'Warning: could not read {img_path}, skipping.')
-            continue
+            width = info.get('width')
+            height = info.get('height')
 
         gt_instances = [
             _parse_instance(inst) for inst in img_to_instances[img_id]
         ]
 
-        if prefetch_scale is not None and prefetch_scale != 1.0:
-            image, sx, sy = _resize_prefetch_image(image, prefetch_scale)
-            _scale_gt_instances(gt_instances, sx, sy)
-
-        h, w = image.shape[:2]
+        # Placeholder ori_shape from raw annotation metadata (if available);
+        # load_sample_image overwrites this with the true, possibly
+        # downscaled, shape once pixels are read.
+        ori_shape = (int(height), int(width)) if (width and height) else (0, 0)
 
         samples.append(UnifiedSample(
             img_id=img_id,
             img_path=img_path,
-            image=image,
-            ori_shape=(h, w),
+            image=None,
+            ori_shape=ori_shape,
             gt_instances=gt_instances,
             crowd_index=crowd_index,
         ))
 
-    print(f'Prefetch complete. Loaded {len(samples)} images.')
     return samples
+
+
+def load_sample_image(
+    sample: UnifiedSample,
+    prefetch_scale: Optional[float] = None,
+) -> None:
+    """Load (and optionally downscale) pixel data for *sample*, in place.
+
+    No-op if ``sample.image`` is already set. On a successful read, sets
+    ``sample.image`` and the final ``sample.ori_shape``; on failure, prints
+    a warning and leaves ``sample.image`` as ``None`` (the placeholder
+    ``ori_shape`` from :func:`build_unified_samples` is left untouched).
+
+    GT bboxes/keypoints/areas are scaled to match a downscaled image only
+    once per sample (guarded by ``sample.gt_scaled``), so calling this
+    again after ``sample.image`` has been released back to ``None`` (e.g.
+    by :class:`SampleImageStream`) does not double-scale GT.
+
+    Args:
+        sample: Sample to populate in place.
+        prefetch_scale: If set and not ``1.0``, downscale the image by this
+            factor and scale GT to match (see ``prefetch_scale`` on
+            :class:`~mmpose.evaluation.benchmark_datasets.BenchmarkTestDataset`).
+    """
+    if sample.image is not None:
+        return
+
+    image = mmcv.imread(sample.img_path)
+    if image is None:
+        print(f'Warning: could not read {sample.img_path}, skipping.')
+        return
+
+    if prefetch_scale is not None and prefetch_scale != 1.0:
+        image, sx, sy = _resize_prefetch_image(image, prefetch_scale)
+        if not sample.gt_scaled:
+            _scale_gt_instances(sample.gt_instances, sx, sy)
+            sample.gt_scaled = True
+
+    h, w = image.shape[:2]
+    sample.image = image
+    sample.ori_shape = (h, w)
+
+
+def load_unified_samples(
+    dataset_name: str,
+    num_frames: Optional[int] = None,
+    include_bad_frames: bool = False,
+) -> List[UnifiedSample]:
+    """Load GT annotations and eagerly prefetch every image up front.
+
+    Thin wrapper around :func:`build_unified_samples` +
+    :func:`load_sample_image` that preserves the original all-at-once
+    loading behaviour. See :func:`build_unified_samples` for argument docs.
+    Prefer :class:`SampleImageStream` with ``chunk_size`` set for very large
+    datasets (e.g. PoseTrack21) that don't fit in memory all at once.
+
+    Returns:
+        List of :class:`UnifiedSample` (with pixel data loaded) in dataset
+        order. Samples whose image failed to load are dropped.
+    """
+    spec = BENCHMARK_TEST_DATASETS[dataset_name]
+    prefetch_scale = spec.prefetch_scale
+
+    samples = build_unified_samples(
+        dataset_name, num_frames, include_bad_frames=include_bad_frames)
+
+    if prefetch_scale is not None and prefetch_scale != 1.0:
+        print(f'Prefetching {len(samples)} images '
+              f'at scale {prefetch_scale} ...')
+    else:
+        print(f'Prefetching {len(samples)} images ...')
+
+    loaded: List[UnifiedSample] = []
+    for sample in samples:
+        load_sample_image(sample, prefetch_scale)
+        if sample.image is not None:
+            loaded.append(sample)
+
+    print(f'Prefetch complete. Loaded {len(loaded)} images.')
+    return loaded
+
+
+# ---------------------------------------------------------------------------
+# Chunked image streaming (for large datasets that don't fit in RAM)
+# ---------------------------------------------------------------------------
+
+class SampleImageStream:
+    """Yield :class:`UnifiedSample`\\ s with pixel data, in bounded chunks.
+
+    Two modes:
+
+    - ``chunk_size=None`` (default): eager pass-through. ``samples`` are
+      assumed to already carry their pixel data (e.g. from
+      :func:`load_unified_samples`); iteration just yields them in order
+      with no extra memory or timing overhead.
+    - ``chunk_size=N``: chunked prefetch. ``samples`` are assumed to carry
+      *no* pixel data yet (e.g. from :func:`build_unified_samples`). A
+      background thread walks the sample list in fixed-size chunks of
+      ``N``, decoding each chunk's images in parallel via a
+      ``ThreadPoolExecutor`` (OpenCV's decoder releases the GIL, so this
+      parallelises real work) and buffering up to ``queue_chunks`` decoded
+      chunks ahead of the consumer. Once a chunk has been fully consumed
+      (i.e. the caller has moved on to the next chunk), every sample in it
+      has ``image`` reset to ``None`` so it can be garbage collected --
+      anyone holding their own reference to the pixel array (e.g. a
+      producer/consumer queue item) keeps it alive regardless. Peak
+      resident image memory is roughly ``chunk_size * (queue_chunks + 1)``
+      samples instead of the whole dataset.
+
+    Regardless of mode, iterating always yields exactly ``len(samples)``
+    items, in order, including samples whose image failed to decode
+    (yielded with ``image=None``) -- this keeps a 1:1 mapping between
+    sample index and ``frame_id`` for callers that rely on it.
+    """
+
+    def __init__(
+        self,
+        samples: List[UnifiedSample],
+        prefetch_scale: Optional[float] = None,
+        chunk_size: Optional[int] = None,
+        queue_chunks: int = 2,
+        workers: int = 4,
+    ) -> None:
+        self.samples = samples
+        self.prefetch_scale = prefetch_scale
+        self.chunk_size = chunk_size
+        self.queue_chunks = max(1, queue_chunks)
+        self.workers = max(1, workers)
+        self.stall_s = 0.0  # cumulative time spent blocked waiting for data
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __iter__(self) -> Iterator[UnifiedSample]:
+        self.stall_s = 0.0
+
+        if self.chunk_size is None:
+            yield from self.samples
+            return
+
+        chunk_queue: 'queue.Queue' = queue.Queue(maxsize=self.queue_chunks)
+        _sentinel = object()
+        errors: List[BaseException] = []
+
+        def _produce() -> None:
+            try:
+                with ThreadPoolExecutor(max_workers=self.workers) as pool:
+                    for start in range(0, len(self.samples), self.chunk_size):
+                        chunk = self.samples[start:start + self.chunk_size]
+                        list(pool.map(
+                            lambda s: load_sample_image(
+                                s, self.prefetch_scale),
+                            chunk))
+                        chunk_queue.put(chunk)
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+            finally:
+                chunk_queue.put(_sentinel)
+
+        producer = threading.Thread(target=_produce, daemon=True)
+        producer.start()
+
+        while True:
+            t0 = time.perf_counter()
+            chunk = chunk_queue.get()
+            self.stall_s += time.perf_counter() - t0
+            if chunk is _sentinel:
+                break
+            yield from chunk
+            for sample in chunk:
+                sample.image = None
+
+        producer.join()
+        if errors:
+            raise errors[0]
 
 
 # ---------------------------------------------------------------------------

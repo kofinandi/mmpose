@@ -10,13 +10,26 @@ Quality metrics are the same as tools/test.py (CocoMetric, PCK, etc.).
 Performance metrics cover FPS and per-frame/per-location latency at
 whole-pipeline and per-stage granularity.
 
-Data loading is unified via :func:`load_unified_samples`: all datasets
-(coco, crowdpose, mpii, aic, ochuman, emdb, 3dpw) go through one code path that
-loads every annotation unfiltered, converts keypoints to COCO-17 format,
-and prefetches images.  EMDB and 3DPW downscale prefetched images (default
-~0.33x) to reduce RAM; GT annotations are scaled to match.  GT is never read
-from the model pipeline; it is assembled from :class:`UnifiedSample` and
+Data loading is unified: all datasets (coco, crowdpose, mpii, aic, ochuman,
+emdb, 3dpw, posetrack21) go through one code path that loads every
+annotation unfiltered and converts keypoints to COCO-17 format.  EMDB and
+3DPW downscale images (default ~0.33x) to reduce RAM; GT annotations are
+scaled to match.  GT is never read from the model pipeline; it is assembled
+from :class:`~mmpose.evaluation.functional.benchmark_data.UnifiedSample` and
 attached to each :class:`PoseDataSample` before metric evaluation.
+
+By default (:func:`~mmpose.evaluation.functional.benchmark_data.load_unified_samples`)
+every image is decoded up front, which eliminates disk I/O from the timed
+loop but does not fit large datasets (e.g. PoseTrack21) in memory all at
+once. Pass ``--prefetch-chunk-size N`` to instead build samples with
+:func:`~mmpose.evaluation.functional.benchmark_data.build_unified_samples`
+(metadata only) and stream their pixel data in bounded chunks via
+:class:`~mmpose.evaluation.functional.benchmark_data.SampleImageStream`,
+decoding in the background while inference runs on already-decoded chunks.
+This trades a bounded amount of RAM for the possibility that decoding
+becomes the bottleneck; watch the reported ``dataload/stall_s`` perf key
+(and the warning printed when it is significant) to tell whether measured
+FPS is I/O-bound.
 """
 
 from mmpose.compat.transformers_v5 import install_transformers_v5_shims
@@ -32,7 +45,7 @@ import queue
 import threading
 import time
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Tuple
 
 import mmcv
 import numpy as np
@@ -55,8 +68,10 @@ from mmpose.evaluation.benchmark_datasets import BENCHMARK_TEST_DATASETS
 from mmpose.evaluation.functional import nms
 from mmpose.evaluation.functional.benchmark_data import (
     GTInstance,
+    SampleImageStream,
     UnifiedSample,
     build_det_ann_from_samples,
+    build_unified_samples,
     is_valid_instance,
     load_unified_samples,
 )
@@ -121,6 +136,49 @@ def _init_scope(cfg: Config) -> None:
 def _data_root_for_dataset(dataset_name: str) -> str:
     """Return the data root for the dataset being evaluated."""
     return BENCHMARK_TEST_DATASETS[dataset_name].data_root
+
+
+def _blank_image(ori_shape: Tuple[int, int]) -> np.ndarray:
+    """Build a black placeholder image for a sample whose decode failed.
+
+    Used so a single unreadable frame (possible in chunked-prefetch mode,
+    where every sample must still flow through the pipeline to preserve
+    ``frame_id`` alignment) degrades to a zero-detection frame instead of
+    crashing the run.
+    """
+    h, w = max(int(ori_shape[0]), 1), max(int(ori_shape[1]), 1)
+    return np.zeros((h, w, 3), dtype=np.uint8)
+
+
+def _batched_samples(
+    sample_stream,
+    batch_size: int,
+) -> Iterator[List[Tuple[int, UnifiedSample, Optional[np.ndarray]]]]:
+    """Group a sample stream into ``(frame_id, sample, image)`` batches.
+
+    ``frame_id`` is the running index into the stream, i.e. the index into
+    the original samples list, giving callers a stable id to key
+    dictionaries by (e.g. ``frame_start_times`` / ``det_predictions`` in
+    :func:`run_topdown`) -- matching the dataset-order semantics the rest
+    of the pipeline relies on, regardless of whether the stream is eager
+    or chunked.
+
+    Each sample's ``image`` is captured the instant it is pulled from
+    ``sample_stream``, rather than left to be read later from
+    ``sample.image``. This matters once a single output batch spans more
+    than one of :class:`SampleImageStream`'s internal decode chunks (e.g.
+    ``chunk_size < batch_size``): by the time such a batch is fully
+    assembled and handed off, the stream has already advanced past -- and
+    released -- the chunk(s) containing its earliest samples.
+    """
+    batch: List[Tuple[int, UnifiedSample, Optional[np.ndarray]]] = []
+    for frame_id, sample in enumerate(sample_stream):
+        batch.append((frame_id, sample, sample.image))
+        if len(batch) >= batch_size:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
 
 
 # ── Evaluator helpers ──────────────────────────────────────────────────────
@@ -460,6 +518,7 @@ def _run_post_processing(
 def run_bottomup(
     model,
     samples: List[UnifiedSample],
+    sample_stream: 'SampleImageStream',
     val_pipeline: Compose,
     dataset_meta: dict,
     kp_batch_size: int,
@@ -469,16 +528,21 @@ def run_bottomup(
 ) -> Tuple[Dict[int, PoseDataSample], dict]:
     """Run bottomup inference on unified samples.
 
-    Builds each batch lazily right before it is consumed (images are
-    already prefetched, so this only pays pipeline/collation cost, not
-    disk I/O) instead of pre-building every batch up front.  This keeps
-    peak RAM at roughly one batch's worth of preprocessed tensors instead
-    of the whole dataset at model-input resolution.  GT and evaluation are
-    handled in :func:`main`.
+    Batches are pulled from ``sample_stream`` rather than by indexing
+    ``samples`` directly.  In eager mode (``samples`` already carry pixel
+    data) this only pays pipeline/collation cost per batch, not disk I/O.
+    In chunked-prefetch mode, images are additionally decoded lazily in
+    the background as the stream is consumed, so peak RAM is roughly one
+    batch's worth of preprocessed tensors plus a few chunks of raw images,
+    instead of the whole dataset at once.  GT and evaluation are handled
+    in :func:`main`.
 
     Args:
         model: Bottomup pose estimator.
-        samples: Loaded unified samples (one per image).
+        samples: Loaded unified samples (one per image); only its length is
+            used here, ``sample_stream`` is the actual source of pixels.
+        sample_stream: Stream yielding each sample (with pixel data) once,
+            in the same order as ``samples``.
         val_pipeline: Val pipeline from config; first step handles
             pre-loaded images via ``LoadImage``.
         dataset_meta: Model dataset meta for pipeline augmentation.
@@ -497,15 +561,15 @@ def run_bottomup(
     batch_latencies: List[Tuple[float, int]] = []
     pred_by_img_id: Dict[int, PoseDataSample] = {}
 
-    for i in range(n_batches):
-        start = i * kp_batch_size
-        end = min(start + kp_batch_size, n)
-
+    for i, batch_samples in enumerate(
+            _batched_samples(sample_stream, kp_batch_size)):
         items = []
         img_ids = []
-        for sample in samples[start:end]:
+        for _, sample, img in batch_samples:
+            if img is None:
+                img = _blank_image(sample.ori_shape)
             di: dict = {
-                'img': sample.image,
+                'img': img,
                 'img_path': sample.img_path,
                 'img_id': sample.img_id,
                 # Use GT annotation IDs so CocoMetric gets the right IDs
@@ -562,6 +626,7 @@ def run_bottomup(
         'e2e/latency_ms_per_frame': (
             1000.0 * sum(per_frame) / len(per_frame) if per_frame else 0.0
         ),
+        'dataload/stall_s': sample_stream.stall_s,
     }
     return pred_by_img_id, perf
 
@@ -569,8 +634,8 @@ def run_bottomup(
 # ── Topdown pipeline ───────────────────────────────────────────────────────
 
 def _mock_detector_producer(
-    prefetched_images: List[Tuple[int, np.ndarray]],
-    gt_bboxes_per_frame: Dict[int, Tuple[np.ndarray, np.ndarray]],
+    sample_batches: Iterator[List[Tuple[int, UnifiedSample, Optional[np.ndarray]]]],
+    n_images: int,
     det_batch_size: int,
     bbox_queue: queue.Queue,
     log_interval: int,
@@ -579,35 +644,50 @@ def _mock_detector_producer(
     zero_det_frames: dict,
     det_predictions: dict,
 ) -> None:
-    """Producer: push GT BBoxItems into bbox_queue without running a detector."""
-    n = len(prefetched_images)
-    n_batches = -(-n // det_batch_size)
+    """Producer: push GT BBoxItems into bbox_queue without running a detector.
 
-    for batch_start in range(0, n, det_batch_size):
-        batch_end = min(batch_start + det_batch_size, n)
-        batch = prefetched_images[batch_start:batch_end]
+    A sample whose image failed to decode (``image is None``, only
+    possible in chunked-prefetch mode) is treated as a zero-detection
+    frame regardless of its GT, since there is no image to run the
+    keypoint model on.
+    """
+    n_batches = -(-n_images // det_batch_size)
+
+    for batch_idx, batch in enumerate(sample_batches):
+        batch_start = batch[0][0]
+        batch_end = batch[-1][0] + 1
 
         wall_start = time.perf_counter()
-        for fid in range(batch_start, batch_end):
+        for fid, _, _ in batch:
             frame_start_times[fid] = wall_start
 
-        batch_idx = batch_start // det_batch_size
         if (batch_idx + 1) % log_interval == 0 or (batch_idx + 1) == n_batches:
             print(f'  [mock-detector] batch {batch_idx + 1}/{n_batches} '
                   f'| frames processed: {batch_end}')
 
         wall_after = time.perf_counter()
 
-        for rel, (img_id, img) in enumerate(batch):
-            frame_id = batch_start + rel
-            h, w = img.shape[:2]
+        for frame_id, sample, img in batch:
+            img_id = sample.img_id
+            h, w = sample.ori_shape
 
-            bboxes_xyxy, scores = gt_bboxes_per_frame.get(
-                frame_id, (np.zeros((0, 4), dtype=np.float32),
-                            np.zeros(0, dtype=np.float32)))
+            if img is None:
+                bboxes_xyxy = np.zeros((0, 4), dtype=np.float32)
+                scores = np.zeros(0, dtype=np.float32)
+            else:
+                valid = [
+                    g for g in sample.gt_instances if is_valid_instance(g)
+                ]
+                if valid:
+                    bboxes_xyxy = np.stack(
+                        [g.bbox for g in valid], axis=0)
+                    scores = np.ones(len(valid), dtype=np.float32)
+                else:
+                    bboxes_xyxy = np.zeros((0, 4), dtype=np.float32)
+                    scores = np.zeros(0, dtype=np.float32)
 
             det_predictions[frame_id] = (bboxes_xyxy, scores)
-            n_bboxes = len(bboxes_xyxy)
+            n_bboxes = 0 if img is None else len(bboxes_xyxy)
 
             if n_bboxes == 0:
                 zero_det_frames[frame_id] = (img_id, (h, w))
@@ -629,7 +709,8 @@ def _mock_detector_producer(
 
 def _detector_producer(
     detector,
-    prefetched_images: List[Tuple[int, np.ndarray]],
+    sample_batches: Iterator[List[Tuple[int, UnifiedSample, Optional[np.ndarray]]]],
+    n_images: int,
     det_batch_size: int,
     bbox_thr: float,
     nms_thr: float,
@@ -643,26 +724,34 @@ def _detector_producer(
     zero_det_frames: dict,
     det_predictions: dict,
 ) -> None:
-    """Producer: run detector and push BBoxItems into bbox_queue."""
-    n = len(prefetched_images)
-    n_batches = -(-n // det_batch_size)
+    """Producer: run detector and push BBoxItems into bbox_queue.
 
-    for batch_start in range(0, n, det_batch_size):
-        batch_end = min(batch_start + det_batch_size, n)
-        batch = prefetched_images[batch_start:batch_end]
+    A sample whose image failed to decode (``image is None``, only
+    possible in chunked-prefetch mode) is fed to the detector as a blank
+    placeholder (to keep batch construction simple) but its result is
+    always forced to a zero-detection frame, since there is no real image
+    to run the keypoint model on either way.
+    """
+    n_batches = -(-n_images // det_batch_size)
+
+    for batch_idx, batch in enumerate(sample_batches):
+        batch_start = batch[0][0]
+        batch_end = batch[-1][0] + 1
 
         wall_start = time.perf_counter()
-        for fid in range(batch_start, batch_end):
+        for fid, _, _ in batch:
             frame_start_times[fid] = wall_start
 
-        imgs = [img for _, img in batch]
+        imgs = [
+            img if img is not None else _blank_image(sample.ori_shape)
+            for _, sample, img in batch
+        ]
         with torch.no_grad():
             with _CudaTimer() as timer:
                 det_results = inference_det_model(detector, imgs)
 
         wall_after_det = time.perf_counter()
 
-        batch_idx = batch_start // det_batch_size
         if batch_idx >= warmup_batches:
             det_timings.append((timer.elapsed_s, len(batch)))
 
@@ -674,27 +763,33 @@ def _detector_producer(
                   f'| frames processed: {batch_end} '
                   f'| running FPS: {fps_so_far:.1f}')
 
-        for rel, ((img_id, img), det_result) in enumerate(
-                zip(batch, det_results)):
-            frame_id = batch_start + rel
-            pred = det_result.pred_instances.cpu().numpy()
+        for (frame_id, sample, orig_img), img, det_result in zip(
+                batch, imgs, det_results):
+            img_id = sample.img_id
+            h, w = sample.ori_shape
+            decode_failed = orig_img is None
 
-            mask = np.logical_and(pred.labels == det_cat_id,
-                                  pred.scores > bbox_thr)
-            bboxes_s = np.concatenate(
-                [pred.bboxes[mask], pred.scores[mask, None]], axis=1)
-
-            if bboxes_s.shape[0] > 0:
-                keep = nms(bboxes_s, nms_thr)
-                bboxes_xyxy = bboxes_s[keep, :4]
-                scores = bboxes_s[keep, 4]
+            if decode_failed:
+                bboxes_xyxy = np.zeros((0, 4), dtype=np.float32)
+                scores = np.zeros(0, dtype=np.float32)
             else:
-                bboxes_xyxy = bboxes_s[:, :4]
-                scores = np.array([], dtype=np.float32)
+                pred = det_result.pred_instances.cpu().numpy()
+
+                mask = np.logical_and(pred.labels == det_cat_id,
+                                      pred.scores > bbox_thr)
+                bboxes_s = np.concatenate(
+                    [pred.bboxes[mask], pred.scores[mask, None]], axis=1)
+
+                if bboxes_s.shape[0] > 0:
+                    keep = nms(bboxes_s, nms_thr)
+                    bboxes_xyxy = bboxes_s[keep, :4]
+                    scores = bboxes_s[keep, 4]
+                else:
+                    bboxes_xyxy = bboxes_s[:, :4]
+                    scores = np.array([], dtype=np.float32)
 
             det_predictions[frame_id] = (bboxes_xyxy, scores)
-            n_bboxes = len(bboxes_xyxy)
-            h, w = img.shape[:2]
+            n_bboxes = 0 if decode_failed else len(bboxes_xyxy)
 
             if n_bboxes == 0:
                 zero_det_frames[frame_id] = (img_id, (h, w))
@@ -839,6 +934,7 @@ def run_topdown(
     det_model,
     kp_model,
     samples: List[UnifiedSample],
+    sample_stream: 'SampleImageStream',
     det_batch_size: int,
     kp_batch_size: int,
     queue_strategy: str,
@@ -864,7 +960,12 @@ def run_topdown(
     Args:
         det_model: Detector model (ignored when ``use_mock_detector=True``).
         kp_model: Keypoint model.
-        samples: Unified samples (one per image).
+        samples: Unified samples (one per image); only its length is used
+            here, ``sample_stream`` is the actual source of pixels.
+        sample_stream: Stream yielding each sample (with pixel data) once,
+            in the same order as ``samples``. Feeds the detector producer;
+            GT bboxes for the mock detector are computed per sample as the
+            stream is consumed.
         det_batch_size: Detector batch size.
         kp_batch_size: Keypoint model batch size.
         queue_strategy: One of ``'full_batch'``, ``'any'``, ``'same_frame'``.
@@ -891,23 +992,8 @@ def run_topdown(
     kp_pipeline = Compose(kp_pipeline_cfg)
     dataset_meta = kp_model.dataset_meta
 
-    # Convert samples to the legacy (img_id, img) tuple list for producers
-    prefetched_images: List[Tuple[int, np.ndarray]] = [
-        (s.img_id, s.image) for s in samples
-    ]
-
-    # Build GT bboxes for mock detector (valid instances only)
-    gt_bboxes_per_frame: Dict[int, Tuple[np.ndarray, np.ndarray]] = {}
-    if use_mock_detector:
-        for fid, sample in enumerate(samples):
-            valid = [g for g in sample.gt_instances if is_valid_instance(g)]
-            if valid:
-                bboxes = np.stack([g.bbox for g in valid], axis=0)
-                scores = np.ones(len(valid), dtype=np.float32)
-            else:
-                bboxes = np.zeros((0, 4), dtype=np.float32)
-                scores = np.zeros(0, dtype=np.float32)
-            gt_bboxes_per_frame[fid] = (bboxes, scores)
+    n_images = len(samples)
+    sample_batches = _batched_samples(sample_stream, det_batch_size)
 
     bbox_queue: queue.Queue = queue.Queue(maxsize=kp_batch_size * 8)
 
@@ -923,7 +1009,7 @@ def run_topdown(
     if use_mock_detector:
         producer = threading.Thread(
             target=_mock_detector_producer,
-            args=(prefetched_images, gt_bboxes_per_frame, det_batch_size,
+            args=(sample_batches, n_images, det_batch_size,
                   bbox_queue, log_interval,
                   frame_start_times, frame_end_times, zero_det_frames,
                   det_predictions),
@@ -932,8 +1018,8 @@ def run_topdown(
     else:
         producer = threading.Thread(
             target=_detector_producer,
-            args=(det_model, prefetched_images, det_batch_size, bbox_thr,
-                  nms_thr, det_cat_id, bbox_queue, warmup_batches,
+            args=(det_model, sample_batches, n_images, det_batch_size,
+                  bbox_thr, nms_thr, det_cat_id, bbox_queue, warmup_batches,
                   log_interval, det_timings, frame_start_times,
                   frame_end_times, zero_det_frames, det_predictions),
             daemon=True,
@@ -953,7 +1039,6 @@ def run_topdown(
     consumer.join()
 
     # ── Performance metrics ─────────────────────────────────────────────
-    n_images = len(samples)
     complete_fids = [
         fid for fid in range(n_images)
         if fid in frame_start_times and fid in frame_end_times
@@ -1011,6 +1096,7 @@ def run_topdown(
             1000.0 * sum(kp_per_loc) / len(kp_per_loc)
             if kp_per_loc else 0.0
         ),
+        'dataload/stall_s': sample_stream.stall_s,
     }
 
     # ── Assemble one PoseDataSample per image ─────────────────────────────
@@ -1354,6 +1440,20 @@ def _parse_args():
     p.add_argument('--num-frames', type=int, default=None,
                    help='Cap number of images evaluated (default: full val set)')
     p.add_argument(
+        '--prefetch-chunk-size', type=int, default=0,
+        help='If > 0, load images lazily in chunks of this many frames '
+             'instead of decoding the whole dataset up front. Use this for '
+             'large datasets (e.g. PoseTrack21) that do not fit in memory '
+             'all at once. Default: 0 (eager, load everything up front).')
+    p.add_argument(
+        '--prefetch-queue-chunks', type=int, default=2,
+        help='Number of decoded chunks buffered ahead of the consumer when '
+             '--prefetch-chunk-size > 0 (default: 2).')
+    p.add_argument(
+        '--prefetch-workers', type=int, default=4,
+        help='Parallel image-decode threads per chunk when '
+             '--prefetch-chunk-size > 0 (default: 4).')
+    p.add_argument(
         '--include-bad-frames', action='store_true',
         help='EMDB/3DPW only: also load frames normally excluded for '
              'lacking reliable GT (e.g. EMDB invalid_idxs, 3DPW frames with '
@@ -1468,9 +1568,27 @@ def main():
 
     # ── Unified data loading ───────────────────────────────────────────────
     print(f'\nLoading dataset: {args.test_dataset}')
-    samples = load_unified_samples(
-        args.test_dataset, args.num_frames,
-        include_bad_frames=args.include_bad_frames)
+    if args.prefetch_chunk_size > 0:
+        samples = build_unified_samples(
+            args.test_dataset, args.num_frames,
+            include_bad_frames=args.include_bad_frames)
+        prefetch_scale = BENCHMARK_TEST_DATASETS[args.test_dataset].prefetch_scale
+        print(f'  Chunked prefetch enabled: {len(samples)} images, '
+              f'chunk_size={args.prefetch_chunk_size}, '
+              f'queue_chunks={args.prefetch_queue_chunks}, '
+              f'workers={args.prefetch_workers}')
+        sample_stream = SampleImageStream(
+            samples,
+            prefetch_scale=prefetch_scale,
+            chunk_size=args.prefetch_chunk_size,
+            queue_chunks=args.prefetch_queue_chunks,
+            workers=args.prefetch_workers,
+        )
+    else:
+        samples = load_unified_samples(
+            args.test_dataset, args.num_frames,
+            include_bad_frames=args.include_bad_frames)
+        sample_stream = SampleImageStream(samples)
     n_images = len(samples)
     data_root = _data_root_for_dataset(args.test_dataset)
 
@@ -1507,13 +1625,12 @@ def main():
         dataset_meta = kp_model.dataset_meta
         evaluator = build_evaluator(pose_cfg, dataset_meta, args.test_dataset)
 
-        det_evaluator = (build_det_evaluator(samples)
-                          if getattr(args, 'det_metrics', False) else None)
-
+        t_infer_start = time.perf_counter()
         pred_by_img_id, perf = run_topdown(
             det_model=detector,
             kp_model=kp_model,
             samples=samples,
+            sample_stream=sample_stream,
             det_batch_size=args.det_batch_size,
             kp_batch_size=args.kp_batch_size,
             queue_strategy=args.queue_strategy,
@@ -1525,6 +1642,7 @@ def main():
             log_interval=args.log_interval,
             use_mock_detector=args.mock_detector,
         )
+        infer_wall_s = time.perf_counter() - t_infer_start
 
         mode_suffix = 'mock-detector' if args.mock_detector else args.queue_strategy
         mode = f'topdown (strategy={mode_suffix})'
@@ -1538,13 +1656,14 @@ def main():
             args.pose_config, args.pose_checkpoint, device=args.device)
         dataset_meta = model.dataset_meta
         evaluator = build_evaluator(pose_cfg, dataset_meta, args.test_dataset)
-        det_evaluator = None
 
         val_pipeline = Compose(pipeline_cfg)
 
+        t_infer_start = time.perf_counter()
         pred_by_img_id, perf = run_bottomup(
             model=model,
             samples=samples,
+            sample_stream=sample_stream,
             val_pipeline=val_pipeline,
             dataset_meta=dataset_meta,
             kp_batch_size=args.kp_batch_size,
@@ -1552,8 +1671,20 @@ def main():
             warmup_batches=args.warmup_batches,
             log_interval=args.log_interval,
         )
+        infer_wall_s = time.perf_counter() - t_infer_start
 
         mode = 'bottomup'
+
+    # ── Warn if data loading meaningfully stalled the pipeline ──────────────
+    stall_s = perf.get('dataload/stall_s', 0.0)
+    if infer_wall_s > 0 and stall_s / infer_wall_s > 0.05:
+        print(
+            f'\nWarning: data loading stalled the pipeline for '
+            f'{stall_s:.1f}s ({100.0 * stall_s / infer_wall_s:.0f}% of the '
+            f'{infer_wall_s:.1f}s inference wall time). Measured FPS may be '
+            f'I/O-bound rather than model-bound; consider raising '
+            f'--prefetch-chunk-size, --prefetch-workers, or '
+            f'--prefetch-queue-chunks.')
 
     # ── Post-processing (both modes) ────────────────────────────────────────
     postproc_by_img_id: Optional[Dict[int, PoseDataSample]] = None
@@ -1620,7 +1751,12 @@ def main():
     if pp_evaluator is not None:
         pp_quality = pp_evaluator.evaluate(n_images)
 
-    # Optional detection AP/AR (topdown only — reads from pred_ds.metainfo)
+    # Optional detection AP/AR (topdown only — reads from pred_ds.metainfo).
+    # Built here (after inference) rather than up front, since in chunked
+    # prefetch mode GT bboxes/areas/ori_shape on `samples` are only final
+    # once every image has been decoded.
+    det_evaluator = (build_det_evaluator(samples)
+                      if getattr(args, 'det_metrics', False) else None)
     if det_evaluator is not None:
         for fid, sample in enumerate(samples):
             pred_ds = pred_by_img_id.get(sample.img_id)
