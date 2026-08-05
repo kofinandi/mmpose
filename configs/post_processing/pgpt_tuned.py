@@ -31,15 +31,31 @@
 # 0.00069 (80.7% of same-identity pairs accepted, 87.5% of different-identity
 # pairs rejected). The distributions overlap substantially, so this is a
 # genuinely tuned knob rather than a clean separation. 0.001 is shipped
-# because it scored best on end-to-end tracking metrics over a 2000-frame
-# PoseTrack21 slice (IDF1 0.5132 vs 0.5089 at 0.00069, HOTA tied at 0.380),
-# beating both the published gate (IDF1 0.4988) and the appearance-free
-# ablation (0.5072).
+# because it edged 0.00069 on end-to-end tracking metrics over a 2000-frame
+# PoseTrack21 slice (IDF1 0.5132 vs 0.5089, HOTA tied at 0.380).
 #
-# Use pgpt.py when you want the published configuration, and this one when
-# you want the appearance stage to actually discriminate. Neither is a
-# reproduction of the paper's numbers - see pgpt.py on the unreleased graph
-# branch and the absent SiamFC stage.
+# Full-bundle results (PoseTrack21 val, 20161 frames):
+#
+#   config       AP      MOTA     IDF1    HOTA    IDSw
+#   pgpt         0.3112  -0.2601  0.4766  0.3589   941   (published gate 2.0)
+#   pgpt_tuned   0.2960  -0.2021  0.4867  0.3727   837   (this config)
+#   pgpt_geom    0.2913  -0.1858  0.4876  0.3787  1140   (no appearance)
+#
+# So the calibrated gate clearly beats the published one on every metric
+# except AP - and the AP drop is the point, since the published gate's AP
+# came from bypassing the admission rule. Against the appearance-free
+# ablation the picture is mixed: this config gives the fewest ID switches of
+# any variant (837 vs 1140, a 27% reduction), but ties it on IDF1 and still
+# trails slightly on HOTA and MOTA. On a 2000-frame slice the tuned gate did
+# beat pgpt_geom on IDF1; that ordering does not hold over the full bundle,
+# so read the appearance stage's value as identity *continuity* rather than
+# an across-the-board gain.
+#
+# Use pgpt.py when you want the published configuration, this one when you
+# want the appearance stage to discriminate, and pgpt_geom.py when you want
+# the cascade's geometry alone. None is a reproduction of the paper's
+# numbers - see pgpt.py on the unreleased graph branch and the absent
+# SiamFC stage.
 #
 # This config needs the source frames, hence `needs_images=True`.
 #
