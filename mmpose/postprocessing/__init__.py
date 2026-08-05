@@ -20,12 +20,16 @@ Example usage::
 from .base import BaseFilter, sequence_key_from_path
 from .filters import (GPKalmanSmoother, OKSNMS, OKSTracker, OneEuroSmoother,
                        PredictiveTracker, SmoothNetSmoother)
+from .matchers import (BaseAppearanceEmbedder, BasePoseMatcher,
+                        NormalizedL2PoseMatcher, build_appearance_embedder,
+                        build_pose_matcher)
 from .measurement import (BaseMeasurementModel, PowerScoreMeasurementModel,
                            build_measurement_model)
 from .pipeline import PostProcessingPipeline, build_post_processor
 from .predictors import BasePredictor, GPKalmanPredictor, build_predictor
-from .registry import (POST_PROCESS_FILTERS, POST_PROCESS_MEASUREMENT_MODELS,
-                        POST_PROCESS_PREDICTORS)
+from .registry import (POST_PROCESS_APPEARANCE_EMBEDDERS,
+                        POST_PROCESS_FILTERS, POST_PROCESS_MEASUREMENT_MODELS,
+                        POST_PROCESS_POSE_MATCHERS, POST_PROCESS_PREDICTORS)
 
 __all__ = [
     'BaseFilter',
@@ -44,7 +48,14 @@ __all__ = [
     'BaseMeasurementModel',
     'PowerScoreMeasurementModel',
     'build_measurement_model',
+    'BasePoseMatcher',
+    'BaseAppearanceEmbedder',
+    'NormalizedL2PoseMatcher',
+    'build_pose_matcher',
+    'build_appearance_embedder',
     'POST_PROCESS_FILTERS',
     'POST_PROCESS_PREDICTORS',
     'POST_PROCESS_MEASUREMENT_MODELS',
+    'POST_PROCESS_POSE_MATCHERS',
+    'POST_PROCESS_APPEARANCE_EMBEDDERS',
 ]

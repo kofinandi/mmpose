@@ -10,3 +10,6 @@ from mmengine.registry import Registry
 POST_PROCESS_FILTERS = Registry('post_process_filters')
 POST_PROCESS_PREDICTORS = Registry('post_process_predictors')
 POST_PROCESS_MEASUREMENT_MODELS = Registry('post_process_measurement_models')
+POST_PROCESS_POSE_MATCHERS = Registry('post_process_pose_matchers')
+POST_PROCESS_APPEARANCE_EMBEDDERS = Registry(
+    'post_process_appearance_embedders')
