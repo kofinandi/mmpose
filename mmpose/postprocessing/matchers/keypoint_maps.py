@@ -27,7 +27,8 @@ _L_HIP, _R_HIP = 11, 12
 _L_KNE, _R_KNE = 13, 14
 _L_ANK, _R_ANK = 15, 16
 
-#: COCO-17 -> the 15-joint layout of LightTrack's ``Graph('PoseTrack')``.
+#: The 12 limb joints of LightTrack's 15-joint layout, as indices into a
+#: 17-joint COCO **or** PoseTrack pose.
 #:
 #: The graph's edge list (``external/lighttrack/graph/gcn_utils/graph.py``:
 #: ``[(0,1),(1,2),(3,4),(4,5),(2,8),(8,7),(7,6),(8,12),(12,9),(9,10),
@@ -39,17 +40,101 @@ _L_ANK, _R_ANK = 15, 16
 #:    10 l_elbow  11 l_wrist 12 head_bottom (neck, the graph centre)
 #:    13 nose     14 head_top
 #:
-#: COCO-17 has neither head_bottom nor head_top, so both are synthesised:
-#: the neck as the shoulder midpoint and head_top as the eye midpoint.  This
-#: is an approximation of joints the network was trained on - see the
-#: fidelity notes on :class:`SGCNPoseMatcher`.
-COCO17_TO_POSETRACK15_LIGHTTRACK: IndexMap = (
+#: Joints 12 and 14 are synthesised by :func:`to_lighttrack15`; the rest are
+#: plain index lookups, listed here in target order.
+_LIGHTTRACK15_LIMBS = (
     _R_ANK, _R_KNE, _R_HIP, _L_HIP, _L_KNE, _L_ANK,
     _R_WRI, _R_ELB, _R_SHO, _L_SHO, _L_ELB, _L_WRI,
-    (_L_SHO, _R_SHO),   # 12 head_bottom / neck
-    _NOSE,              # 13
-    (_L_EYE, _R_EYE),   # 14 head_top
 )
+
+#: How far past the nose, along the shoulder-midpoint-to-nose direction, the
+#: top of the head sits.  Least-squares-style fit over the 32 185 PoseTrack21
+#: *train* annotations that label nose, head_top and both shoulders; the
+#: residual is 0.47 shoulder-widths (median), versus 0.59 for using the nose
+#: itself.  See :func:`synthesize_head_joints`.
+HEAD_TOP_EXTRAPOLATION = 0.55
+
+
+def synthesize_head_joints(kpts: np.ndarray):
+    """Estimate ``(head_bottom, head_top)`` from nose and shoulders.
+
+    LightTrack's graph has a head_bottom (neck) and a head_top node, and
+    neither COCO-17 nor the predictions in this repo's bundles provide
+    them.  Rather than leave a train/test gap, both the SGCN's training
+    pairs and its inference input go through this one rule, so the network
+    only ever sees synthesised head joints:
+
+    * ``head_bottom`` = shoulder midpoint (0.26 shoulder-widths from the
+      annotated head_bottom, median, on PoseTrack21 train);
+    * ``head_top`` = the nose pushed a further
+      :data:`HEAD_TOP_EXTRAPOLATION` of the shoulder-midpoint-to-nose vector
+      (0.47 shoulder-widths from the annotated head_top).
+
+    Only joints that COCO-17 and PoseTrack-17 share at identical indices
+    (the nose and both shoulders) are read, which is what lets the same
+    function serve GT poses during training and COCO predictions at
+    inference.
+
+    Args:
+        kpts: ``(..., 17, 2)`` poses in either layout.
+
+    Returns:
+        ``(head_bottom, head_top)``, each ``(..., 2)``.
+    """
+    shoulder_mid = 0.5 * (kpts[..., _L_SHO, :] + kpts[..., _R_SHO, :])
+    nose = kpts[..., _NOSE, :]
+    head_top = nose + HEAD_TOP_EXTRAPOLATION * (nose - shoulder_mid)
+    return shoulder_mid, head_top
+
+
+def to_lighttrack15(kpts: np.ndarray) -> np.ndarray:
+    """Convert 17-joint poses to LightTrack's 15-joint graph layout.
+
+    Accepts **either** COCO-17 or PoseTrack-17 input: the two layouts agree
+    on the nose (index 0) and on every limb joint (indices 5-16), and they
+    differ only in joints 1-4, none of which this conversion reads.  The
+    head_bottom and head_top nodes come from
+    :func:`synthesize_head_joints`.
+
+    Args:
+        kpts: ``(..., 17, 2)`` poses.
+
+    Returns:
+        ``(..., 15, 2)`` poses in graph order.
+    """
+    kpts = np.asarray(kpts)
+    out = np.empty(kpts.shape[:-2] + (15, kpts.shape[-1]), dtype=kpts.dtype)
+    for dst, src in enumerate(_LIGHTTRACK15_LIMBS):
+        out[..., dst, :] = kpts[..., src, :]
+    head_bottom, head_top = synthesize_head_joints(kpts)
+    out[..., 12, :] = head_bottom
+    out[..., 13, :] = kpts[..., _NOSE, :]
+    out[..., 14, :] = head_top
+    return out
+
+
+def to_lighttrack15_scores(scores: np.ndarray) -> np.ndarray:
+    """Per-keypoint scores in LightTrack's 15-joint layout.
+
+    Synthesised joints take the minimum of the scores they were built from,
+    so a head node derived from an unreliable nose or shoulder is itself
+    treated as unreliable.
+
+    Args:
+        scores: ``(..., 17)`` per-keypoint scores.
+
+    Returns:
+        ``(..., 15)`` scores in graph order.
+    """
+    scores = np.asarray(scores)
+    out = np.empty(scores.shape[:-1] + (15, ), dtype=scores.dtype)
+    for dst, src in enumerate(_LIGHTTRACK15_LIMBS):
+        out[..., dst] = scores[..., src]
+    shoulder_min = np.minimum(scores[..., _L_SHO], scores[..., _R_SHO])
+    out[..., 12] = shoulder_min
+    out[..., 13] = scores[..., _NOSE]
+    out[..., 14] = np.minimum(scores[..., _NOSE], shoulder_min)
+    return out
 
 #: COCO-17 -> PGPT's 15-joint layout, which is simply COCO-17 with the two
 #: ear joints dropped.

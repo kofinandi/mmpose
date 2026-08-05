@@ -18,11 +18,13 @@ Example usage::
 """
 
 from .base import BaseFilter, sequence_key_from_path
-from .filters import (DetectAndTrackLinker, GPKalmanSmoother, OKSNMS,
-                       OKSTracker, OneEuroSmoother, PredictiveTracker,
+from .filters import (DetectAndTrackLinker, GPKalmanSmoother,
+                       LightTrackTracker, OKSNMS, OKSTracker,
+                       OneEuroSmoother, PGPTTracker, PredictiveTracker,
                        SmoothNetSmoother)
 from .matchers import (BaseAppearanceEmbedder, BasePoseMatcher,
-                        NormalizedL2PoseMatcher, TorchvisionCNNEmbedder,
+                        NormalizedL2PoseMatcher, PGPTPoseGCNEmbedder,
+                        SGCNPoseMatcher, TorchvisionCNNEmbedder,
                         build_appearance_embedder, build_pose_matcher)
 from .measurement import (BaseMeasurementModel, PowerScoreMeasurementModel,
                            build_measurement_model)
@@ -42,6 +44,8 @@ __all__ = [
     'SmoothNetSmoother',
     'PredictiveTracker',
     'DetectAndTrackLinker',
+    'LightTrackTracker',
+    'PGPTTracker',
     'PostProcessingPipeline',
     'build_post_processor',
     'BasePredictor',
@@ -54,6 +58,8 @@ __all__ = [
     'BaseAppearanceEmbedder',
     'NormalizedL2PoseMatcher',
     'TorchvisionCNNEmbedder',
+    'SGCNPoseMatcher',
+    'PGPTPoseGCNEmbedder',
     'build_pose_matcher',
     'build_appearance_embedder',
     'POST_PROCESS_FILTERS',
