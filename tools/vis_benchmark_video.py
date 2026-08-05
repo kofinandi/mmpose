@@ -53,6 +53,8 @@ import numpy as np  # noqa: E402
 # other invocation styles (e.g. via a wrapper that changes cwd first).
 sys.path.insert(0, osp.dirname(osp.abspath(__file__)))
 
+from mmpose.evaluation.functional.benchmark_data import resize_to_ori_shape
+
 from vis_benchmark_predictions import (  # noqa: E402
     _GT_COLOR,
     _PRED_COLOR,
@@ -63,7 +65,6 @@ from vis_benchmark_predictions import (  # noqa: E402
     _draw_match_labels,
     _draw_track_ids,
     _parse_instances,
-    _resize_to_ori_shape,
     _resolve_image_path,
     _upscale_image,
     load_bundle,
@@ -278,7 +279,7 @@ class VideoRenderer:
             raise FileNotFoundError(
                 f'Image not found: {path} (data_root={self.data_root})')
         img = mmcv.imread(path, channel_order='rgb')
-        return _resize_to_ori_shape(img, frame.get('ori_shape'))
+        return resize_to_ori_shape(img, frame.get('ori_shape'))
 
     # ------------------------------------------------------------------
 

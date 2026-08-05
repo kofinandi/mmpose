@@ -212,11 +212,6 @@ def _upscale_image(img: np.ndarray, scale: float) -> np.ndarray:
     return mmcv.imresize(img, new_size, interpolation='bicubic')
 
 
-def _resize_to_ori_shape(img: np.ndarray, ori_shape: Optional[List[int]]) -> np.ndarray:
-    """Resize *img* to the bundle's ``ori_shape`` (shared helper re-export)."""
-    return resize_to_ori_shape(img, ori_shape)
-
-
 def _bbox_iou(box_a: np.ndarray, box_b: np.ndarray) -> float:
     """Axis-aligned IoU of two [x1, y1, x2, y2] boxes."""
     ix1 = max(float(box_a[0]), float(box_b[0]))
@@ -604,7 +599,7 @@ class PredictionBrowser:
             raise FileNotFoundError(
                 f'Image not found: {path} (data_root={self.data_root})')
         img = mmcv.imread(path, channel_order='rgb')
-        return _resize_to_ori_shape(img, frame.get('ori_shape'))
+        return resize_to_ori_shape(img, frame.get('ori_shape'))
 
     def _render(self) -> None:
         if not self.frames:
