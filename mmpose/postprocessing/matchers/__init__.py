@@ -1,6 +1,7 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 from .base import (BaseAppearanceEmbedder, BasePoseMatcher,
                    build_appearance_embedder, build_pose_matcher)
+from .cnn_embedder import TorchvisionCNNEmbedder
 from .keypoint_maps import (COCO17_TO_PGPT15,
                             COCO17_TO_POSETRACK15_LIGHTTRACK, PGPT15_SIGMAS,
                             convert_keypoints, convert_scores)
@@ -12,6 +13,7 @@ __all__ = [
     'build_pose_matcher',
     'build_appearance_embedder',
     'NormalizedL2PoseMatcher',
+    'TorchvisionCNNEmbedder',
     'convert_keypoints',
     'convert_scores',
     'COCO17_TO_POSETRACK15_LIGHTTRACK',

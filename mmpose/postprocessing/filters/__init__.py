@@ -1,4 +1,5 @@
 # Copyright (c) OpenMMLab. All rights reserved.
+from .detect_and_track_linker import DetectAndTrackLinker
 from .gp_kalman_smoother import GPKalmanSmoother
 from .oks_nms import OKSNMS
 from .oks_tracker import OKSTracker
@@ -8,5 +9,5 @@ from .smoothnet_smoother import SmoothNetSmoother
 
 __all__ = [
     'GPKalmanSmoother', 'OKSNMS', 'OKSTracker', 'OneEuroSmoother',
-    'SmoothNetSmoother', 'PredictiveTracker'
+    'SmoothNetSmoother', 'PredictiveTracker', 'DetectAndTrackLinker'
 ]
