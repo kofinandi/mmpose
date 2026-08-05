@@ -69,7 +69,7 @@ from __future__ import annotations
 
 import os.path as osp
 import sys
-from typing import Optional, Tuple
+from typing import Tuple
 
 import cv2
 import numpy as np

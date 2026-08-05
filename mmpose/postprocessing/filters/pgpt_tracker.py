@@ -54,7 +54,6 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
-from mmengine.structures import InstanceData
 
 from mmpose.structures import PoseDataSample
 

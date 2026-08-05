@@ -145,6 +145,8 @@ def to_lighttrack15_scores(scores: np.ndarray) -> np.ndarray:
 #: ``[.26,.25,.25,.79,.79,.72,.72,.62,.62,1.07,1.07,.87,.87,.89,.89]`` -
 #: exactly the COCO sigmas with the two ``.35`` ear entries removed, which
 #: confirms the ordering is otherwise unchanged.  No joint is synthesised.
+
+
 COCO17_TO_PGPT15: IndexMap = (
     _NOSE, _L_EYE, _R_EYE,
     _L_SHO, _R_SHO, _L_ELB, _R_ELB, _L_WRI, _R_WRI,

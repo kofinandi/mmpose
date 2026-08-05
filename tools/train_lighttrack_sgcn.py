@@ -67,7 +67,7 @@ import os.path as osp
 import random
 import sys
 from collections import defaultdict
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
