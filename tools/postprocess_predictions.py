@@ -585,7 +585,9 @@ def main() -> None:
     postproc_samples: List[PoseDataSample] = []
 
     if pipeline.needs_images:
-        # needs_images pipelines are always all-online (validated at build).
+        # Image-requiring filters run in the online prefix during process().
+        # If any later filter is offline, process() buffers pose-only results
+        # and evaluate() finishes the chain.
         image_root = args.data_root or data_root or 'data/'
         image_stream = _make_image_stream(
             frames, image_root, test_dataset, args)
@@ -617,6 +619,8 @@ def main() -> None:
         if image_stream.stall_s > 0:
             print(f'  Image decode stall : {image_stream.stall_s:.3f} s '
                   f'(waiting for images; not counted in pipeline timing)')
+        if not pipeline.is_online:
+            postproc_samples = pipeline.evaluate()
     elif pipeline.is_online:
         for pred_ds in pred_samples:
             result = pipeline.process(pred_ds)

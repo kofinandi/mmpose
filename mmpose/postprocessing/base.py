@@ -44,10 +44,10 @@ class BaseFilter(metaclass=ABCMeta):
     **Image access.**  Filters that need the frame's pixels (e.g. appearance
     models) set ``requires_images = True`` -- as a class attribute, or as an
     instance attribute in ``__init__`` when the need depends on the
-    configuration.  Such filters can only run in a pipeline whose config
-    declares ``needs_images=True`` (validated at build time); the driver then
-    attaches the frame as a data field ``ds.img`` before each
-    :meth:`process_frame` call:
+    configuration.  Such filters must be online and must appear before any
+    offline filter in a pipeline whose config declares ``needs_images=True``
+    (validated at build time).  The driver then attaches the frame as a data
+    field ``ds.img`` before each :meth:`process_frame` call:
 
     * ``ds.img`` is a BGR ``(H, W, 3)`` ``uint8`` array in the **bundle's
       coordinate space**, i.e. its shape matches ``metainfo['ori_shape']``
@@ -57,6 +57,8 @@ class BaseFilter(metaclass=ABCMeta):
     * Filters must **not** retain a reference to ``ds.img`` beyond the
       current call -- the driver streams images in bounded chunks and
       releases them afterwards.  Cache embeddings/features, never pixels.
+    * Offline filters never see ``ds.img``; the pipeline strips it before
+      buffering for the offline suffix.
     """
 
     online: bool = True

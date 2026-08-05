@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import copy
 import time
 from typing import Dict, List, Optional, Union
 
@@ -18,18 +17,20 @@ from .registry import POST_PROCESS_FILTERS
 class PostProcessingPipeline:
     """Ordered chain of :class:`BaseFilter` instances applied to pose predictions.
 
-    The pipeline operates in two modes depending on whether all filters are
-    online (causal):
+    The pipeline splits the filter list at the first offline filter and
+    operates in two modes:
 
     **All-online mode** - :meth:`process` applies every filter in order and
     returns the processed :class:`PoseDataSample` immediately.  Per-frame
     timing is accumulated in ``_frame_times``.  Sequence boundaries are
     detected from ``img_path``; filter state is reset at each new sequence.
 
-    **Any-offline mode** - :meth:`process` buffers each frame and returns
-    ``None``.  :meth:`evaluate` runs all filters over the collected buffer
-    (chaining outputs between stages) and returns the list of processed
-    frames.  :meth:`evaluate` is timed as a single call.
+    **Any-offline mode** - :meth:`process` runs the online prefix (if any),
+    strips ``img`` when the pipeline needs images, buffers the pose-only
+    result, and returns ``None``.  :meth:`evaluate` runs the offline suffix
+    over the collected buffer and returns the list of processed frames.
+    Online-prefix time is accumulated per frame; offline-suffix time is
+    recorded as a single :meth:`evaluate` call.
 
     Args:
         filters: Ordered list of :class:`BaseFilter` instances.
@@ -39,10 +40,10 @@ class PostProcessingPipeline:
             time).  When set, the driver attaches each frame's pixels as a
             data field ``ds.img`` before :meth:`process` (see
             :class:`BaseFilter` for the exact contract) and this pipeline
-            strips ``img`` from the returned sample so downstream consumers
-            don't pin the pixel arrays in memory.  Only all-online pipelines
-            may declare it: offline filters buffer whole sequences, and
-            images cannot be buffered.
+            strips ``img`` before buffering or returning so downstream
+            consumers don't pin the pixel arrays in memory.  Image-requiring
+            filters must be online and must appear before the first offline
+            filter; offline filters never see frame images.
     """
 
     def __init__(
@@ -54,25 +55,48 @@ class PostProcessingPipeline:
         self.is_online: bool = all(f.online for f in filters)
         self.needs_images: bool = bool(needs_images)
 
+        # Split at the first offline filter: online prefix runs in
+        # process(); offline suffix (and any later online filters) run in
+        # evaluate() via process_sequence.
+        split = len(filters)
+        for i, f in enumerate(filters):
+            if not f.online:
+                split = i
+                break
+        self._online_filters: List[BaseFilter] = filters[:split]
+        self._offline_filters: List[BaseFilter] = filters[split:]
+
         image_filters = [
-            type(f).__name__ for f in filters
-            if getattr(f, 'requires_images', False)
+            f for f in filters if getattr(f, 'requires_images', False)
         ]
         if image_filters and not self.needs_images:
+            names = [type(f).__name__ for f in image_filters]
             raise ValueError(
-                f'Filters {image_filters} require frame images, but the '
+                f'Filters {names} require frame images, but the '
                 f'pipeline config does not declare needs_images=True. Add '
                 f"needs_images=True to the post_processor dict of the "
                 f'post-processing config.')
-        if self.needs_images and not self.is_online:
-            offline_filters = [
-                type(f).__name__ for f in filters if not f.online
-            ]
+
+        bad_offline_image = [
+            type(f).__name__ for f in image_filters if not f.online
+        ]
+        if bad_offline_image:
             raise ValueError(
-                f'needs_images=True requires an all-online pipeline, but '
-                f'filters {offline_filters} are offline. Offline filters '
-                f'buffer whole sequences and frame images cannot be '
-                f'buffered alongside them.')
+                f'Filters {bad_offline_image} require frame images but are '
+                f'offline. Image-requiring filters must be online so they '
+                f'can consume ds.img during process() before results are '
+                f'buffered without pixels.')
+
+        bad_after_offline = [
+            type(f).__name__ for f in self._offline_filters
+            if getattr(f, 'requires_images', False)
+        ]
+        if bad_after_offline:
+            raise ValueError(
+                f'Filters {bad_after_offline} require frame images but '
+                f'appear at or after the first offline filter. Move '
+                f'image-requiring filters into the online prefix (before '
+                f'any offline filter); offline stages never see ds.img.')
 
         # Online runtime bookkeeping
         self._frame_times: List[float] = []
@@ -80,8 +104,13 @@ class PostProcessingPipeline:
 
         # Offline buffer
         self._buffer: List[PoseDataSample] = []
+        # Retained after evaluate() clears the buffer so timing accessors
+        # still know how many frames were processed.
+        self._num_buffered: int = 0
 
-        # Offline timing (set by evaluate())
+        # Timing: online-prefix total is snapshotted before evaluate()
+        # clears _frame_times; offline-suffix total is set by evaluate().
+        self._online_total_s: float = 0.0
         self._eval_total_s: float = 0.0
 
     # ------------------------------------------------------------------
@@ -94,18 +123,19 @@ class PostProcessingPipeline:
     ) -> Optional[PoseDataSample]:
         """Process one frame.
 
-        Online pipeline: applies all filters and returns the result.
-        Offline pipeline: buffers the frame and returns ``None``.
+        All-online pipeline: applies all filters and returns the result.
+        Any-offline pipeline: runs the online prefix (if any), strips
+        ``img`` when needed, buffers the result, and returns ``None``.
 
         Args:
             ds: Prediction-only :class:`PoseDataSample` for this frame.
 
         Returns:
-            Processed :class:`PoseDataSample` (online) or ``None`` (offline).
+            Processed :class:`PoseDataSample` (all-online) or ``None``
+            (any-offline).
         """
         if not self.is_online:
-            self._buffer.append(ds)
-            return None
+            return self._process_hybrid(ds)
 
         img_path = ds.metainfo.get('img_path', '')
         seq_key = sequence_key_from_path(img_path)
@@ -134,13 +164,14 @@ class PostProcessingPipeline:
     def evaluate(self) -> List[PoseDataSample]:
         """Finalise and return all processed frames.
 
-        Online pipeline: returns the list that was returned by successive
-        :meth:`process` calls (must have been stored by the caller).  This
-        method is a no-op in the timing sense for the online path; it just
-        resets state.
+        All-online pipeline: returns an empty list (frames were already
+        returned by successive :meth:`process` calls).  This method is a
+        no-op in the timing sense for the online path; it just resets
+        state.
 
-        Offline pipeline: runs the full filter chain over the buffer, records
-        timing, and clears the buffer.
+        Any-offline pipeline: runs the offline suffix over the buffer
+        (online prefix already ran in :meth:`process`), records timing,
+        and clears the buffer.
 
         Returns:
             List of processed :class:`PoseDataSample`s in input order.
@@ -150,9 +181,13 @@ class PostProcessingPipeline:
             self._reset_online_state()
             return []
 
+        # Snapshot online-prefix time before _reset_online_state clears it.
+        self._online_total_s = sum(self._frame_times)
+        self._num_buffered = len(self._buffer)
+
         t0 = time.perf_counter()
         frames = list(self._buffer)
-        for f in self.filters:
+        for f in self._offline_filters:
             frames = f.process_sequence(frames)
         self._eval_total_s = time.perf_counter() - t0
 
@@ -166,6 +201,8 @@ class PostProcessingPipeline:
             f.reset()
         self._reset_online_state()
         self._buffer.clear()
+        self._num_buffered = 0
+        self._online_total_s = 0.0
         self._eval_total_s = 0.0
 
     # ------------------------------------------------------------------
@@ -174,7 +211,7 @@ class PostProcessingPipeline:
 
     @property
     def per_frame_ms(self) -> float:
-        """Average per-frame processing time in milliseconds (online only)."""
+        """Average per-frame processing time in milliseconds (online prefix)."""
         if not self._frame_times:
             return 0.0
         return 1000.0 * sum(self._frame_times) / len(self._frame_times)
@@ -183,34 +220,65 @@ class PostProcessingPipeline:
     def total_s(self) -> float:
         """Total processing time in seconds.
 
-        Online: sum of per-frame times accumulated so far.
-        Offline: time of the last :meth:`evaluate` call.
+        All-online: sum of per-frame times accumulated so far.
+        Any-offline: online-prefix time plus the last :meth:`evaluate`
+        call.  Before :meth:`evaluate`, the online prefix is still in
+        ``_frame_times``; afterwards it is snapshotted in
+        ``_online_total_s``.
         """
         if self.is_online:
             return sum(self._frame_times)
-        return self._eval_total_s
+        online_s = (
+            sum(self._frame_times) if self._frame_times
+            else self._online_total_s)
+        return online_s + self._eval_total_s
 
     @property
     def num_frames(self) -> int:
         """Number of frames processed (online) or buffered (offline)."""
         if self.is_online:
             return len(self._frame_times)
-        return len(self._buffer)
+        if self._buffer:
+            return len(self._buffer)
+        return self._num_buffered
 
     def perf_dict(self) -> Dict[str, float]:
         """Return a flat dict of performance metrics for serialisation."""
-        n = len(self._frame_times) if self.is_online else (
-            len(self._buffer) if not self._eval_total_s
-            else self.num_frames  # already cleared
-        )
+        n = self.num_frames
+        total = self.total_s
         return {
-            'postproc/latency_ms_per_frame': self.per_frame_ms,
-            'postproc/total_s': self.total_s,
+            'postproc/latency_ms_per_frame': (
+                1000.0 * total / n if n > 0 else 0.0),
+            'postproc/total_s': total,
         }
 
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
+
+    def _process_hybrid(self, ds: PoseDataSample) -> None:
+        """Run online prefix, strip images, and buffer for evaluate()."""
+        img_path = ds.metainfo.get('img_path', '')
+        seq_key = sequence_key_from_path(img_path)
+
+        if self._current_seq is None:
+            self._current_seq = seq_key
+        elif seq_key != self._current_seq:
+            for f in self._online_filters:
+                f.reset()
+            self._current_seq = seq_key
+
+        t0 = time.perf_counter()
+        result = ds
+        for f in self._online_filters:
+            result = f.process_frame(result, seq_key)
+        self._frame_times.append(time.perf_counter() - t0)
+
+        if self.needs_images and result is not None:
+            result.pop('img', None)
+
+        self._buffer.append(result)
+        return None
 
     def _reset_online_state(self) -> None:
         self._frame_times = []
@@ -247,7 +315,9 @@ def build_post_processor(
             ],
         )
 
-    Pipelines whose filters read frame images must declare it explicitly::
+    Pipelines whose filters read frame images must declare it explicitly.
+    Image-requiring filters may be followed by offline pose-only filters
+    (e.g. a CNN tracker then SmoothNet)::
 
         post_processor = dict(
             type='PostProcessingPipeline',

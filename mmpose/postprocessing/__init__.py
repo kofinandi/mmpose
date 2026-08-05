@@ -13,7 +13,7 @@ Example usage::
     for frame_ds in frames:
         result = pipeline.process(frame_ds)   # None if any filter is offline
     # For an all-online pipeline, results were already returned above.
-    # For an any-offline pipeline:
+    # For an any-offline pipeline (online prefix already ran in process()):
     results = pipeline.evaluate()
 """
 
