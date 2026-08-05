@@ -66,6 +66,11 @@ from mmpose.evaluation.functional.frame_metrics import (
     save_prediction_bundle,
     sanitize_dataset_meta,
 )
+from mmpose.evaluation.functional.good_frames import (
+    BAD_FRAME_DATASETS,
+    frame_record_is_good,
+    partition_frame_records,
+)
 from mmpose.postprocessing import PostProcessingPipeline, build_post_processor
 from mmpose.structures import PoseDataSample
 
@@ -531,6 +536,14 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         '--prefetch-workers', type=int, default=4,
         help='Threads decoding images within a chunk (default: 4)')
+    p.add_argument(
+        '--eval-good-frames-only', action='store_true',
+        help='Exclude frames without reliable GT from metric computation. '
+             'Uses the explicit ``good_frame`` field written into newer '
+             'prediction bundles; for legacy bundles on EMDB/3DPW/'
+             'PoseTrack21 falls back to "has at least one non-crowd GT '
+             'instance". Inference/post-processing still runs over every '
+             'frame so trackers and smoothers keep a continuous sequence.')
     return p.parse_args()
 
 
@@ -645,20 +658,46 @@ def main() -> None:
     evaluator = build_evaluator_from_types(
         args.metrics, dataset_meta, test_dataset)
 
+    eval_good_only = bool(getattr(args, 'eval_good_frames_only', False))
+    good_idxs: Optional[set] = None
+    if eval_good_only:
+        allow_heuristic = test_dataset in BAD_FRAME_DATASETS
+        has_explicit = any('good_frame' in f for f in frames)
+        if not has_explicit and not allow_heuristic:
+            raise ValueError(
+                f'--eval-good-frames-only was requested but the bundle '
+                f'frames lack a ``good_frame`` field and test_dataset='
+                f'{test_dataset!r} is not one of {sorted(BAD_FRAME_DATASETS)}. '
+                f'Re-run tools/benchmark_e2e.py to produce a bundle that '
+                f'tags each frame, or pass a bad-frame dataset name.')
+        idxs, used_heuristic = partition_frame_records(
+            frames, allow_heuristic=allow_heuristic)
+        good_idxs = set(idxs)
+        n_bad = n_frames - len(good_idxs)
+        heuristic_note = (
+            ' (legacy heuristic: non-crowd GT presence)'
+            if used_heuristic else '')
+        print(f'  Evaluating on {len(good_idxs)}/{n_frames} frames '
+              f'({n_bad} bad frames excluded){heuristic_note}')
+
     # Attach GT from the full_samples (which have GT from frame records)
-    num_kpts = dataset_meta.get('num_keypoints', 17)
-    seq_track_id_map: Dict[str, int] = {}
-    for pp_ds, full_ds, frame in zip(postproc_samples, full_samples, frames):
+    n_eval = 0
+    for i, (pp_ds, full_ds, frame) in enumerate(
+            zip(postproc_samples, full_samples, frames)):
+        if good_idxs is not None and i not in good_idxs:
+            continue
         # Merge post-processed pred_instances with GT from full_ds
-        img_path = frame.get('img_path', '')
         pp_ds_gt = pp_ds.new()
         pp_ds_gt.set_metainfo(full_ds.metainfo)
         pp_ds_gt.pred_instances = pp_ds.pred_instances
         pp_ds_gt.gt_instances = full_ds.gt_instances
         pp_ds_gt.set_metainfo({'id': full_ds.metainfo.get('id', [frame['img_id']])})
         evaluator.process(data_samples=[pp_ds_gt], data_batch=None)
+        n_eval += 1
 
-    quality = evaluator.evaluate(n_frames)
+    if good_idxs is None:
+        n_eval = n_frames
+    quality = evaluator.evaluate(n_eval)
 
     # ── Print results ──────────────────────────────────────────────────────
     sep = '=' * 60
@@ -692,6 +731,16 @@ def main() -> None:
         pp_ds_gt.gt_instances = full_ds.gt_instances
 
         gt_dicts = frame.get('ground_truth', {}).get('instances', [])
+        # Prefer the source bundle's explicit flag; for legacy bundles on
+        # bad-frame datasets fall back to the same heuristic used for eval
+        # so a chained re-run still sees good_frame on every record.
+        if 'good_frame' in frame:
+            good_frame = bool(frame['good_frame'])
+        elif test_dataset in BAD_FRAME_DATASETS:
+            good_frame = frame_record_is_good(
+                frame, allow_heuristic=True)
+        else:
+            good_frame = True
         pp_frame_records.append(build_frame_record(
             img_id=int(img_id),
             frame_id=int(fid),
@@ -700,6 +749,7 @@ def main() -> None:
             pred_ds=pp_ds_gt,
             gt_instances=gt_dicts,
             dataset_meta=dataset_meta,
+            good_frame=good_frame,
         ))
 
     e2e_perf = _e2e_perf_from_manifest(manifest)
@@ -726,12 +776,14 @@ def main() -> None:
         },
         'data_root': data_root,
         'dataset_meta': sanitize_dataset_meta(dataset_meta),
+        'eval_good_frames_only': eval_good_only,
         'badcase_defaults': manifest.get('badcase_defaults', {
             'metric_key': 'mean_oks',
             'metric_type': 'accuracy',
             'thr': 0.5,
         }),
         'num_frames': len(pp_frame_records),
+        'num_eval_frames': n_eval,
     }
 
     save_prediction_bundle(pp_manifest, pp_frame_records, out_dir)

@@ -391,6 +391,7 @@ def build_frame_record(
     gt_instances: List[dict],
     dataset_meta: dict,
     match_thr: float = 0.5,
+    good_frame: Optional[bool] = None,
 ) -> dict:
     """Build one frame dict for ``frames.json``.
 
@@ -399,6 +400,13 @@ def build_frame_record(
     Raw detector output (before keypoint refinement) is stored in
     ``pred_ds.metainfo`` under ``'det_bboxes'`` / ``'det_scores'`` by
     :func:`run_topdown`.
+
+    Args:
+        good_frame: Optional explicit evaluability flag (EMDB/3DPW/
+            PoseTrack21). When provided it is written as
+            ``record['good_frame']``; when omitted the key is absent so
+            legacy consumers / heuristic fallbacks can detect older
+            bundles.
     """
     pred_instances = serialize_pred_instances(pred_ds.pred_instances)
     ori_shape = pred_ds.metainfo.get('ori_shape', (0, 0))
@@ -422,6 +430,8 @@ def build_frame_record(
         },
         'metrics': metrics,
     }
+    if good_frame is not None:
+        record['good_frame'] = bool(good_frame)
     if matches:
         record['metrics']['matches'] = matches
 

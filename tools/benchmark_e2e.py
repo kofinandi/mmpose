@@ -80,6 +80,7 @@ from mmpose.evaluation.functional.frame_metrics import (
     save_prediction_bundle,
     sanitize_dataset_meta,
 )
+from mmpose.evaluation.functional.good_frames import BAD_FRAME_DATASETS
 from mmpose.postprocessing import PostProcessingPipeline, build_post_processor
 from mmpose.structures import PoseDataSample, merge_data_samples
 
@@ -1164,6 +1165,8 @@ def _save_out(
     mode: str,
     args,
     pp_quality: Optional[dict] = None,
+    n_eval: Optional[int] = None,
+    n_images: Optional[int] = None,
 ) -> None:
     post_config = getattr(args, 'post_config', None)
     payload = {
@@ -1182,8 +1185,14 @@ def _save_out(
                 osp.abspath(post_config) if post_config else None),
         },
         'test_dataset': args.test_dataset,
+        'eval_good_frames_only': bool(
+            getattr(args, 'eval_good_frames_only', False)),
         'timestamp': datetime.now().isoformat(timespec='seconds'),
     }
+    if n_eval is not None:
+        payload['num_eval_frames'] = int(n_eval)
+    if n_images is not None:
+        payload['num_frames'] = int(n_images)
     if pp_quality is not None:
         payload['post_processed_quality'] = pp_quality
     out_dir = osp.dirname(osp.abspath(args.out))
@@ -1276,6 +1285,7 @@ def _save_predictions(
     frame_records: List[dict],
     dataset_meta: dict,
     run_date: str,
+    n_eval: Optional[int] = None,
 ) -> None:
     manifest = {
         'timestamp': datetime.now().isoformat(timespec='seconds'),
@@ -1296,12 +1306,16 @@ def _save_predictions(
         'data_root': data_root,
         'dataset_meta': sanitize_dataset_meta(dataset_meta),
         'save_score_thr': args.save_score_thr,
+        'eval_good_frames_only': bool(
+            getattr(args, 'eval_good_frames_only', False)),
         'badcase_defaults': {
             'metric_key': 'mean_oks',
             'metric_type': 'accuracy',
             'thr': 0.5,
         },
         'num_frames': len(frame_records),
+        'num_eval_frames': (
+            int(n_eval) if n_eval is not None else len(frame_records)),
     }
     out_dir = _prediction_out_dir(args, run_date, is_topdown)
     save_prediction_bundle(manifest, frame_records, out_dir)
@@ -1319,6 +1333,7 @@ def _save_predictions_postproc(
     dataset_meta: dict,
     run_date: str,
     post_config: Optional[str] = None,
+    n_eval: Optional[int] = None,
 ) -> None:
     """Save the post-processed prediction bundle next to the run folder."""
     base_dir = _prediction_out_dir(args, run_date, is_topdown)
@@ -1344,12 +1359,16 @@ def _save_predictions_postproc(
         'data_root': data_root,
         'dataset_meta': sanitize_dataset_meta(dataset_meta),
         'save_score_thr': args.save_score_thr,
+        'eval_good_frames_only': bool(
+            getattr(args, 'eval_good_frames_only', False)),
         'badcase_defaults': {
             'metric_key': 'mean_oks',
             'metric_type': 'accuracy',
             'thr': 0.5,
         },
         'num_frames': len(frame_records),
+        'num_eval_frames': (
+            int(n_eval) if n_eval is not None else len(frame_records)),
     }
     save_prediction_bundle(manifest, frame_records, out_dir)
     print(f'Post-processed predictions saved to {osp.abspath(out_dir)}')
@@ -1455,13 +1474,24 @@ def _parse_args():
              '--prefetch-chunk-size > 0 (default: 4).')
     p.add_argument(
         '--include-bad-frames', action='store_true',
-        help='EMDB/3DPW only: also load frames normally excluded for '
+        help='EMDB/3DPW/PoseTrack21: also load frames normally excluded for '
              'lacking reliable GT (e.g. EMDB invalid_idxs, 3DPW frames with '
-             'no valid actor), so post-processing sees a temporally '
-             'continuous frame sequence. These frames have no GT and may '
-             'produce false-positive detections that affect detection/pose '
-             'metrics; temporal metrics (MPJVE/MPJAE) still exclude them '
-             'via frame_id-gap masking. No effect on other datasets.')
+             'no valid actor, PoseTrack21 unlabeled frames), so '
+             'post-processing sees a temporally continuous frame sequence. '
+             'These frames have no GT and may produce false-positive '
+             'detections that affect detection/pose metrics; temporal '
+             'metrics (MPJVE/MPJAE) still exclude them via frame_id-gap '
+             'masking. Combine with --eval-good-frames-only to keep '
+             'inference continuous while excluding bad frames from metric '
+             'computation. No effect on other datasets.')
+    p.add_argument(
+        '--eval-good-frames-only', action='store_true',
+        help='Exclude frames without reliable GT (EMDB/3DPW/PoseTrack21 '
+             '``good_frame=False``) from all metric computation. Inference, '
+             'post-processing, and prediction-bundle export still run over '
+             'every loaded frame. Intended for use with '
+             '--include-bad-frames. Warns (no-op) on datasets without a '
+             'good_frame concept.')
     p.add_argument('--warmup-batches', type=int, default=3,
                    help='Leading batches excluded from timing (default: 3)')
     p.add_argument('--bbox-thr', type=float, default=0.3,
@@ -1712,15 +1742,28 @@ def main():
         if postproc_by_img_id is not None else None
     )
 
+    eval_good_only = bool(getattr(args, 'eval_good_frames_only', False))
+    if eval_good_only and args.test_dataset not in BAD_FRAME_DATASETS:
+        print(
+            f'Warning: --eval-good-frames-only has no effect on '
+            f'{args.test_dataset!r} (no good_frame concept); evaluating '
+            f'every loaded frame.')
+        eval_good_only = False
+
+    n_eval = 0
     for fid, sample in enumerate(samples):
         img_id = sample.img_id
         gt_dicts = _pose_dicts_from_unifiedsample(sample)
+        include_in_eval = (not eval_good_only) or sample.good_frame
+        if include_in_eval:
+            n_eval += 1
 
         # ── Regular predictions ────────────────────────────────────────
         pred_ds = pred_by_img_id.get(img_id)
         if pred_ds is not None:
             ds = _attach_gt_to_posedatasample(pred_ds, sample)
-            evaluator.process(data_samples=[ds], data_batch=None)
+            if include_in_eval:
+                evaluator.process(data_samples=[ds], data_batch=None)
 
             if frame_records is not None:
                 pred_ds_save = _filter_pred_for_saving(ds, args.save_score_thr)
@@ -1732,6 +1775,7 @@ def main():
                     pred_ds=pred_ds_save,
                     gt_instances=gt_dicts,
                     dataset_meta=dataset_meta,
+                    good_frame=sample.good_frame,
                 ))
 
         # ── Post-processed predictions ─────────────────────────────────
@@ -1739,8 +1783,9 @@ def main():
             pp_ds = postproc_by_img_id.get(img_id)
             if pp_ds is not None:
                 pp_ds_gt = _attach_gt_to_posedatasample(pp_ds, sample)
-                pp_evaluator.process(
-                    data_samples=[pp_ds_gt], data_batch=None)
+                if include_in_eval:
+                    pp_evaluator.process(
+                        data_samples=[pp_ds_gt], data_batch=None)
 
                 if frame_records_pp is not None:
                     pp_ds_save = _filter_pred_for_saving(
@@ -1753,21 +1798,33 @@ def main():
                         pred_ds=pp_ds_save,
                         gt_instances=gt_dicts,
                         dataset_meta=dataset_meta,
+                        good_frame=sample.good_frame,
                     ))
 
-    quality = evaluator.evaluate(n_images)
+    n_bad = n_images - n_eval
+    if eval_good_only:
+        print(f'\nEvaluating on {n_eval}/{n_images} frames '
+              f'({n_bad} bad frames excluded)')
+    else:
+        n_eval = n_images
+
+    quality = evaluator.evaluate(n_eval)
     pp_quality: Optional[dict] = None
     if pp_evaluator is not None:
-        pp_quality = pp_evaluator.evaluate(n_images)
+        pp_quality = pp_evaluator.evaluate(n_eval)
 
     # Optional detection AP/AR (topdown only — reads from pred_ds.metainfo).
     # Built here (after inference) rather than up front, since in chunked
     # prefetch mode GT bboxes/areas/ori_shape on `samples` are only final
     # once every image has been decoded.
-    det_evaluator = (build_det_evaluator(samples)
+    det_samples = (
+        [s for s in samples if s.good_frame] if eval_good_only else samples)
+    det_evaluator = (build_det_evaluator(det_samples)
                       if getattr(args, 'det_metrics', False) else None)
     if det_evaluator is not None:
         for fid, sample in enumerate(samples):
+            if eval_good_only and not sample.good_frame:
+                continue
             pred_ds = pred_by_img_id.get(sample.img_id)
             bb = (pred_ds.metainfo.get(
                 'det_bboxes', np.zeros((0, 4), dtype=np.float32))
@@ -1789,7 +1846,7 @@ def main():
                 ),
             )
             det_evaluator.process(data_samples=[det_ds], data_batch=None)
-        det_quality = det_evaluator.evaluate(n_images)
+        det_quality = det_evaluator.evaluate(n_eval)
         quality = {**quality, **det_quality}
 
     # ── Output ─────────────────────────────────────────────────────────────
@@ -1798,7 +1855,9 @@ def main():
         _print_results(pp_quality, perf, f'{mode} [post-processed]')
 
     if args.out:
-        _save_out(quality, perf, mode, args, pp_quality=pp_quality)
+        _save_out(
+            quality, perf, mode, args, pp_quality=pp_quality,
+            n_eval=n_eval, n_images=n_images)
 
     if args.results_file:
         assert args.model_name and args.model_variant, (
@@ -1809,14 +1868,15 @@ def main():
     if args.model_name and frame_records is not None:
         _save_predictions(
             args, data_root, mode, is_topdown, quality, perf,
-            frame_records, dataset_meta, run_date)
+            frame_records, dataset_meta, run_date, n_eval=n_eval)
 
     # ── Post-processed bundle ───────────────────────────────────────────
     if args.model_name and frame_records_pp is not None and pp_quality is not None:
         _save_predictions_postproc(
             args, data_root, mode, is_topdown, pp_quality, perf,
             frame_records_pp, dataset_meta, run_date,
-            post_config=getattr(args, 'post_config', None))
+            post_config=getattr(args, 'post_config', None),
+            n_eval=n_eval)
 
 
 if __name__ == '__main__':

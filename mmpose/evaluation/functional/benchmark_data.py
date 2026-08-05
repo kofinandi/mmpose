@@ -75,6 +75,10 @@ class UnifiedSample:
     # Guards against double-scaling GT when load_sample_image is called more
     # than once for the same sample (e.g. re-fetched after being released).
     gt_scaled: bool = False
+    # True when the frame has reliable GT (EMDB/3DPW/PoseTrack21
+    # ``good_frame`` image field). Defaults to True for datasets without
+    # that concept.
+    good_frame: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -258,6 +262,9 @@ def build_unified_samples(
                 # has neither, so ori_shape stays (0, 0) until loaded).
                 'width': img.get('width'),
                 'height': img.get('height'),
+                # EMDB / 3DPW / PoseTrack21 image field; default True so
+                # datasets without the concept stay fully evaluable.
+                'good_frame': bool(img.get('good_frame', True)),
             }
 
     # ── Ordered unique img_ids with optional num_frames cap ─────────────
@@ -376,6 +383,7 @@ def build_unified_samples(
                 img_path = insts[0]['img_path']
                 crowd_index = None
                 width = height = None
+                good_frame = True
             else:
                 continue  # cannot determine image path
         else:
@@ -383,6 +391,7 @@ def build_unified_samples(
             crowd_index = info.get('crowd_index')
             width = info.get('width')
             height = info.get('height')
+            good_frame = bool(info.get('good_frame', True))
 
         gt_instances = [
             _parse_instance(inst) for inst in img_to_instances[img_id]
@@ -400,6 +409,7 @@ def build_unified_samples(
             ori_shape=ori_shape,
             gt_instances=gt_instances,
             crowd_index=crowd_index,
+            good_frame=good_frame,
         ))
 
     return samples
