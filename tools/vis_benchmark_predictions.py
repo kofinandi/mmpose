@@ -35,6 +35,7 @@ import matplotlib.pyplot as plt
 import mmcv
 import numpy as np
 
+from mmpose.evaluation.functional.benchmark_data import resize_to_ori_shape
 from mmpose.evaluation.functional.frame_metrics import (
     normalize_keypoint_visibility,
 )
@@ -212,20 +213,8 @@ def _upscale_image(img: np.ndarray, scale: float) -> np.ndarray:
 
 
 def _resize_to_ori_shape(img: np.ndarray, ori_shape: Optional[List[int]]) -> np.ndarray:
-    """Resize *img* to ``ori_shape`` when it differs from the file on disk.
-
-    Benchmark runs may prefetch EMDB (and other datasets) at reduced
-    resolution; predictions and GT in ``frames.json`` are stored in that
-    inference coordinate space while ``img_path`` still points at the
-    original file.
-    """
-    if not ori_shape or len(ori_shape) < 2:
-        return img
-    target_h, target_w = int(ori_shape[0]), int(ori_shape[1])
-    h, w = img.shape[:2]
-    if (h, w) == (target_h, target_w):
-        return img
-    return mmcv.imresize(img, (target_w, target_h))
+    """Resize *img* to the bundle's ``ori_shape`` (shared helper re-export)."""
+    return resize_to_ori_shape(img, ori_shape)
 
 
 def _bbox_iou(box_a: np.ndarray, box_b: np.ndarray) -> float:

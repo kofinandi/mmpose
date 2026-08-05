@@ -40,9 +40,31 @@ class BaseFilter(metaclass=ABCMeta):
     delegates to :meth:`process_frame`.
 
     Offline filters override :meth:`process_sequence` directly.
+
+    **Image access.**  Filters that need the frame's pixels (e.g. appearance
+    models) set ``requires_images = True`` -- as a class attribute, or as an
+    instance attribute in ``__init__`` when the need depends on the
+    configuration.  Such filters can only run in a pipeline whose config
+    declares ``needs_images=True`` (validated at build time); the driver then
+    attaches the frame as a data field ``ds.img`` before each
+    :meth:`process_frame` call:
+
+    * ``ds.img`` is a BGR ``(H, W, 3)`` ``uint8`` array in the **bundle's
+      coordinate space**, i.e. its shape matches ``metainfo['ori_shape']``
+      and the prediction coordinates.
+    * ``ds.img`` may be absent or ``None`` when the source image could not
+      be read; filters must degrade gracefully.
+    * Filters must **not** retain a reference to ``ds.img`` beyond the
+      current call -- the driver streams images in bounded chunks and
+      releases them afterwards.  Cache embeddings/features, never pixels.
     """
 
     online: bool = True
+
+    # Whether this filter reads ``ds.img``.  May be overridden per-instance
+    # in ``__init__`` when it depends on the configuration (e.g. a tracker
+    # whose appearance cost is optional).
+    requires_images: bool = False
 
     def reset(self) -> None:
         """Reset any internal state (e.g. per-track history).

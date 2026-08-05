@@ -101,6 +101,35 @@ def is_valid_instance(gt: GTInstance) -> bool:
     return True
 
 
+def resize_to_ori_shape(img: np.ndarray, ori_shape) -> np.ndarray:
+    """Resize *img* to ``ori_shape`` when it differs from the file on disk.
+
+    Benchmark runs may prefetch some datasets (e.g. EMDB) at reduced
+    resolution; predictions and GT in a saved bundle are stored in that
+    inference coordinate space while ``img_path`` still points at the
+    original file.  Consumers that reload images from disk (visualisation,
+    image-consuming post-processing) use this to bring the pixels back into
+    the bundle's coordinate space.
+
+    Args:
+        img: Image as read from disk, ``(H, W, 3)``.
+        ori_shape: Target ``(height, width)`` from the bundle frame record.
+            Falsy or malformed values leave the image untouched.
+
+    Returns:
+        The image at exactly ``ori_shape`` resolution.
+    """
+    if ori_shape is None or len(ori_shape) < 2:
+        return img
+    target_h, target_w = int(ori_shape[0]), int(ori_shape[1])
+    if target_h <= 0 or target_w <= 0:
+        return img
+    h, w = img.shape[:2]
+    if (h, w) == (target_h, target_w):
+        return img
+    return mmcv.imresize(img, (target_w, target_h))
+
+
 def _resize_prefetch_image(
     image: np.ndarray,
     scale: float,

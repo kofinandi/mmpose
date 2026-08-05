@@ -56,6 +56,11 @@ import mmpose.evaluation  # noqa: F401
 import mmpose.models      # noqa: F401
 from mmengine.registry import METRICS
 from mmpose.evaluation.benchmark_datasets import BENCHMARK_TEST_DATASETS
+from mmpose.evaluation.functional.benchmark_data import (
+    SampleImageStream,
+    UnifiedSample,
+    resize_to_ori_shape,
+)
 from mmpose.evaluation.functional.frame_metrics import (
     build_frame_record,
     save_prediction_bundle,
@@ -306,6 +311,71 @@ def build_evaluator_from_types(
     return Evaluator(metrics)
 
 
+# ── Image loading (for pipelines with needs_images=True) ─────────────────────
+
+def _resolve_image_path(img_path: str, data_root: str) -> str:
+    """Resolve a bundle-relative image path against the dataset root."""
+    if osp.isabs(img_path):
+        return img_path
+    return osp.join(data_root, img_path)
+
+
+def _build_image_samples(
+    frames: List[dict],
+    data_root: str,
+) -> List[UnifiedSample]:
+    """Build image-less :class:`UnifiedSample`\\ s from bundle frame records.
+
+    One sample per frame, in order, so :class:`SampleImageStream` can decode
+    the images in bounded chunks the same way ``tools/benchmark_e2e.py``
+    does.  GT is irrelevant here (only pixels are needed), so
+    ``gt_instances`` stays empty.
+    """
+    samples: List[UnifiedSample] = []
+    for frame in frames:
+        samples.append(UnifiedSample(
+            img_id=int(frame.get('img_id', 0)),
+            img_path=_resolve_image_path(frame.get('img_path', ''), data_root),
+            image=None,
+            ori_shape=tuple(frame.get('ori_shape', [0, 0])),
+        ))
+    return samples
+
+
+def _make_image_stream(
+    frames: List[dict],
+    data_root: str,
+    test_dataset: str,
+    args: argparse.Namespace,
+) -> SampleImageStream:
+    """Build the chunked image stream for a needs-images pipeline run."""
+    samples = _build_image_samples(frames, data_root)
+
+    if samples:
+        first_path = samples[0].img_path
+        if not osp.isfile(first_path):
+            raise FileNotFoundError(
+                f'The post-processing pipeline declares needs_images=True '
+                f'but the first frame image was not found at {first_path!r} '
+                f'(data_root={data_root!r}, cwd={os.getcwd()!r}). Pass '
+                f'--data-root to point at the dataset location.')
+
+    # Decode at the dataset's benchmark prefetch scale when known, so the
+    # (possibly much larger) source images are downscaled inside the worker
+    # threads; resize_to_ori_shape then snaps each frame exactly to the
+    # bundle's coordinate space.
+    spec = BENCHMARK_TEST_DATASETS.get(test_dataset)
+    prefetch_scale = spec.prefetch_scale if spec is not None else None
+
+    return SampleImageStream(
+        samples,
+        prefetch_scale=prefetch_scale,
+        chunk_size=args.prefetch_chunk_size,
+        queue_chunks=args.prefetch_queue_chunks,
+        workers=args.prefetch_workers,
+    )
+
+
 def _e2e_perf_from_manifest(manifest: dict) -> dict:
     """Return e2e perf entries from a source prediction bundle manifest."""
     return {
@@ -446,6 +516,21 @@ def _parse_args() -> argparse.Namespace:
         '--results-file', default=None,
         help='Append post-processed metrics to this JSON file '
              '(same nested format as tools/benchmark_e2e.py)')
+    p.add_argument(
+        '--data-root', default=None,
+        help='Dataset root for resolving frame image paths when the '
+             'pipeline declares needs_images=True '
+             '(default: data_root from manifest.json)')
+    p.add_argument(
+        '--prefetch-chunk-size', type=int, default=64,
+        help='Images decoded per chunk when the pipeline needs images '
+             '(bounds peak image memory; default: 64)')
+    p.add_argument(
+        '--prefetch-queue-chunks', type=int, default=2,
+        help='Decoded chunks buffered ahead of processing (default: 2)')
+    p.add_argument(
+        '--prefetch-workers', type=int, default=4,
+        help='Threads decoding images within a chunk (default: 4)')
     return p.parse_args()
 
 
@@ -499,7 +584,40 @@ def main() -> None:
     print(f'\nRunning post-processing pipeline ({mode_label}) ...')
     postproc_samples: List[PoseDataSample] = []
 
-    if pipeline.is_online:
+    if pipeline.needs_images:
+        # needs_images pipelines are always all-online (validated at build).
+        image_root = args.data_root or data_root or 'data/'
+        image_stream = _make_image_stream(
+            frames, image_root, test_dataset, args)
+        print(f'  Streaming images from {image_root!r} '
+              f'(chunk_size={args.prefetch_chunk_size}, '
+              f'workers={args.prefetch_workers})')
+
+        n_missing = 0
+        for sample, pred_ds, frame in zip(image_stream, pred_samples, frames):
+            if sample.image is not None:
+                pred_ds.img = resize_to_ori_shape(
+                    sample.image, frame.get('ori_shape'))
+            else:
+                if n_missing == 0:
+                    print(f'Warning: image missing for frame '
+                          f'{frame.get("img_path", "?")}; the pipeline '
+                          f'receives no ds.img for such frames.')
+                n_missing += 1
+            result = pipeline.process(pred_ds)
+            # Drop the pixel reference so the input sample list (which stays
+            # alive for evaluation/saving) doesn't pin every frame's image.
+            pred_ds.pop('img', None)
+            if result is not None:
+                postproc_samples.append(result)
+
+        if n_missing:
+            print(f'Warning: {n_missing}/{len(frames)} frame images could '
+                  f'not be read.')
+        if image_stream.stall_s > 0:
+            print(f'  Image decode stall : {image_stream.stall_s:.3f} s '
+                  f'(waiting for images; not counted in pipeline timing)')
+    elif pipeline.is_online:
         for pred_ds in pred_samples:
             result = pipeline.process(pred_ds)
             if result is not None:

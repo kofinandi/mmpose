@@ -1538,6 +1538,14 @@ def main():
     if getattr(args, 'post_config', None):
         print(f'\nBuilding post-processing pipeline from: {args.post_config}')
         post_pipeline = build_post_processor(args.post_config)
+        if post_pipeline.needs_images:
+            raise ValueError(
+                f'The post-processing config {args.post_config!r} declares '
+                f'needs_images=True, but --post-config in benchmark_e2e '
+                f'does not supply frame images (chunked prefetch releases '
+                f'the pixels before post-processing runs). Save the '
+                f'predictions first and run tools/postprocess_predictions.py '
+                f'on the bundle instead.')
         mode_label = 'online' if post_pipeline.is_online else 'offline'
         print(f'  Pipeline mode : {mode_label}')
         print(f'  Filters       : {[type(f).__name__ for f in post_pipeline.filters]}')

@@ -33,11 +33,46 @@ class PostProcessingPipeline:
 
     Args:
         filters: Ordered list of :class:`BaseFilter` instances.
+        needs_images: Declare that this pipeline consumes frame images.
+            Must be set to ``True`` in the pipeline config whenever any
+            filter has ``requires_images=True`` (validated here, at build
+            time).  When set, the driver attaches each frame's pixels as a
+            data field ``ds.img`` before :meth:`process` (see
+            :class:`BaseFilter` for the exact contract) and this pipeline
+            strips ``img`` from the returned sample so downstream consumers
+            don't pin the pixel arrays in memory.  Only all-online pipelines
+            may declare it: offline filters buffer whole sequences, and
+            images cannot be buffered.
     """
 
-    def __init__(self, filters: List[BaseFilter]) -> None:
+    def __init__(
+        self,
+        filters: List[BaseFilter],
+        needs_images: bool = False,
+    ) -> None:
         self.filters = filters
         self.is_online: bool = all(f.online for f in filters)
+        self.needs_images: bool = bool(needs_images)
+
+        image_filters = [
+            type(f).__name__ for f in filters
+            if getattr(f, 'requires_images', False)
+        ]
+        if image_filters and not self.needs_images:
+            raise ValueError(
+                f'Filters {image_filters} require frame images, but the '
+                f'pipeline config does not declare needs_images=True. Add '
+                f"needs_images=True to the post_processor dict of the "
+                f'post-processing config.')
+        if self.needs_images and not self.is_online:
+            offline_filters = [
+                type(f).__name__ for f in filters if not f.online
+            ]
+            raise ValueError(
+                f'needs_images=True requires an all-online pipeline, but '
+                f'filters {offline_filters} are offline. Offline filters '
+                f'buffer whole sequences and frame images cannot be '
+                f'buffered alongside them.')
 
         # Online runtime bookkeeping
         self._frame_times: List[float] = []
@@ -87,6 +122,12 @@ class PostProcessingPipeline:
         for f in self.filters:
             result = f.process_frame(result, seq_key)
         self._frame_times.append(time.perf_counter() - t0)
+
+        if self.needs_images and result is not None:
+            # ds.new() copies data fields by reference, so the returned
+            # sample would otherwise keep the frame's pixels alive in the
+            # caller's results list for the whole run.
+            result.pop('img', None)
 
         return result
 
@@ -204,6 +245,14 @@ def build_post_processor(
                 dict(type='OKSTracker', match_thr=0.5),
                 dict(type='OneEuroSmoother', min_cutoff=0.004, beta=0.7),
             ],
+        )
+
+    Pipelines whose filters read frame images must declare it explicitly::
+
+        post_processor = dict(
+            type='PostProcessingPipeline',
+            needs_images=True,
+            filters=[...],
         )
     """
     if isinstance(cfg, str):
