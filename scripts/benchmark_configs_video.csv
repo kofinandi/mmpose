@@ -1,0 +1,8 @@
+Config,Checkpoint,Name,Variant,Mode,KpBatchSize
+configs/body_2d_keypoint/poseidon/poseidon_vits-t5_posetrack21-288x384.py,data/models/poseidon/vits_model.pt,Poseidon,vits-posetrack21,topdown,16
+configs/body_2d_keypoint/poseidon/poseidon_vitb-t5_posetrack21-288x384.py,data/models/poseidon/vitb_model.pt,Poseidon,vitb-posetrack21,topdown,8
+configs/body_2d_keypoint/poseidon/poseidon_vith-t5_posetrack21-288x384.py,data/models/poseidon/vith_model.pt,Poseidon,vith-posetrack21,topdown,4
+# configs/body_2d_keypoint/poseidon/poseidon_vith-t5_posetrack18-288x384.py,data/models/poseidon/vith_model_posetrack18.pt,Poseidon,vith-posetrack18,topdown,4
+configs/body_2d_keypoint/tarvitpose/tarvitpose_vitb-t5_posetrack17-288x384.py,data/models/tarvitpose/tarvitpose_b_17.pt,TAR-ViTPose,vitb-posetrack17,topdown,8
+configs/body_2d_keypoint/tarvitpose/tarvitpose_vith-t5_posetrack17-288x384.py,data/models/tarvitpose/tarvitpose_h_17.pt,TAR-ViTPose,vith-posetrack17,topdown,4
+configs/body_2d_keypoint/pavenet/pavenet_r50-t3_posetrack17.py,data/models/pavenet/resnet50_posetrack.pth,PAVE-Net,r50-posetrack17,bottomup,8
