@@ -52,6 +52,20 @@ class LoadImage(LoadImageFromFile):
             if 'img' not in results:
                 # Load image from file by :meth:`LoadImageFromFile.transform`
                 results = super().transform(results)
+            elif isinstance(results['img'], list):
+                # A list of pre-loaded frames (a temporal clip window for a
+                # multi-frame video model, see tools/benchmark_e2e.py). All
+                # frames share one bbox/keypoint annotation (the center
+                # frame's), so only the first frame's shape is recorded.
+                imgs = results['img']
+                assert all(isinstance(im, np.ndarray) for im in imgs)
+                if self.to_float32:
+                    imgs = [im.astype(np.float32) for im in imgs]
+                results['img'] = imgs
+                if 'img_path' not in results:
+                    results['img_path'] = None
+                results['img_shape'] = imgs[0].shape[:2]
+                results['ori_shape'] = imgs[0].shape[:2]
             else:
                 img = results['img']
                 assert isinstance(img, np.ndarray)

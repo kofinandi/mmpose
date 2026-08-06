@@ -93,7 +93,7 @@ except (ImportError, ModuleNotFoundError):
 # Named tuple carried through the producer→consumer queue
 BBoxItem = collections.namedtuple(
     'BBoxItem',
-    ['frame_id', 'img_id', 'img', 'bbox_xyxy', 'det_score',
+    ['frame_id', 'img_id', 'img', 'clip_imgs', 'bbox_xyxy', 'det_score',
      'n_bboxes_in_frame', 'frame_start_wall'],
 )
 _SENTINEL = object()   # signals producer is done
@@ -151,11 +151,153 @@ def _blank_image(ori_shape: Tuple[int, int]) -> np.ndarray:
     return np.zeros((h, w, 3), dtype=np.uint8)
 
 
+FrameItem = collections.namedtuple(
+    'FrameItem',
+    ['frame_id', 'sample', 'image', 'clip'],
+)
+
+
+def _iter_stream_items(
+    sample_stream,
+) -> Iterator[Tuple[int, UnifiedSample, Optional[np.ndarray]]]:
+    """Enumerate a sample stream as ``(frame_id, sample, image)`` triples.
+
+    Each sample's ``image`` is captured the instant it is pulled from
+    ``sample_stream``, rather than left to be read later from
+    ``sample.image``. This matters for chunked prefetch, where
+    :class:`SampleImageStream` releases each chunk's pixel data
+    (``sample.image = None``) once the stream has advanced past it, and
+    for clip windowing (see :func:`_with_clip_windows`), which must keep
+    its own references to a handful of neighbouring frames while the
+    stream continues to advance underneath it.
+    """
+    for frame_id, sample in enumerate(sample_stream):
+        yield frame_id, sample, sample.image
+
+
+def _clip_seq_key(sample: UnifiedSample):
+    """Sequence-grouping key for clip-window assembly.
+
+    Uses ``UnifiedSample.seq_id`` (populated for EMDB/3DPW/PoseTrack21 from
+    the annotation's ``seq_name``) when available. Datasets without video
+    metadata (COCO, CrowdPose, MPII, AIC, OCHuman) fall back to the
+    sample's own ``img_id`` as a singleton "sequence" of one frame, so a
+    clip requested around such a frame is just that frame repeated --
+    no cross-image bleed, but no real temporal context either.
+    """
+    return sample.seq_id if sample.seq_id is not None else sample.img_id
+
+
+def _with_clip_windows(
+    item_iter: Iterator[Tuple[int, UnifiedSample, Optional[np.ndarray]]],
+    num_input_frames: int,
+) -> Iterator[Tuple[int, UnifiedSample, Optional[np.ndarray],
+                    Optional[List[Optional[np.ndarray]]]]]:
+    """Attach a temporal clip window to each ``(frame_id, sample, image)``.
+
+    For ``num_input_frames > 1``, yields ``(frame_id, sample, image, clip)``
+    where ``clip`` is a list of ``num_input_frames`` images
+    ``[image[-half], ..., image, ..., image[+half]]`` centred on ``image``
+    (``half = num_input_frames // 2``), matching the fixed odd-length
+    temporal windows used by every published video-pose config (Poseidon,
+    TAR-ViTPose: 5; PAVE-Net: 3).
+
+    Windows are edge-clamped *within a sequence*: frames whose
+    :func:`_clip_seq_key` differs from the current frame's (i.e. would
+    cross a video boundary, or the stream start/end) are replaced with the
+    current frame itself, replicating the reference implementations'
+    "clip index to [0, nframes-1]" boundary behaviour without needing to
+    know each sequence's length up front.
+
+    For ``num_input_frames <= 1`` (the default, and every existing
+    single-frame model), yields ``(frame_id, sample, image, None)`` --
+    ``clip`` is ``None`` rather than ``[image]`` so callers can cheaply
+    branch on ``clip is None`` and leave the single-frame code path (and
+    its performance) completely unchanged.
+
+    Holds at most ``num_input_frames`` decoded frames in memory beyond
+    whatever :class:`SampleImageStream` itself buffers, since each
+    ``image`` reference is captured by :func:`_iter_stream_items` the
+    instant it is produced; this works for chunked prefetch as long as
+    ``--prefetch-chunk-size`` (if used) is at least ``num_input_frames``,
+    since otherwise a chunk boundary could release a frame's pixels before
+    a later frame's window is assembled from it.
+    """
+    if num_input_frames <= 1:
+        for frame_id, sample, image in item_iter:
+            yield frame_id, sample, image, None
+        return
+
+    if num_input_frames % 2 == 0:
+        raise ValueError(
+            'num_input_frames must be odd (or 1); every published '
+            f'video-pose config uses a centred, odd-length window. Got '
+            f'{num_input_frames}.')
+
+    half = num_input_frames // 2
+    it = iter(item_iter)
+    window: List[Tuple[int, UnifiedSample, Optional[np.ndarray]]] = []
+    pos = 0
+    exhausted = False
+
+    def _extend_lookahead() -> None:
+        nonlocal exhausted
+        while not exhausted and (len(window) - pos - 1) < half:
+            try:
+                window.append(next(it))
+            except StopIteration:
+                exhausted = True
+
+    _extend_lookahead()
+    while pos < len(window):
+        _extend_lookahead()
+        frame_id, sample, image = window[pos]
+        seq_key = _clip_seq_key(sample)
+
+        # Walk outward from the centre in each direction, freezing at the
+        # last in-sequence frame once a boundary (different seq_id, or the
+        # stream's own start/end) is crossed -- since the stream visits
+        # each sequence contiguously, every offset beyond that point is
+        # equally out of range, so it repeats that same boundary frame
+        # (matching the reference implementations' `clip(idx, 0, n-1)`).
+        before = []
+        last = image
+        for offset in range(1, half + 1):
+            idx = pos - offset
+            if idx >= 0:
+                _, nb_sample, nb_image = window[idx]
+                if _clip_seq_key(nb_sample) == seq_key:
+                    last = nb_image
+            before.append(last)
+        before.reverse()
+
+        after = []
+        last = image
+        for offset in range(1, half + 1):
+            idx = pos + offset
+            if idx < len(window):
+                _, nb_sample, nb_image = window[idx]
+                if _clip_seq_key(nb_sample) == seq_key:
+                    last = nb_image
+            after.append(last)
+
+        clip = before + [image] + after
+
+        yield frame_id, sample, image, clip
+
+        pos += 1
+        if pos > half:
+            drop = pos - half
+            window = window[drop:]
+            pos -= drop
+
+
 def _batched_samples(
     sample_stream,
     batch_size: int,
-) -> Iterator[List[Tuple[int, UnifiedSample, Optional[np.ndarray]]]]:
-    """Group a sample stream into ``(frame_id, sample, image)`` batches.
+    num_input_frames: int = 1,
+) -> Iterator[List[FrameItem]]:
+    """Group a sample stream into batches of :class:`FrameItem`.
 
     ``frame_id`` is the running index into the stream, i.e. the index into
     the original samples list, giving callers a stable id to key
@@ -164,22 +306,29 @@ def _batched_samples(
     of the pipeline relies on, regardless of whether the stream is eager
     or chunked.
 
-    Each sample's ``image`` is captured the instant it is pulled from
-    ``sample_stream``, rather than left to be read later from
-    ``sample.image``. This matters once a single output batch spans more
-    than one of :class:`SampleImageStream`'s internal decode chunks (e.g.
-    ``chunk_size < batch_size``): by the time such a batch is fully
-    assembled and handed off, the stream has already advanced past -- and
-    released -- the chunk(s) containing its earliest samples.
+    When ``num_input_frames > 1``, each item's ``clip`` field additionally
+    carries the temporal window around it (see :func:`_with_clip_windows`);
+    otherwise ``clip`` is ``None``. See :func:`_iter_stream_items` for how
+    ``image`` capture interacts with chunked prefetch.
     """
-    batch: List[Tuple[int, UnifiedSample, Optional[np.ndarray]]] = []
-    for frame_id, sample in enumerate(sample_stream):
-        batch.append((frame_id, sample, sample.image))
+    batch: List[FrameItem] = []
+    stream_items = _with_clip_windows(
+        _iter_stream_items(sample_stream), num_input_frames)
+    for frame_id, sample, image, clip in stream_items:
+        batch.append(FrameItem(frame_id, sample, image, clip))
         if len(batch) >= batch_size:
             yield batch
             batch = []
     if batch:
         yield batch
+
+
+def _fill_blank_clip(
+    clip: List[Optional[np.ndarray]],
+    ori_shape: Tuple[int, int],
+) -> List[np.ndarray]:
+    """Replace any ``None`` frame in a clip (failed decode) with a blank."""
+    return [im if im is not None else _blank_image(ori_shape) for im in clip]
 
 
 # ── Evaluator helpers ──────────────────────────────────────────────────────
@@ -526,6 +675,7 @@ def run_bottomup(
     device: str,
     warmup_batches: int = 3,
     log_interval: int = 100,
+    num_input_frames: int = 1,
 ) -> Tuple[Dict[int, PoseDataSample], dict]:
     """Run bottomup inference on unified samples.
 
@@ -551,6 +701,13 @@ def run_bottomup(
         device: Target device string.
         warmup_batches: Leading batches excluded from timing.
         log_interval: Batches between progress prints.
+        num_input_frames: Temporal clip window size for multi-frame video
+            models (see :func:`_with_clip_windows`). ``1`` (default) keeps
+            the single-frame behaviour: ``di['img']`` is a single image.
+            When ``> 1``, ``di['img']`` is instead a list of
+            ``num_input_frames`` whole-frame images (the model's own
+            ``data_preprocessor``/wrapper is responsible for stacking and
+            normalising the clip).
 
     Returns:
         pred_by_img_id: Mapping ``img_id → PoseDataSample`` (prediction only).
@@ -563,14 +720,16 @@ def run_bottomup(
     pred_by_img_id: Dict[int, PoseDataSample] = {}
 
     for i, batch_samples in enumerate(
-            _batched_samples(sample_stream, kp_batch_size)):
+            _batched_samples(sample_stream, kp_batch_size, num_input_frames)):
         items = []
         img_ids = []
-        for _, sample, img in batch_samples:
+        for _, sample, img, clip in batch_samples:
             if img is None:
                 img = _blank_image(sample.ori_shape)
+            model_img = (_fill_blank_clip(clip, sample.ori_shape)
+                        if clip is not None else img)
             di: dict = {
-                'img': img,
+                'img': model_img,
                 'img_path': sample.img_path,
                 'img_id': sample.img_id,
                 # Use GT annotation IDs so CocoMetric gets the right IDs
@@ -635,7 +794,7 @@ def run_bottomup(
 # ── Topdown pipeline ───────────────────────────────────────────────────────
 
 def _mock_detector_producer(
-    sample_batches: Iterator[List[Tuple[int, UnifiedSample, Optional[np.ndarray]]]],
+    sample_batches: Iterator[List[FrameItem]],
     n_images: int,
     det_batch_size: int,
     bbox_queue: queue.Queue,
@@ -655,12 +814,12 @@ def _mock_detector_producer(
     n_batches = -(-n_images // det_batch_size)
 
     for batch_idx, batch in enumerate(sample_batches):
-        batch_start = batch[0][0]
-        batch_end = batch[-1][0] + 1
+        batch_start = batch[0].frame_id
+        batch_end = batch[-1].frame_id + 1
 
         wall_start = time.perf_counter()
-        for fid, _, _ in batch:
-            frame_start_times[fid] = wall_start
+        for item in batch:
+            frame_start_times[item.frame_id] = wall_start
 
         if (batch_idx + 1) % log_interval == 0 or (batch_idx + 1) == n_batches:
             print(f'  [mock-detector] batch {batch_idx + 1}/{n_batches} '
@@ -668,7 +827,7 @@ def _mock_detector_producer(
 
         wall_after = time.perf_counter()
 
-        for frame_id, sample, img in batch:
+        for frame_id, sample, img, clip in batch:
             img_id = sample.img_id
             h, w = sample.ori_shape
 
@@ -690,6 +849,10 @@ def _mock_detector_producer(
             det_predictions[frame_id] = (bboxes_xyxy, scores)
             n_bboxes = 0 if img is None else len(bboxes_xyxy)
 
+            clip_imgs = (
+                _fill_blank_clip(clip, sample.ori_shape)
+                if clip is not None else None)
+
             if n_bboxes == 0:
                 zero_det_frames[frame_id] = (img_id, (h, w))
                 frame_end_times[frame_id] = wall_after
@@ -699,6 +862,7 @@ def _mock_detector_producer(
                         frame_id=frame_id,
                         img_id=img_id,
                         img=img,
+                        clip_imgs=clip_imgs,
                         bbox_xyxy=bbox,
                         det_score=float(score),
                         n_bboxes_in_frame=n_bboxes,
@@ -710,7 +874,7 @@ def _mock_detector_producer(
 
 def _detector_producer(
     detector,
-    sample_batches: Iterator[List[Tuple[int, UnifiedSample, Optional[np.ndarray]]]],
+    sample_batches: Iterator[List[FrameItem]],
     n_images: int,
     det_batch_size: int,
     bbox_thr: float,
@@ -736,16 +900,17 @@ def _detector_producer(
     n_batches = -(-n_images // det_batch_size)
 
     for batch_idx, batch in enumerate(sample_batches):
-        batch_start = batch[0][0]
-        batch_end = batch[-1][0] + 1
+        batch_start = batch[0].frame_id
+        batch_end = batch[-1].frame_id + 1
 
         wall_start = time.perf_counter()
-        for fid, _, _ in batch:
-            frame_start_times[fid] = wall_start
+        for item in batch:
+            frame_start_times[item.frame_id] = wall_start
 
         imgs = [
-            img if img is not None else _blank_image(sample.ori_shape)
-            for _, sample, img in batch
+            item.image if item.image is not None
+            else _blank_image(item.sample.ori_shape)
+            for item in batch
         ]
         with torch.no_grad():
             with _CudaTimer() as timer:
@@ -764,7 +929,7 @@ def _detector_producer(
                   f'| frames processed: {batch_end} '
                   f'| running FPS: {fps_so_far:.1f}')
 
-        for (frame_id, sample, orig_img), img, det_result in zip(
+        for (frame_id, sample, orig_img, clip), img, det_result in zip(
                 batch, imgs, det_results):
             img_id = sample.img_id
             h, w = sample.ori_shape
@@ -792,6 +957,10 @@ def _detector_producer(
             det_predictions[frame_id] = (bboxes_xyxy, scores)
             n_bboxes = 0 if decode_failed else len(bboxes_xyxy)
 
+            clip_imgs = (
+                _fill_blank_clip(clip, sample.ori_shape)
+                if clip is not None else None)
+
             if n_bboxes == 0:
                 zero_det_frames[frame_id] = (img_id, (h, w))
                 frame_end_times[frame_id] = wall_after_det
@@ -801,6 +970,7 @@ def _detector_producer(
                         frame_id=frame_id,
                         img_id=img_id,
                         img=img,
+                        clip_imgs=clip_imgs,
                         bbox_xyxy=bbox,
                         det_score=float(score),
                         n_bboxes_in_frame=n_bboxes,
@@ -834,7 +1004,9 @@ def _keypoint_consumer(
 
         data_list = []
         for item in buf:
-            di = dict(img=item.img)
+            img_for_model = (
+                item.clip_imgs if item.clip_imgs is not None else item.img)
+            di = dict(img=img_for_model)
             di['bbox'] = item.bbox_xyxy[None]
             di['bbox_score'] = np.array(
                 [item.det_score], dtype=np.float32)
@@ -946,6 +1118,7 @@ def run_topdown(
     pose_cfg: Config,
     log_interval: int = 100,
     use_mock_detector: bool = False,
+    num_input_frames: int = 1,
 ) -> Tuple[Dict[int, PoseDataSample], dict]:
     """Run topdown async producer/consumer benchmark on unified samples.
 
@@ -977,6 +1150,13 @@ def run_topdown(
         pose_cfg: Pose config (used to build the keypoint pipeline).
         log_interval: Batches between progress prints.
         use_mock_detector: If True, skip real detector.
+        num_input_frames: Temporal clip window size for multi-frame video
+            models (see :func:`_with_clip_windows`). ``1`` (default) keeps
+            the single-frame behaviour: each ``BBoxItem`` fed to the
+            keypoint model carries a single crop image. When ``> 1``, it
+            instead carries a list of ``num_input_frames`` crops (the same
+            bbox applied to every frame in the window around it) for the
+            keypoint pipeline/wrapper to stack into a clip tensor.
 
     Returns:
         pred_by_img_id: Mapping ``img_id → PoseDataSample`` (prediction only).
@@ -994,7 +1174,8 @@ def run_topdown(
     dataset_meta = kp_model.dataset_meta
 
     n_images = len(samples)
-    sample_batches = _batched_samples(sample_stream, det_batch_size)
+    sample_batches = _batched_samples(
+        sample_stream, det_batch_size, num_input_frames)
 
     bbox_queue: queue.Queue = queue.Queue(maxsize=kp_batch_size * 8)
 
@@ -1459,6 +1640,13 @@ def _parse_args():
     p.add_argument('--num-frames', type=int, default=None,
                    help='Cap number of images evaluated (default: full val set)')
     p.add_argument(
+        '--num-input-frames', type=int, default=None,
+        help='Temporal clip window size (number of consecutive frames) fed '
+             'to the pose model per prediction, for multi-frame video '
+             'models (e.g. Poseidon, TAR-ViTPose: 5; PAVE-Net: 3). Must be '
+             'odd. Defaults to the pose config\'s `num_input_frames` field '
+             '(itself defaulting to 1, i.e. single-frame) when not set.')
+    p.add_argument(
         '--prefetch-chunk-size', type=int, default=0,
         help='If > 0, load images lazily in chunks of this many frames '
              'instead of decoding the whole dataset up front. Use this for '
@@ -1562,6 +1750,19 @@ def main():
 
     _init_scope(pose_cfg)
     MMLogger.get_current_instance()
+
+    num_input_frames = args.num_input_frames
+    if num_input_frames is None:
+        num_input_frames = pose_cfg.get('num_input_frames', 1)
+    if num_input_frames > 1:
+        print(f'\nMulti-frame video model: num_input_frames={num_input_frames}')
+        if args.prefetch_chunk_size and args.prefetch_chunk_size < num_input_frames:
+            print(
+                f'Warning: --prefetch-chunk-size ({args.prefetch_chunk_size}) '
+                f'is smaller than --num-input-frames ({num_input_frames}); '
+                f'clip windows near a chunk boundary may see frames whose '
+                f'pixels were already released. Set --prefetch-chunk-size '
+                f'>= --num-input-frames (or 0 for eager loading).')
 
     # ── Optional post-processing pipeline ────────────────────────────────
     post_pipeline: Optional[PostProcessingPipeline] = None
@@ -1680,6 +1881,7 @@ def main():
             pose_cfg=pose_cfg,
             log_interval=args.log_interval,
             use_mock_detector=args.mock_detector,
+            num_input_frames=num_input_frames,
         )
         infer_wall_s = time.perf_counter() - t_infer_start
 
@@ -1709,6 +1911,7 @@ def main():
             device=args.device,
             warmup_batches=args.warmup_batches,
             log_interval=args.log_interval,
+            num_input_frames=num_input_frames,
         )
         infer_wall_s = time.perf_counter() - t_infer_start
 
