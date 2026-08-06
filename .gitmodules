@@ -19,3 +19,6 @@
 [submodule "external/poseidon"]
 	path = external/poseidon
 	url = https://github.com/CesareDavidePace/poseidon.git
+[submodule "external/TARViTPose"]
+	path = external/TARViTPose
+	url = https://github.com/zgspose/TARViTPose.git
