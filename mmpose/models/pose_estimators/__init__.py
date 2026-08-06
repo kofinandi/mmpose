@@ -2,6 +2,7 @@
 from .bottomup import BottomupPoseEstimator
 from .pct_wrapper import PCTPoseEstimator
 from .petr_wrapper import PETRPoseEstimator
+from .poseidon_wrapper import PoseidonPoseEstimator
 from .rfdetr_pose_wrapper import RFDETRPoseEstimator
 from .ultralytics_yolo_pose_wrapper import UltralyticsYOLOPoseEstimator
 from .pose_lifter import PoseLifter
@@ -11,5 +12,6 @@ from .topdown import TopdownPoseEstimator
 __all__ = [
     'TopdownPoseEstimator', 'BottomupPoseEstimator', 'PoseLifter',
     'PCTPoseEstimator', 'Sapiens2PoseEstimator', 'PETRPoseEstimator',
-    'UltralyticsYOLOPoseEstimator', 'RFDETRPoseEstimator'
+    'UltralyticsYOLOPoseEstimator', 'RFDETRPoseEstimator',
+    'PoseidonPoseEstimator'
 ]

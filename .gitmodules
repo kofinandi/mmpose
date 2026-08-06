@@ -16,3 +16,6 @@
 [submodule "external/PGPT"]
 	path = external/PGPT
 	url = https://github.com/JDAI-CV/PGPT.git
+[submodule "external/poseidon"]
+	path = external/poseidon
+	url = https://github.com/CesareDavidePace/poseidon.git
