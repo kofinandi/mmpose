@@ -552,6 +552,13 @@ class BottomupResize(BaseTransform):
         img = results['img']
         img_h, img_w = results['ori_shape']
         w, h = self.input_size
+        # ``img`` is a list of frames rather than a single array when this
+        # transform runs on a multi-frame video clip (see
+        # ``_with_clip_windows`` in ``tools/benchmark_e2e.py``). Every frame
+        # in the clip shares the same ``ori_shape`` and therefore the same
+        # warp matrix, so it is simply applied per-frame below (mirrors
+        # ``TopdownAffine``'s handling of clip lists).
+        is_clip = isinstance(img, list)
 
         input_sizes = [(w, h)]
         if self.aug_scales:
@@ -585,12 +592,22 @@ class BottomupResize(BaseTransform):
                     rot=0,
                     output_size=padded_input_size)
 
-            _img = cv2.warpAffine(
-                img,
-                warp_mat,
-                padded_input_size,
-                flags=cv2.INTER_LINEAR,
-                borderValue=self.pad_val)
+            if is_clip:
+                _img = [
+                    cv2.warpAffine(
+                        frame,
+                        warp_mat,
+                        padded_input_size,
+                        flags=cv2.INTER_LINEAR,
+                        borderValue=self.pad_val) for frame in img
+                ]
+            else:
+                _img = cv2.warpAffine(
+                    img,
+                    warp_mat,
+                    padded_input_size,
+                    flags=cv2.INTER_LINEAR,
+                    borderValue=self.pad_val)
 
             imgs.append(_img)
 

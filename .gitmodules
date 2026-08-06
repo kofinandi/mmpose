@@ -22,3 +22,6 @@
 [submodule "external/TARViTPose"]
 	path = external/TARViTPose
 	url = https://github.com/zgspose/TARViTPose.git
+[submodule "external/PAVENet"]
+	path = external/PAVENet
+	url = https://github.com/zgspose/PAVENet.git

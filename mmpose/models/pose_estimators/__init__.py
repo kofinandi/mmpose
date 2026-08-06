@@ -1,6 +1,7 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 from .bottomup import BottomupPoseEstimator
 from .pct_wrapper import PCTPoseEstimator
+from .pavenet_wrapper import PAVENetPoseEstimator
 from .petr_wrapper import PETRPoseEstimator
 from .poseidon_wrapper import PoseidonPoseEstimator
 from .rfdetr_pose_wrapper import RFDETRPoseEstimator
@@ -14,5 +15,6 @@ __all__ = [
     'TopdownPoseEstimator', 'BottomupPoseEstimator', 'PoseLifter',
     'PCTPoseEstimator', 'Sapiens2PoseEstimator', 'PETRPoseEstimator',
     'UltralyticsYOLOPoseEstimator', 'RFDETRPoseEstimator',
-    'PoseidonPoseEstimator', 'TARViTPosePoseEstimator'
+    'PoseidonPoseEstimator', 'TARViTPosePoseEstimator',
+    'PAVENetPoseEstimator'
 ]
