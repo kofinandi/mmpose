@@ -25,6 +25,9 @@
 [submodule "external/PAVENet"]
 	path = external/PAVENet
 	url = https://github.com/zgspose/PAVENet.git
+[submodule "external/openpifpaf"]
+	path = external/openpifpaf
+	url = https://github.com/openpifpaf/openpifpaf.git
 [submodule "external/AlphaPose"]
 	path = external/AlphaPose
 	url = https://github.com/MVIG-SJTU/AlphaPose.git

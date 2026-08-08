@@ -1,6 +1,7 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 from .alphapose_wrapper import AlphaPosePoseEstimator
 from .bottomup import BottomupPoseEstimator
+from .openpifpaf_wrapper import OpenPifPafPoseEstimator
 from .pct_wrapper import PCTPoseEstimator
 from .pavenet_wrapper import PAVENetPoseEstimator
 from .petr_wrapper import PETRPoseEstimator
@@ -17,5 +18,6 @@ __all__ = [
     'PCTPoseEstimator', 'Sapiens2PoseEstimator', 'PETRPoseEstimator',
     'UltralyticsYOLOPoseEstimator', 'RFDETRPoseEstimator',
     'PoseidonPoseEstimator', 'TARViTPosePoseEstimator',
-    'PAVENetPoseEstimator', 'AlphaPosePoseEstimator'
+    'PAVENetPoseEstimator', 'AlphaPosePoseEstimator',
+    'OpenPifPafPoseEstimator'
 ]

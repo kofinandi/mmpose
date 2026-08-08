@@ -21,10 +21,16 @@ from mmpose.structures.bbox import bbox_xywh2xyxy
 CUSTOM_POSE_WRAPPER_TYPES = frozenset({
     'UltralyticsYOLOPoseEstimator',
     'RFDETRPoseEstimator',
+    # OpenPifPaf checkpoints are pickled *whole model objects*
+    # (``torch.save({'model': model, ...})``), not state dicts, so they must
+    # be loaded by openpifpaf's own network.Factory rather than MMEngine's
+    # load_checkpoint.
+    'OpenPifPafPoseEstimator',
 })
 _POSE_WRAPPER_CHECKPOINT_FIELDS = {
     'UltralyticsYOLOPoseEstimator': 'weights',
     'RFDETRPoseEstimator': 'pretrain_weights',
+    'OpenPifPafPoseEstimator': 'checkpoint',
 }
 
 
