@@ -24,15 +24,23 @@
 # For large test sets, stream frames in chunks instead of eager-loading
 # everything upfront, e.g.:
 #   PREFETCH_CHUNK_SIZE=256 TEST_DATASET=emdb ./scripts/run_video_benchmarks.sh
+#
+# A different CSV can be swept with CSV=, in which case SUFFIX= renames the
+# output folders so the two sweeps do not write into each other, e.g. the
+# self-tracking models (AlphaPose, OpenPifPaf):
+#   CSV=scripts/benchmark_configs_tracking.csv SUFFIX=tracking \
+#     ./scripts/run_video_benchmarks.sh
 
 set -uo pipefail
 
 TIMESTAMP="$(date '+%Y%m%d')"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CSV="${CSV:-${ROOT_DIR}/scripts/benchmark_configs_video.csv}"
+# Names the log/results/prediction folders; change it alongside CSV.
+SUFFIX="${SUFFIX:-video}"
 TEST_DATASET="${TEST_DATASET:-emdb-mini}"
-LOG_DIR="${LOG_DIR:-${ROOT_DIR}/benchmark/logs/${TIMESTAMP}_${TEST_DATASET}_video}"
-RESULTS_FILE="${RESULTS_FILE:-${ROOT_DIR}/benchmark/results/${TIMESTAMP}_${TEST_DATASET}_video.json}"
+LOG_DIR="${LOG_DIR:-${ROOT_DIR}/benchmark/logs/${TIMESTAMP}_${TEST_DATASET}_${SUFFIX}}"
+RESULTS_FILE="${RESULTS_FILE:-${ROOT_DIR}/benchmark/results/${TIMESTAMP}_${TEST_DATASET}_${SUFFIX}.json}"
 DEVICE="${DEVICE:-cuda:7}"
 KP_BATCH_SIZE="${KP_BATCH_SIZE:-8}"
 # 0 (default) = eager-load the whole dataset upfront, matching
@@ -67,7 +75,7 @@ run_benchmark() {
     local det_cat_id="${8:-}"
 
     local log_file="${LOG_DIR}/${name}-${full_variant}.log"
-    local pred_dir="benchmark/predictions/${TIMESTAMP}_${TEST_DATASET}_video/${name}-${full_variant}"
+    local pred_dir="benchmark/predictions/${TIMESTAMP}_${TEST_DATASET}_${SUFFIX}/${name}-${full_variant}"
 
     local extra_args=()
     if [[ "$PREFETCH_CHUNK_SIZE" -gt 0 ]]; then

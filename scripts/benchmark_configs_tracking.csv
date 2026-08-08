@@ -1,0 +1,17 @@
+Config,Checkpoint,Name,Variant,Mode,KpBatchSize
+configs/body_2d_keypoint/alphapose/alphapose_fastpose-res50_coco-256x192.py,data/models/alphapose/fast_res50_256x192.pth,AlphaPose,fastpose-res50,topdown,1
+configs/body_2d_keypoint/alphapose/alphapose_fastpose-duc-res50_coco-256x192.py,data/models/alphapose/fast_421_res50-shuffle_256x192.pth,AlphaPose,fastpose-duc-res50,topdown,1
+configs/body_2d_keypoint/alphapose/alphapose_fastpose-duc-res152_coco-256x192.py,data/models/alphapose/fast_421_res152_256x192.pth,AlphaPose,fastpose-duc-res152,topdown,1
+configs/body_2d_keypoint/alphapose/alphapose_fastpose-dcn-res50_coco-256x192.py,data/models/alphapose/fast_dcn_res50_256x192.pth,AlphaPose,fastpose-dcn-res50,topdown,1
+configs/body_2d_keypoint/alphapose/alphapose_hrnet-w32_coco-256x192.py,data/models/alphapose/pose_hrnet_w32_256x192.pth,AlphaPose,hrnet-w32,topdown,1
+configs/body_2d_keypoint/openpifpaf/openpifpaf_tshufflenetv2k30-trackingpose_posetrack2018.py,data/models/openpifpaf/tshufflenetv2k30-210628-075118-posetrack2018-cocokpst-slurm668247-o25-3d734bb8.pkl,OpenPifPaf,tshufflenetv2k30-trackingpose,bottomup,1
+configs/body_2d_keypoint/openpifpaf/openpifpaf_tshufflenetv2k30-posesimilarity_posetrack2018.py,data/models/openpifpaf/tshufflenetv2k30-210628-075118-posetrack2018-cocokpst-slurm668247-o25-3d734bb8.pkl,OpenPifPaf,tshufflenetv2k30-posesimilarity,bottomup,1
+configs/body_2d_keypoint/openpifpaf/openpifpaf_shufflenetv2k16_coco.py,data/models/openpifpaf/shufflenetv2k16-210820-232500-cocokp-slurm726069-edge513-o10s-7189450a.pkl,OpenPifPaf,shufflenetv2k16-coco,bottomup,1
+configs/body_2d_keypoint/openpifpaf/openpifpaf_shufflenetv2k30_coco.py,data/models/openpifpaf/shufflenetv2k30-210821-003923-cocokp-slurm726072-edge513-o10s-5fe1c400.pkl,OpenPifPaf,shufflenetv2k30-coco,bottomup,1
+# OpenPifPaf tshufflenetv2k16: no row -- upstream marks it PRETRAINED_UNAVAILABLE
+# (external/openpifpaf/src/openpifpaf/plugins/posetrack/__init__.py:9), so the
+# only released tracking checkpoint is tshufflenetv2k30.
+# STAF (Raaj et al., CVPR 2019): no row -- its body_21a_video caffemodel is
+# unobtainable (CMU's posefs1 host is dead, no Wayback snapshot of that path,
+# vcl.snu.ac.kr mirror 502s, and no HuggingFace mirror carries it). See the
+# integration notes in the branch's commit history.
