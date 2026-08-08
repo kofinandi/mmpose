@@ -4,21 +4,26 @@
 #
 # Each CSV row is one multi-frame video model config + checkpoint, tagged
 # with a `Mode` of either:
-#   - topdown:  needs person detections. Swept against three detector
+#   - topdown:  needs person detections. Swept against two detector
 #               strategies, mirroring run_topdown_coco_benchmarks.sh:
-#                 - "gt"     : --mock-detector (ground-truth boxes -- the
-#                              paper-matching evaluation protocol used to
-#                              verify each of these configs)
 #                 - "rfdetr" : RF-DETR-medium
 #                 - "rtmdet" : RTMDet-medium
 #   - bottomup: end-to-end (e.g. PAVE-Net), run once with no detector,
 #               mirroring run_e2e_coco_benchmarks.sh.
+#
+# All predictions are saved under one {date}_{dataset}_video/ folder
+# (rather than tools/benchmark_e2e.py's own topdown/e2e split), since every
+# row here is a video model regardless of Mode.
 #
 # Test set is configurable (default: emdb-mini) since these are video
 # models -- e.g.:
 #   TEST_DATASET=emdb ./scripts/run_video_benchmarks.sh
 #   TEST_DATASET=3dpw ./scripts/run_video_benchmarks.sh
 #   TEST_DATASET=posetrack21 ./scripts/run_video_benchmarks.sh
+#
+# For large test sets, stream frames in chunks instead of eager-loading
+# everything upfront, e.g.:
+#   PREFETCH_CHUNK_SIZE=256 TEST_DATASET=emdb ./scripts/run_video_benchmarks.sh
 
 set -uo pipefail
 
@@ -30,6 +35,11 @@ LOG_DIR="${LOG_DIR:-${ROOT_DIR}/benchmark/logs/${TIMESTAMP}_${TEST_DATASET}_vide
 RESULTS_FILE="${RESULTS_FILE:-${ROOT_DIR}/benchmark/results/${TIMESTAMP}_${TEST_DATASET}_video.json}"
 DEVICE="${DEVICE:-cuda:7}"
 KP_BATCH_SIZE="${KP_BATCH_SIZE:-8}"
+# 0 (default) = eager-load the whole dataset upfront, matching
+# run_e2e_coco_benchmarks.sh/run_topdown_coco_benchmarks.sh. Set e.g.
+# PREFETCH_CHUNK_SIZE=256 to stream in chunks instead (recommended for
+# large video test sets such as full EMDB/3DPW/PoseTrack21).
+PREFETCH_CHUNK_SIZE="${PREFETCH_CHUNK_SIZE:-0}"
 
 RFDET_CONFIG="demo/mmdetection_cfg/rfdetr_medium_coco-person.py"
 RFDET_CHECKPOINT="rf-detr-medium.pth"
@@ -55,14 +65,15 @@ run_benchmark() {
     local det_config="${6:-}"
     local det_checkpoint="${7:-}"
     local det_cat_id="${8:-}"
-    local mock_detector="${9:-}"
 
     local log_file="${LOG_DIR}/${name}-${full_variant}.log"
+    local pred_dir="benchmark/predictions/${TIMESTAMP}_${TEST_DATASET}_video/${name}-${full_variant}"
 
     local extra_args=()
-    if [[ "$mock_detector" == "1" ]]; then
-        extra_args+=(--mock-detector)
-    elif [[ -n "$det_config" ]]; then
+    if [[ "$PREFETCH_CHUNK_SIZE" -gt 0 ]]; then
+        extra_args+=(--prefetch-chunk-size "$PREFETCH_CHUNK_SIZE")
+    fi
+    if [[ -n "$det_config" ]]; then
         extra_args+=(
             --det-config "$det_config"
             --det-checkpoint "$det_checkpoint"
@@ -81,7 +92,6 @@ run_benchmark() {
     echo "  Checkpoint: ${checkpoint}"
     echo "  KP batch:   ${kp_batch_size}"
     [[ -n "$det_config" ]] && echo "  Detector:   ${det_config}"
-    [[ "$mock_detector" == "1" ]] && echo "  Detector:   MOCK (ground-truth boxes)"
     echo "  Log file:   ${log_file}"
     echo "============================================================"
 
@@ -96,11 +106,12 @@ run_benchmark() {
         --model-name "$name" \
         --model-variant "$full_variant" \
         --include-bad-frames \
+        --pred-dir "$pred_dir" \
         "${extra_args[@]}" \
         >"$log_file" 2>&1; then
         PASSED=$((PASSED + 1))
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] Finished: ${name} / ${full_variant}"
-        echo "  Predictions: benchmark/predictions/${TIMESTAMP}_${TEST_DATASET}_video/${name}-${full_variant}/"
+        echo "  Predictions: ${pred_dir}/"
     else
         FAILED+=("${name}/${full_variant}")
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] FAILED: ${name} / ${full_variant} (see ${log_file})"
@@ -137,8 +148,6 @@ while IFS=',' read -r config checkpoint name variant mode kp_batch_size \
 
     case "$mode" in
         topdown)
-            run_benchmark "$config" "$checkpoint" "$name" "${variant}-gt" \
-                "$kp_batch_size" "" "" "" "1"
             run_benchmark "$config" "$checkpoint" "$name" "${variant}-rfdetr" \
                 "$kp_batch_size" "$RFDET_CONFIG" "$RFDET_CHECKPOINT" 1
             run_benchmark "$config" "$checkpoint" "$name" "${variant}-rtmdet" \
