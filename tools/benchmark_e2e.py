@@ -338,6 +338,7 @@ def build_evaluator(
     dataset_meta: dict,
     test_dataset: Optional[str] = None,
     include_tracking_metrics: bool = False,
+    full_tracking_metrics: bool = False,
 ) -> Evaluator:
     """Build an mmengine Evaluator from the config's test_evaluator section.
 
@@ -364,6 +365,13 @@ def build_evaluator(
             no ``track_ids`` (e.g. no tracker in the post-processing
             pipeline), so it is safe to enable whenever post-processed
             (potentially tracked) predictions are being evaluated.
+        full_tracking_metrics: When ``True``, additionally appends
+            :class:`MOTA`, :class:`IDF1` and :class:`HOTA`.  Used for models
+            that assign track IDs during inference (``emits_track_ids``),
+            where the run would otherwise produce no association metrics at
+            all -- the post-processing path can still reach these via
+            ``tools/postprocess_predictions.py --metrics``.  Kept off by
+            default so existing runs' metric sets are unchanged.
     """
     _init_scope(pose_cfg)
     ev_cfg = pose_cfg.test_evaluator
@@ -388,9 +396,13 @@ def build_evaluator(
                 metrics.append(m)
 
     if include_tracking_metrics:
-        m = METRICS.build(dict(type='IDSwitch'))
-        m.dataset_meta = dataset_meta
-        metrics.append(m)
+        tracking_types = ['IDSwitch']
+        if full_tracking_metrics:
+            tracking_types += ['MOTA', 'IDF1', 'HOTA']
+        for m_type in tracking_types:
+            m = METRICS.build(dict(type=m_type))
+            m.dataset_meta = dataset_meta
+            metrics.append(m)
 
     return Evaluator(metrics)
 
@@ -1316,6 +1328,280 @@ def run_topdown(
     return pred_by_img_id, perf
 
 
+# ── Self-tracking pipeline ─────────────────────────────────────────────────
+
+def _detections_for_frame(
+    detector,
+    sample: UnifiedSample,
+    image: Optional[np.ndarray],
+    use_mock_detector: bool,
+    bbox_thr: float,
+    nms_thr: float,
+    det_cat_id: int,
+) -> Tuple[np.ndarray, np.ndarray, float]:
+    """Detections for a single frame, filtered exactly as in topdown mode.
+
+    Mirrors the per-frame body of :func:`_detector_producer` (real detector)
+    and :func:`_mock_detector_producer` (GT bboxes) so that a self-tracking
+    model sees the same boxes a plain topdown model would, but synchronously
+    and one frame at a time.
+
+    Returns ``(bboxes_xyxy, scores, det_time_s)``.  A frame whose image
+    failed to decode yields zero detections, matching the topdown path.
+    """
+    if image is None:
+        return (np.zeros((0, 4), dtype=np.float32),
+                np.zeros(0, dtype=np.float32), 0.0)
+
+    if use_mock_detector:
+        valid = [g for g in sample.gt_instances if is_valid_instance(g)]
+        if not valid:
+            return (np.zeros((0, 4), dtype=np.float32),
+                    np.zeros(0, dtype=np.float32), 0.0)
+        bboxes_xyxy = np.stack([g.bbox for g in valid], axis=0).astype(np.float32)
+        scores = np.ones(len(valid), dtype=np.float32)
+        return bboxes_xyxy, scores, 0.0
+
+    with torch.no_grad():
+        with _CudaTimer() as timer:
+            det_results = inference_det_model(detector, [image])
+
+    pred = det_results[0].pred_instances.cpu().numpy()
+    mask = np.logical_and(pred.labels == det_cat_id, pred.scores > bbox_thr)
+    bboxes_s = np.concatenate([pred.bboxes[mask], pred.scores[mask, None]],
+                              axis=1)
+    if bboxes_s.shape[0] > 0:
+        keep = nms(bboxes_s, nms_thr)
+        return bboxes_s[keep, :4], bboxes_s[keep, 4], timer.elapsed_s
+    return bboxes_s[:, :4], np.array([], dtype=np.float32), timer.elapsed_s
+
+
+def _ensure_track_ids(ds: PoseDataSample) -> PoseDataSample:
+    """Guarantee ``pred_instances.track_ids`` exists, defaulting to ``-1``.
+
+    A zero-detection frame produces an empty ``pred_instances`` that never
+    passed through the model, and a model may legitimately decline to assign
+    an id to a low-confidence instance.  Both are represented as ``-1`` so
+    downstream metrics and the saved bundle see a consistently shaped field
+    on every frame rather than the field being absent on some.
+    """
+    pred = getattr(ds, 'pred_instances', None)
+    if pred is None:
+        return ds
+    if 'track_ids' not in pred:
+        n = len(pred.get('keypoints', []))
+        pred.track_ids = np.full(n, -1, dtype=np.int32)
+    else:
+        pred.track_ids = np.asarray(pred.track_ids, dtype=np.int32).reshape(-1)
+    return ds
+
+
+def run_tracking(
+    model,
+    samples: List[UnifiedSample],
+    sample_stream: 'SampleImageStream',
+    kp_pipeline: Compose,
+    dataset_meta: dict,
+    device: str,
+    *,
+    det_model=None,
+    is_topdown: bool = False,
+    use_mock_detector: bool = False,
+    bbox_thr: float = 0.3,
+    nms_thr: float = 0.3,
+    det_cat_id: int = 0,
+    warmup_batches: int = 3,
+    log_interval: int = 100,
+    num_input_frames: int = 1,
+) -> Tuple[Dict[int, PoseDataSample], dict]:
+    """Run a model that assigns track IDs itself, strictly frame by frame.
+
+    Neither :func:`run_topdown` nor :func:`run_bottomup` can host such a
+    model.  ``run_topdown`` batches crops *across* frames in a
+    producer/consumer pair, so a tracker never sees one frame's detections
+    as a unit and never sees frames in order; ``run_bottomup`` batches N
+    frames into one ``test_step``, which desynchronises any recurrent state
+    the model carries between frames.  This path instead:
+
+    * consumes the stream one frame at a time, in dataset order;
+    * in topdown mode, runs the detector on that frame inline and hands the
+      model **all** of the frame's boxes in a single ``test_step`` call, so
+      the model's own association step sees the complete frame;
+    * calls ``model.reset_tracking()`` whenever :func:`_clip_seq_key`
+      changes, i.e. at every video boundary.
+
+    The model is expected to return one :class:`PoseDataSample` per input
+    element with ``pred_instances.track_ids`` already set (``np.int32``,
+    one entry per instance).  In topdown mode the per-box samples are merged
+    with :func:`_merge_pose_predictions_to_posedatasample`, whose
+    ``InstanceData.cat`` carries ``track_ids`` through unchanged.
+
+    Because the batch size is fixed at one frame, the reported FPS is a
+    sequential, unbatched figure and is **not** comparable with the batched
+    ``run_topdown`` / ``run_bottomup`` numbers for other models.
+
+    Args:
+        model: Pose estimator that emits its own track IDs.  Must expose
+            ``reset_tracking()``.
+        samples: Unified samples (one per image), used for ordering and to
+            assemble the per-image results afterwards.
+        sample_stream: Stream yielding each sample (with pixels) once.
+        kp_pipeline: Inference pipeline from the config, GT-only transforms
+            already stripped.
+        dataset_meta: Model dataset meta, merged into each pipeline input.
+        device: Target device string (bottomup inputs are moved explicitly,
+            as in :func:`run_bottomup`).
+        det_model: Detector, topdown mode with a real detector only.
+        is_topdown: Whether the model consumes person crops.
+        use_mock_detector: Feed GT bboxes instead of running a detector.
+        bbox_thr: Detector bbox confidence threshold.
+        nms_thr: NMS IoU threshold.
+        det_cat_id: Person class id in the detector.
+        warmup_batches: Leading frames excluded from timing.
+        log_interval: Frames between progress prints.
+        num_input_frames: Temporal clip window size (see
+            :func:`_with_clip_windows`).
+
+    Returns:
+        pred_by_img_id: Mapping ``img_id → PoseDataSample`` (prediction only).
+        perf: Performance-metric dict.
+    """
+    if not hasattr(model, 'reset_tracking'):
+        raise TypeError(
+            f'{type(model).__name__} declares emits_track_ids=True but does '
+            'not implement reset_tracking(); the driver needs it to clear '
+            'per-sequence tracker state at video boundaries.')
+
+    n_images = len(samples)
+    frame_latencies: List[float] = []
+    det_timings: List[float] = []
+    # Model-only GPU time per frame (the _CudaTimer also synchronises, which
+    # is what makes the surrounding wall-clock frame latency meaningful).
+    model_timings: List[float] = []
+    pred_by_img_id: Dict[int, PoseDataSample] = {}
+    det_predictions: Dict[int, Tuple[np.ndarray, np.ndarray]] = {}
+    current_seq = None
+    n_done = 0
+
+    for batch in _batched_samples(sample_stream, 1, num_input_frames):
+        frame_id, sample, image, clip = batch[0]
+        img_id = sample.img_id
+        h, w = sample.ori_shape
+
+        seq_key = _clip_seq_key(sample)
+        if seq_key != current_seq:
+            model.reset_tracking()
+            current_seq = seq_key
+
+        clip_imgs = (_fill_blank_clip(clip, sample.ori_shape)
+                     if clip is not None else None)
+        frame_img = image if image is not None else _blank_image((h, w))
+
+        t_frame_start = time.perf_counter()
+
+        if is_topdown:
+            bboxes_xyxy, scores, det_s = _detections_for_frame(
+                det_model, sample, image, use_mock_detector,
+                bbox_thr, nms_thr, det_cat_id)
+            det_predictions[frame_id] = (bboxes_xyxy, scores)
+
+            if len(bboxes_xyxy) == 0:
+                # Deliberately does not invoke the model.  Upstream
+                # AlphaPose skips its tracker entirely on a zero-detection
+                # frame (demo_inference.py `continue`s before track()), so
+                # the tracker's frame counter and track ages do not advance
+                # either; calling into the model here would diverge from the
+                # published behaviour.
+                pred_ds = _merge_pose_predictions_to_posedatasample(
+                    img_id, [], [], (h, w), img_path=sample.img_path)
+            else:
+                data_list = []
+                for bbox, score in zip(bboxes_xyxy, scores):
+                    di = dict(
+                        img=clip_imgs if clip_imgs is not None else frame_img)
+                    di['bbox'] = bbox[None]
+                    di['bbox_score'] = np.array([score], dtype=np.float32)
+                    di['img_path'] = sample.img_path
+                    di['img_id'] = img_id
+                    di['ori_shape'] = sample.ori_shape
+                    di.update(dataset_meta)
+                    data_list.append(kp_pipeline(di))
+                batch_in = pseudo_collate(data_list)
+
+                with torch.no_grad():
+                    with _CudaTimer() as timer:
+                        results = model.test_step(batch_in)
+                model_timings.append(timer.elapsed_s)
+
+                pred_ds = _merge_pose_predictions_to_posedatasample(
+                    img_id, list(results), [float(s) for s in scores],
+                    (h, w), img_path=sample.img_path)
+                del batch_in, results
+
+            if len(bboxes_xyxy) > 0:
+                pred_ds.set_metainfo(
+                    {'det_bboxes': bboxes_xyxy, 'det_scores': scores})
+            det_timings.append(det_s)
+        else:
+            di = {
+                'img': (clip_imgs if clip_imgs is not None else frame_img),
+                'img_path': sample.img_path,
+                'img_id': img_id,
+                'id': [g.id for g in sample.gt_instances],
+                'ori_shape': sample.ori_shape,
+            }
+            di.update(dataset_meta)
+            batch_in = pseudo_collate([kp_pipeline(di)])
+            batch_in['inputs'] = [t.to(device) for t in batch_in['inputs']]
+
+            with torch.no_grad():
+                with _CudaTimer() as timer:
+                    results = model.test_step(batch_in)
+            model_timings.append(timer.elapsed_s)
+
+            pred_ds = results[0]
+            pred_ds.set_metainfo({
+                'img_id': img_id,
+                'ori_shape': sample.ori_shape,
+                'img_path': sample.img_path,
+            })
+            del batch_in, results
+
+        if n_done >= warmup_batches:
+            frame_latencies.append(time.perf_counter() - t_frame_start)
+
+        pred_by_img_id[img_id] = _ensure_track_ids(pred_ds)
+        n_done += 1
+
+        if n_done % log_interval == 0 or n_done == n_images:
+            elapsed = sum(frame_latencies)
+            fps_so_far = len(frame_latencies) / elapsed if elapsed > 0 else 0.0
+            print(f'  [tracking] frame {n_done}/{n_images} '
+                  f'| running FPS: {fps_so_far:.1f}')
+
+    total_s = sum(frame_latencies)
+    perf = {
+        'e2e/fps': len(frame_latencies) / total_s if total_s > 0 else 0.0,
+        'e2e/latency_ms_per_frame': (
+            1000.0 * total_s / len(frame_latencies) if frame_latencies else 0.0
+        ),
+        'dataload/stall_s': sample_stream.stall_s,
+    }
+    timed_det = [t for t in det_timings if t > 0]
+    if timed_det:
+        perf['detector/fps'] = len(timed_det) / sum(timed_det)
+        perf['detector/latency_ms_per_frame'] = (
+            1000.0 * sum(timed_det) / len(timed_det))
+    if model_timings:
+        model_total = sum(model_timings)
+        perf['keypoint/fps'] = (
+            len(model_timings) / model_total if model_total > 0 else 0.0)
+        perf['keypoint/latency_ms_per_frame'] = (
+            1000.0 * model_total / len(model_timings))
+
+    return pred_by_img_id, perf
+
+
 # ── Output helpers ─────────────────────────────────────────────────────────
 
 def _print_results(quality: dict, perf: dict, mode: str) -> None:
@@ -1786,6 +2072,12 @@ def main():
     is_topdown = args.mock_detector or use_real_detector
     model_type = pose_cfg.model.get('type', '')
 
+    # Models that assign track IDs during inference (AlphaPose's re-ID
+    # tracker, OpenPifPaf's spatio-temporal association) declare this at the
+    # config top level, alongside num_input_frames.  It routes the run
+    # through run_tracking(); every other config is untouched.
+    emits_track_ids = bool(pose_cfg.get('emits_track_ids', False))
+
     if 'Bottomup' in model_type and is_topdown:
         raise ValueError(
             'The pose config uses a BottomupPoseEstimator but --det-config '
@@ -1805,6 +2097,15 @@ def main():
             '--postproc-name is required when both --post-config and '
             '--model-name are specified (used to name the post-processed '
             'output run folder).')
+    if emits_track_ids and getattr(args, 'post_config', None):
+        raise ValueError(
+            f'{args.pose_config} declares emits_track_ids=True, so the model '
+            f'assigns track IDs during inference. Adding a post-processing '
+            f'tracker via --post-config would overwrite them, and the run '
+            f'would report the post-processing tracker\'s association rather '
+            f'than the model\'s. Drop --post-config to benchmark the model\'s '
+            f'own tracking, or benchmark a non-tracking pose config with '
+            f'--post-config to compare against it.')
 
     # ── Unified data loading ───────────────────────────────────────────────
     print(f'\nLoading dataset: {args.test_dataset}')
@@ -1842,8 +2143,58 @@ def main():
         if not (isinstance(s, dict) and s.get('type') in _GT_ONLY_TYPES)
     ]
 
+    # ── Self-tracking mode ─────────────────────────────────────────────────
+    if emits_track_ids:
+        sub_mode = 'topdown' if is_topdown else 'bottomup'
+        print(f'\nMode: tracking ({sub_mode})  |  model assigns its own '
+              f'track IDs')
+        print('  Frames are processed strictly sequentially, one per '
+              'test_step; FPS is NOT comparable with batched runs.')
+
+        detector = None
+        if is_topdown and not args.mock_detector:
+            if not HAS_MMDET:
+                raise ImportError(
+                    'mmdet is required for topdown mode. '
+                    'Install it with: pip install mmdet')
+            print(f'  Detector : {args.det_config}')
+            detector = init_det_model(
+                args.det_config, args.det_checkpoint, device=args.device)
+        elif args.mock_detector:
+            print('  Detector : MOCK (GT bboxes from dataset)')
+        print(f'  Model    : {args.pose_config}\n')
+
+        model = init_model(
+            args.pose_config, args.pose_checkpoint, device=args.device)
+        dataset_meta = model.dataset_meta
+        evaluator = build_evaluator(
+            pose_cfg, dataset_meta, args.test_dataset,
+            include_tracking_metrics=True, full_tracking_metrics=True)
+
+        t_infer_start = time.perf_counter()
+        pred_by_img_id, perf = run_tracking(
+            model=model,
+            samples=samples,
+            sample_stream=sample_stream,
+            kp_pipeline=Compose(pipeline_cfg),
+            dataset_meta=dataset_meta,
+            device=args.device,
+            det_model=detector,
+            is_topdown=is_topdown,
+            use_mock_detector=args.mock_detector,
+            bbox_thr=args.bbox_thr,
+            nms_thr=args.nms_thr,
+            det_cat_id=args.det_cat_id,
+            warmup_batches=args.warmup_batches,
+            log_interval=args.log_interval,
+            num_input_frames=num_input_frames,
+        )
+        infer_wall_s = time.perf_counter() - t_infer_start
+
+        mode = f'tracking ({sub_mode})'
+
     # ── Topdown mode ───────────────────────────────────────────────────────
-    if is_topdown:
+    elif is_topdown:
         print(f'\nMode: topdown  |  strategy: {args.queue_strategy}')
 
         detector = None

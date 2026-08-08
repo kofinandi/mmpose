@@ -107,7 +107,16 @@ def _flatten_bbox(bbox_raw) -> Optional[List[float]]:
 
 
 def _make_pred_ds(frame: dict, dataset_meta: dict) -> PoseDataSample:
-    """Reconstruct a prediction-only :class:`PoseDataSample` from a frame record."""
+    """Reconstruct a prediction-only :class:`PoseDataSample` from a frame record.
+
+    Any ``track_id`` stored on the saved instances is restored onto
+    ``pred_instances.track_ids``.  For a bundle produced by a plain pose
+    model this field is absent and nothing is set, exactly as before; for a
+    bundle produced by a model that assigns track IDs during inference
+    (``emits_track_ids``) it is what makes the association re-scorable here
+    without re-running inference.  A post-processing tracker in the pipeline
+    overwrites it, which is the intended behaviour when one is configured.
+    """
     ds = PoseDataSample()
     ori_shape = tuple(frame.get('ori_shape', [0, 0]))
     img_path = frame.get('img_path', '')
@@ -147,6 +156,11 @@ def _make_pred_ds(frame: dict, dataset_meta: dict) -> PoseDataSample:
         pred.keypoint_scores = scores
         pred.bboxes = np.array(bboxes, dtype=np.float32)
         pred.bbox_scores = np.array(bbox_scores, dtype=np.float32)
+
+        if any('track_id' in inst for inst in insts):
+            pred.track_ids = np.array(
+                [int(inst.get('track_id', -1)) for inst in insts],
+                dtype=np.int32)
 
     ds.pred_instances = pred
     return ds
