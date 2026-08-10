@@ -16,3 +16,6 @@ configs/body_2d_keypoint/detrpose/coco/detrpose_hgnetv2_s_coco.py,data/models/de
 configs/body_2d_keypoint/detrpose/coco/detrpose_hgnetv2_m_coco.py,data/models/detrpose_hgnetv2_m.pth,DETRPose,m,1
 configs/body_2d_keypoint/detrpose/coco/detrpose_hgnetv2_l_coco.py,data/models/detrpose_hgnetv2_l.pth,DETRPose,l,1
 configs/body_2d_keypoint/detrpose/coco/detrpose_hgnetv2_x_coco.py,data/models/detrpose_hgnetv2_x.pth,DETRPose,x,1
+configs/body_2d_keypoint/grouppose/coco/grouppose_r50_coco.py,data/models/grouppose_r50.pth,GroupPose,r50,1
+configs/body_2d_keypoint/grouppose/coco/grouppose_swin-t_coco.py,data/models/grouppose_swinT.pth,GroupPose,swin-t,1
+configs/body_2d_keypoint/grouppose/coco/grouppose_swin-l_coco.py,data/models/grouppose_swinL.pth,GroupPose,swin-l,1
