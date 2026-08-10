@@ -85,19 +85,46 @@ _OPENPIFPAF_ROOT = os.path.abspath(
                  'openpifpaf'))
 
 
-def _ensure_openpifpaf_on_path(root: str) -> str:
-    """Make the vendored ``external/openpifpaf`` importable."""
+def _ensure_openpifpaf_importable(root: str) -> str:
+    """Make ``openpifpaf`` importable, preferring an already-installed copy.
+
+    An openpifpaf that is already importable is left alone: its compiled
+    decoder was built for the interpreter that installed it, whereas the
+    submodule's was built for whichever interpreter last ran
+    ``pip install -e external/openpifpaf`` there.  Those can differ, because
+    upstream's setup.py builds the extension with
+    ``no_python_abi_suffix=True`` (setup.py:56) -- the artifact is plain
+    ``src/openpifpaf/_cpp.so`` with no ``cpython-3X`` tag, so one checkout
+    holds exactly one build and a second env cannot add its own without
+    overwriting the first.  Prepending the submodule path unconditionally
+    would therefore shadow a correctly-built install with an ABI-mismatched
+    ``.so``.
+
+    Only when openpifpaf is not installed at all does the submodule tree go
+    on ``sys.path``, which is the editable-install case.
+
+    Returns the resolved root, or ``''`` when an installed copy is used.
+    """
+    try:
+        import openpifpaf  # noqa: F401
+        return ''
+    except ImportError:
+        pass
+
     root = os.path.abspath(root)
     src = os.path.join(root, 'src')
     if not os.path.isdir(src):
         raise FileNotFoundError(
-            f'OpenPifPaf sources not found at {src!r}. It is vendored as a '
-            f'git submodule; run '
+            f'openpifpaf is not installed and its sources are not at '
+            f'{src!r}. It is vendored as a git submodule; run '
             f'`git submodule update --init external/openpifpaf`, then build '
             f'its C++ decoder extension with '
             f'`pip install -e external/openpifpaf --no-build-isolation '
             f'--no-deps` (the CifCaf/Tcaf decoder *is* that extension, so '
-            f'the build is not optional).')
+            f'the build is not optional). To share one checkout across two '
+            f'environments, install it non-editably in the second '
+            f'(`pip install ./external/openpifpaf ...`) so each gets its own '
+            f'_cpp.so.')
     if src not in sys.path:
         sys.path.insert(0, src)
     return root
@@ -115,6 +142,8 @@ class OpenPifPafPoseEstimator(BaseModel):
             forwarded into this field; see
             ``mmpose.apis.inference.CUSTOM_POSE_WRAPPER_TYPES``.
         openpifpaf_root (str): Path to the ``external/openpifpaf`` checkout.
+            Only used when ``openpifpaf`` is not already installed; see
+            :func:`_ensure_openpifpaf_importable`.
         decoder (str, optional): Decoder request in upstream's CLI syntax,
             e.g. ``'trackingpose:0'`` (the paper's method),
             ``'posesimilarity:0'`` (the paper's own tracking baseline) or
@@ -150,7 +179,7 @@ class OpenPifPafPoseEstimator(BaseModel):
         super().__init__(
             data_preprocessor=data_preprocessor, init_cfg=init_cfg)
 
-        _ensure_openpifpaf_on_path(openpifpaf_root)
+        _ensure_openpifpaf_importable(openpifpaf_root)
 
         import openpifpaf
         import openpifpaf.plugin
