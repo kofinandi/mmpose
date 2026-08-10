@@ -4,6 +4,7 @@ from .bottomup import BottomupPoseEstimator
 from .detrpose_wrapper import DETRPoseEstimator
 from .grouppose_wrapper import GroupPosePoseEstimator
 from .openpifpaf_wrapper import OpenPifPafPoseEstimator
+from .querypose_wrapper import QueryPosePoseEstimator
 from .pct_wrapper import PCTPoseEstimator
 from .pavenet_wrapper import PAVENetPoseEstimator
 from .petr_wrapper import PETRPoseEstimator
@@ -22,5 +23,5 @@ __all__ = [
     'PoseidonPoseEstimator', 'TARViTPosePoseEstimator',
     'PAVENetPoseEstimator', 'AlphaPosePoseEstimator',
     'OpenPifPafPoseEstimator', 'DETRPoseEstimator',
-    'GroupPosePoseEstimator'
+    'GroupPosePoseEstimator', 'QueryPosePoseEstimator'
 ]

@@ -19,3 +19,5 @@ configs/body_2d_keypoint/detrpose/coco/detrpose_hgnetv2_x_coco.py,data/models/de
 configs/body_2d_keypoint/grouppose/coco/grouppose_r50_coco.py,data/models/grouppose_r50.pth,GroupPose,r50,1
 configs/body_2d_keypoint/grouppose/coco/grouppose_swin-t_coco.py,data/models/grouppose_swinT.pth,GroupPose,swin-t,1
 configs/body_2d_keypoint/grouppose/coco/grouppose_swin-l_coco.py,data/models/grouppose_swinL.pth,GroupPose,swin-l,1
+configs/body_2d_keypoint/querypose/coco/querypose_hrnetw32_light_100pro_3x_coco.py,data/models/querypose_hrnet32_light.pth,QueryPose-light,hrnetw32,1
+configs/body_2d_keypoint/querypose/coco/querypose_hrnetw48_light_100pro_3x_coco.py,data/models/querypose_hrnet48_light.pth,QueryPose-light,hrnetw48,1

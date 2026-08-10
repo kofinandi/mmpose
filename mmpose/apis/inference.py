@@ -30,6 +30,7 @@ CUSTOM_POSE_WRAPPER_TYPES = frozenset({
     # inside DETRPoseEstimator rather than via MMEngine load_checkpoint.
     'DETRPoseEstimator',
     'GroupPosePoseEstimator',
+    'QueryPosePoseEstimator',
 })
 _POSE_WRAPPER_CHECKPOINT_FIELDS = {
     'UltralyticsYOLOPoseEstimator': 'weights',
@@ -37,6 +38,7 @@ _POSE_WRAPPER_CHECKPOINT_FIELDS = {
     'OpenPifPafPoseEstimator': 'checkpoint',
     'DETRPoseEstimator': 'checkpoint',
     'GroupPosePoseEstimator': 'checkpoint',
+    'QueryPosePoseEstimator': 'checkpoint',
 }
 
 

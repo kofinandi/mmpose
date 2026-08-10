@@ -38,3 +38,6 @@
 [submodule "external/GroupPose"]
 	path = external/GroupPose
 	url = https://github.com/Michel-liu/GroupPose.git
+[submodule "external/QueryPose"]
+	path = external/QueryPose
+	url = https://github.com/buptxyb666/QueryPose.git
