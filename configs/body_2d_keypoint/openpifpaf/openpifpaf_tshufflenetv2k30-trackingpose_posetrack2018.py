@@ -61,6 +61,13 @@ emits_track_ids = True
 model = dict(
     type='OpenPifPafPoseEstimator',
     openpifpaf_root='external/openpifpaf',
+    # Default checkpoint; tools/benchmark_e2e.py takes it as a required
+    # positional and overrides this, but pinning it here is what makes
+    # this config self-contained (init_model(cfg) needs no checkpoint
+    # argument) and what distinguishes the backbone variants -- the
+    # architecture lives in the pickled .pkl, not in this file.
+    checkpoint='data/models/openpifpaf/tshufflenetv2k30-210628-075118-'
+               'posetrack2018-cocokpst-slurm668247-o25-3d734bb8.pkl',
     # Upstream CLI syntax; this is `--decoder=trackingpose:0`.
     decoder='trackingpose:0',
     long_edge=801,

@@ -45,6 +45,13 @@ param_scheduler = None
 model = dict(
     type='OpenPifPafPoseEstimator',
     openpifpaf_root='external/openpifpaf',
+    # Default checkpoint; tools/benchmark_e2e.py takes it as a required
+    # positional and overrides this, but pinning it here is what makes
+    # this config self-contained (init_model(cfg) needs no checkpoint
+    # argument) and what distinguishes the backbone variants -- the
+    # architecture lives in the pickled .pkl, not in this file.
+    checkpoint='data/models/openpifpaf/shufflenetv2k30-210821-003923-cocokp-'
+               'slurm726072-edge513-o10s-5fe1c400.pkl',
     decoder='cifcaf:0',
     long_edge=801,
     map_to_coco=False,
