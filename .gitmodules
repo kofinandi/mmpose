@@ -31,3 +31,7 @@
 [submodule "external/AlphaPose"]
 	path = external/AlphaPose
 	url = https://github.com/MVIG-SJTU/AlphaPose.git
+[submodule "external/DETRPose"]
+	path = external/DETRPose
+	url = https://github.com/SebastianJanampa/DETRPose.git
+	branch = inference_only

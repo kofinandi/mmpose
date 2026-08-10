@@ -26,11 +26,15 @@ CUSTOM_POSE_WRAPPER_TYPES = frozenset({
     # be loaded by openpifpaf's own network.Factory rather than MMEngine's
     # load_checkpoint.
     'OpenPifPafPoseEstimator',
+    # DETRPose release checkpoints are trainer dicts (`model` / `ema`), loaded
+    # inside DETRPoseEstimator rather than via MMEngine load_checkpoint.
+    'DETRPoseEstimator',
 })
 _POSE_WRAPPER_CHECKPOINT_FIELDS = {
     'UltralyticsYOLOPoseEstimator': 'weights',
     'RFDETRPoseEstimator': 'pretrain_weights',
     'OpenPifPafPoseEstimator': 'checkpoint',
+    'DETRPoseEstimator': 'checkpoint',
 }
 
 
