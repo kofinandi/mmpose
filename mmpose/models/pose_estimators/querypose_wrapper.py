@@ -8,8 +8,21 @@ ResNet50 weights are **not** reproducible from public artifacts — do not
 report those under this wrapper's name.
 
 This wrapper loads the upstream QueryPose + vendored Detectron2 unmodified
-(after ``python setup.py build develop`` in ``external/QueryPose``) and
+(after ``python setup.py build_ext --inplace`` in ``external/QueryPose``) and
 translates ``Instances`` to MMPose ``PoseDataSample``.
+
+.. warning::
+   Build the extension **in place**; do not ``develop``/``pip install -e``
+   this submodule.  A develop install appends ``external/QueryPose`` to
+   ``easy-install.pth``, which puts its top-level ``detectron2/`` package on
+   ``sys.path`` for *every* process in the environment.  ``mmdet`` imports
+   ``mmdet.models.detectors.d2_wrapper`` unconditionally, so that shadowing
+   makes Detectron2 0.3 load at mmdet-import time — before
+   :func:`_ensure_querypose_importable` can apply the ``Image.LINEAR`` shim —
+   and every topdown benchmark run dies with ``AttributeError: module
+   'PIL.Image' has no attribute 'LINEAR'``.  In-place build keeps ``_C``
+   importable via this module's own lazy ``sys.path`` insertion, which is all
+   the wrapper needs.
 
 Native boxes and scores are used (not derived).
 
@@ -57,9 +70,13 @@ def _ensure_querypose_importable(querypose_root: str) -> None:
         raise ImportError(
             'QueryPose requires the vendored Detectron2 CUDA extension. '
             'Build it with:\n'
-            '  cd external/QueryPose && python setup.py build develop\n'
-            'Use an isolated env — this package name clashes with pip '
-            f'detectron2. Original error: {exc}') from exc
+            '  cd external/QueryPose && python setup.py build_ext --inplace\n'
+            'Do NOT use `build develop` / `pip install -e`: that registers '
+            'external/QueryPose in easy-install.pth, whose top-level '
+            'detectron2/ package then shadows any other detectron2 for every '
+            'process in the env and breaks mmdet detector init. '
+            'This package name also clashes with pip detectron2. '
+            f'Original error: {exc}') from exc
 
 
 @MODELS.register_module()
@@ -163,21 +180,40 @@ class QueryPosePoseEstimator(BaseModel):
         raise ValueError(f'Unsupported mode "{mode}"')
 
     def _inference_forward(self, batched_inputs: list):
-        """NN forward (FPS metric target)."""
-        return self.querypose_model(batched_inputs, do_postprocess=True)
+        """NN forward, one image at a time (FPS metric target).
+
+        Detectron2 ``ImageList`` pads a multi-image batch to a shared HxW
+        before the backbone.  That padding changes features vs batch-size-1
+        and was collapsing full-set COCO AP (~0.03).  Process sequentially
+        after cropping away PoseDataPreprocessor pad.
+        """
+        results = []
+        for inp in batched_inputs:
+            results.extend(
+                self.querypose_model([inp], do_postprocess=True))
+        return results
 
     def predict(self, inputs: torch.Tensor,
                 data_samples: SampleList) -> SampleList:
         """Run QueryPose-light and pack native boxes/keypoints."""
+        # Crop PoseDataPreprocessor batch-pad back to ``img_shape``, then
+        # run one image at a time (see ``_inference_forward``).
         batched_inputs = []
         for i, ds in enumerate(data_samples):
+            img_shape = ds.metainfo.get('img_shape', None)
+            if img_shape is not None:
+                ih, iw = int(img_shape[0]), int(img_shape[1])
+                image = inputs[i, :, :ih, :iw].contiguous()
+            else:
+                image = inputs[i].contiguous()
+
             ori = ds.metainfo.get('ori_shape', None)
             if ori is None:
-                h, w = int(inputs.shape[-2]), int(inputs.shape[-1])
+                h, w = int(image.shape[-2]), int(image.shape[-1])
             else:
                 h, w = int(ori[0]), int(ori[1])
             batched_inputs.append({
-                'image': inputs[i].contiguous(),
+                'image': image,
                 'height': h,
                 'width': w,
             })

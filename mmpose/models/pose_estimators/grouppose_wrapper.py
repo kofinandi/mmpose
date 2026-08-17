@@ -219,35 +219,52 @@ class GroupPosePoseEstimator(BaseModel):
                 'GroupPosePoseEstimator is for inference only.')
         raise ValueError(f'Unsupported mode "{mode}"')
 
-    def _inference_forward(self, samples, orig_sizes: torch.Tensor):
-        """NN + PostProcess (FPS metric target)."""
-        outputs = self.grouppose_model(samples)
-        return self.postprocessor(outputs, orig_sizes)
+    def _inference_forward(self, tensor_list: list, orig_list: list):
+        """NN + PostProcess, one image at a time (FPS metric target).
+
+        GroupPose's backbone runs on the NestedTensor *padded* canvas (masks
+        only affect the encoder).  Mixing different ``img_shape``s in one
+        NestedTensor therefore changes ResNet features vs batch-size-1 and
+        is not faithful to the authors' ``batch_size=1`` eval.  We always
+        forward sequentially after cropping away PoseDataPreprocessor pad.
+        """
+        from util.misc import nested_tensor_from_tensor_list
+
+        results = []
+        for tensor, orig_hw in zip(tensor_list, orig_list):
+            samples = nested_tensor_from_tensor_list([tensor])
+            orig_sizes = torch.tensor(
+                [orig_hw], dtype=torch.float32, device=tensor.device)
+            outputs = self.grouppose_model(samples)
+            results.extend(self.postprocessor(outputs, orig_sizes))
+        return results
 
     def predict(self, inputs: torch.Tensor,
                 data_samples: SampleList) -> SampleList:
-        from util.misc import nested_tensor_from_tensor_list
-
-        device = inputs.device
-        # Split batch into a list so NestedTensor masks match each image.
-        # benchmark_e2e uses batch_size=1, but keep the general path.
-        tensor_list = [inputs[i] for i in range(inputs.shape[0])]
-        samples = nested_tensor_from_tensor_list(tensor_list).to(device)
-
+        # PoseDataPreprocessor pads a multi-image batch to a shared HxW.
+        # Crop back to ``img_shape`` then run one image at a time (see
+        # ``_inference_forward``).
+        tensor_list = []
         orig_list = []
-        for ds in data_samples:
+        for i, ds in enumerate(data_samples):
+            img_shape = ds.metainfo.get('img_shape', None)
+            if img_shape is not None:
+                ih, iw = int(img_shape[0]), int(img_shape[1])
+                tensor_list.append(inputs[i, :, :ih, :iw].contiguous())
+            else:
+                tensor_list.append(inputs[i].contiguous())
+
             ori = ds.metainfo.get('ori_shape', None)
             if ori is None:
-                h, w = int(inputs.shape[-2]), int(inputs.shape[-1])
+                h, w = int(tensor_list[-1].shape[-2]), int(
+                    tensor_list[-1].shape[-1])
             else:
                 h, w = int(ori[0]), int(ori[1])
             # PostProcess expects (H, W).
             orig_list.append([h, w])
-        orig_sizes = torch.tensor(
-            orig_list, dtype=torch.float32, device=device)
 
         with torch.no_grad():
-            results = self._inference_forward(samples, orig_sizes)
+            results = self._inference_forward(tensor_list, orig_list)
 
         k = self.num_keypoints
         for i, res in enumerate(results):

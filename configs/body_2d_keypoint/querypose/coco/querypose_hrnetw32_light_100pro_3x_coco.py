@@ -8,7 +8,10 @@ _base_ = '../../../_base_/default_runtime.py'
 # (MODEL.QueryPose.LIGHT_VERSION=True). Expected README AP on COCO val:
 # ~69.8. Do NOT report paper Table AP 72.4 (full DynamicConv) under this
 # config — those weights were never published.
-# Requires: cd external/QueryPose && python setup.py build develop
+# Requires: cd external/QueryPose && python setup.py build_ext --inplace
+# (build in place — a `develop`/`-e` install puts external/QueryPose on
+#  sys.path globally, shadowing detectron2 for every process and breaking
+#  mmdet detector init in all topdown runs)
 # Checkpoint (Google Drive): data/models/querypose_hrnet32_light.pth
 
 train_cfg = None

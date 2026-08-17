@@ -17,8 +17,9 @@ configs/body_2d_keypoint/detrpose/coco/detrpose_hgnetv2_s_coco.py,data/models/de
 configs/body_2d_keypoint/detrpose/coco/detrpose_hgnetv2_m_coco.py,data/models/detrpose_hgnetv2_m.pth,DETRPose,m
 configs/body_2d_keypoint/detrpose/coco/detrpose_hgnetv2_l_coco.py,data/models/detrpose_hgnetv2_l.pth,DETRPose,l
 configs/body_2d_keypoint/detrpose/coco/detrpose_hgnetv2_x_coco.py,data/models/detrpose_hgnetv2_x.pth,DETRPose,x
-configs/body_2d_keypoint/grouppose/coco/grouppose_r50_coco.py,data/models/grouppose_r50.pth,GroupPose,r50,4
-configs/body_2d_keypoint/grouppose/coco/grouppose_swin-t_coco.py,data/models/grouppose_swinT.pth,GroupPose,swin-t,4
-configs/body_2d_keypoint/grouppose/coco/grouppose_swin-l_coco.py,data/models/grouppose_swinL.pth,GroupPose,swin-l,4
-configs/body_2d_keypoint/querypose/coco/querypose_hrnetw32_light_100pro_3x_coco.py,data/models/querypose_hrnet32_light.pth,QueryPose-light,hrnetw32,4
-configs/body_2d_keypoint/querypose/coco/querypose_hrnetw48_light_100pro_3x_coco.py,data/models/querypose_hrnet48_light.pth,QueryPose-light,hrnetw48,4
+configs/body_2d_keypoint/grouppose/coco/grouppose_r50_coco.py,data/models/grouppose_r50.pth,GroupPose,r50,16
+configs/body_2d_keypoint/grouppose/coco/grouppose_swin-t_coco.py,data/models/grouppose_swinT.pth,GroupPose,swin-t,16
+configs/body_2d_keypoint/grouppose/coco/grouppose_swin-l_coco.py,data/models/grouppose_swinL.pth,GroupPose,swin-l,16
+configs/body_2d_keypoint/querypose/coco/querypose_hrnetw32_light_100pro_3x_coco.py,data/models/querypose_hrnet32_light.pth,QueryPose-light,hrnetw32,16
+configs/body_2d_keypoint/querypose/coco/querypose_hrnetw48_light_100pro_3x_coco.py,data/models/querypose_hrnet48_light.pth,QueryPose-light,hrnetw48,16
+configs/body_2d_keypoint/edpose/coco/edpose_res50_8xb2-50e_coco-800x1333.py,https://download.openmmlab.com/mmpose/v1/body_2d_keypoint/edpose/coco/edpose_res50_coco_3rdparty.pth,ED-Pose,r50,16
