@@ -1,0 +1,18 @@
+# Optional BoxMOT extra for BoxMOTTracker.
+#
+# The published package declares numpy>=2.2.0, which would replace the
+# numpy 1.26.x pin that mmcv in this environment needs.  BoxMOT 22.0.0
+# does not use numpy-2-only APIs, so install the tracker deps below and
+# then the package itself without its metadata:
+#
+#   pip install -r requirements/boxmot.txt
+#   pip install --no-deps boxmot==22.0.0
+#
+# Do not run a plain `pip install boxmot`: that upgrades numpy and
+# breaks mmcv.  BoxMOT is AGPL-3.0; see LICENSES.md.
+
+filterpy>=1.4.5,<2.0.0
+gdown>=5.1.0,<6.0.0
+lapx>=0.5.5,<1.0.0
+filelock
+# boxmot==22.0.0  # install separately: pip install --no-deps boxmot==22.0.0

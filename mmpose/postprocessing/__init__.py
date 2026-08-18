@@ -18,7 +18,7 @@ Example usage::
 """
 
 from .base import BaseFilter, sequence_key_from_path
-from .filters import (DetectAndTrackLinker, GPKalmanSmoother,
+from .filters import (BoxMOTTracker, DetectAndTrackLinker, GPKalmanSmoother,
                        LightTrackTracker, OKSNMS, OKSTracker,
                        OneEuroSmoother, PGPTTracker, PredictiveTracker,
                        SmoothNetSmoother)
@@ -46,6 +46,7 @@ __all__ = [
     'DetectAndTrackLinker',
     'LightTrackTracker',
     'PGPTTracker',
+    'BoxMOTTracker',
     'PostProcessingPipeline',
     'build_post_processor',
     'BasePredictor',

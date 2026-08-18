@@ -1,4 +1,5 @@
 # Copyright (c) OpenMMLab. All rights reserved.
+from .boxmot_tracker import BoxMOTTracker
 from .detect_and_track_linker import DetectAndTrackLinker
 from .gp_kalman_smoother import GPKalmanSmoother
 from .lighttrack_tracker import LightTrackTracker
@@ -10,6 +11,7 @@ from .predictive_tracker import PredictiveTracker
 from .smoothnet_smoother import SmoothNetSmoother
 
 __all__ = [
+    'BoxMOTTracker',
     'GPKalmanSmoother', 'OKSNMS', 'OKSTracker', 'OneEuroSmoother',
     'SmoothNetSmoother', 'PredictiveTracker', 'DetectAndTrackLinker', 'LightTrackTracker',
     'PGPTTracker'
