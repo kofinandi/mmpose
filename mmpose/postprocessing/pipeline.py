@@ -32,8 +32,14 @@ class PostProcessingPipeline:
     Online-prefix time is accumulated per frame; offline-suffix time is
     recorded as a single :meth:`evaluate` call.
 
+    **Identity (empty filters)** - a pipeline with no filters is online and
+    :meth:`process` returns each frame unchanged.  This is the intended way
+    to re-run evaluation on a saved prediction bundle (different metrics or
+    settings) without transforming the predictions.
+
     Args:
-        filters: Ordered list of :class:`BaseFilter` instances.
+        filters: Ordered list of :class:`BaseFilter` instances.  An empty
+            list is a valid identity pipeline.
         needs_images: Declare that this pipeline consumes frame images.
             Must be set to ``True`` in the pipeline config whenever any
             filter has ``requires_images=True`` (validated here, at build
@@ -52,7 +58,9 @@ class PostProcessingPipeline:
         needs_images: bool = False,
     ) -> None:
         self.filters = filters
-        self.is_online: bool = all(f.online for f in filters)
+        # Vacuous all([]) is True, but spell out the identity case so an
+        # empty filter list is never treated as offline by accident.
+        self.is_online: bool = (not filters) or all(f.online for f in filters)
         self.needs_images: bool = bool(needs_images)
 
         # Split at the first offline filter: online prefix runs in
@@ -304,6 +312,7 @@ def build_post_processor(
       attribute.
 
     Each filter in ``filters`` is built from :data:`POST_PROCESS_FILTERS`.
+    ``filters`` may be omitted or set to ``[]`` for an identity pipeline.
 
     Example config file::
 
