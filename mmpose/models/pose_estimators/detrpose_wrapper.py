@@ -15,6 +15,14 @@ MMPose ``PoseDataSample`` for ``tools/benchmark_e2e.py``.
   mirror that.
 - Official COCO eval keeps all top-``num_select`` queries (no score threshold).
   ``score_thr`` defaults to ``0.0`` for the same behaviour.
+- PoseTrack21 checkpoints in this repo are trained on the **15-keypoint**
+  layout (PoseTrack-17 with never-annotated ears dropped).  Set
+  ``num_keypoints=15`` and ``map_to_coco=True`` so
+  ``tools/benchmark_e2e.py`` can score against its unified COCO-17 GT.
+  ``left_eye`` / ``right_eye`` / ``left_ear`` / ``right_ear`` have no native
+  counterpart and stay at zero confidence; ``head_bottom`` / ``head_top``
+  have no COCO counterpart and are dropped.  This is the same mapping as
+  :class:`~mmpose.models.pose_estimators.pavenet_wrapper.PAVENetPoseEstimator`.
 
 Usage::
 
@@ -35,6 +43,7 @@ Usage::
 from __future__ import annotations
 
 import os
+import pickle
 import sys
 from copy import deepcopy
 from typing import Optional, Tuple, Union
@@ -52,6 +61,26 @@ _DETRpose_ROOT = os.path.abspath(
     os.path.join(os.path.dirname(__file__), '..', '..', '..', 'external',
                  'DETRPose'))
 
+# PoseTrack-17 with left_ear/right_ear (indices 3, 4) removed.  Matches
+# DETRPose's PT21_KEYPOINT_NAMES and PAVE-Net's native 15-joint layout.
+# Maps native index -> COCO-17 index; head_bottom/head_top have no COCO
+# counterpart and are dropped (left at zero score).
+_PT21_15_TO_COCO = [
+    (0, 0),    # nose -> nose
+    (3, 5),    # left_shoulder
+    (4, 6),    # right_shoulder
+    (5, 7),    # left_elbow
+    (6, 8),    # right_elbow
+    (7, 9),    # left_wrist
+    (8, 10),   # right_wrist
+    (9, 11),   # left_hip
+    (10, 12),  # right_hip
+    (11, 13),  # left_knee
+    (12, 14),  # right_knee
+    (13, 15),  # left_ankle
+    (14, 16),  # right_ankle
+]
+
 
 def _bboxes_from_keypoints(keypoints: np.ndarray) -> np.ndarray:
     """Axis-aligned xyxy from keypoint min/max (derived, not upstream)."""
@@ -63,6 +92,57 @@ def _bboxes_from_keypoints(keypoints: np.ndarray) -> np.ndarray:
     return np.concatenate([xy_min, xy_max], axis=1).astype(np.float32)
 
 
+class _UnpicklingStub:
+    """Stand-in for training-repo objects (``src.*``) not present at eval."""
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def __setstate__(self, state):
+        if isinstance(state, dict):
+            self.__dict__.update(state)
+
+
+class _SrcRemapUnpickler(pickle.Unpickler):
+    """Unpickler that stubs ``src.*`` so training checkpoints can load.
+
+    Local DETRPose training dumps ``args`` / optimizer objects from the
+    ``src`` package into ``.pth`` files.  The inference_only checkout has
+    no ``src`` module, so a vanilla ``torch.load`` raises
+    ``ModuleNotFoundError: src``.  Weight tensors still unpickle; only the
+    training-side objects are replaced with stubs.
+    """
+
+    def find_class(self, module, name):
+        if module == 'src' or module.startswith('src.'):
+            return _UnpicklingStub
+        return super().find_class(module, name)
+
+
+class _src_remap_pickle:
+    Unpickler = _SrcRemapUnpickler
+    load = pickle.load
+
+
+def _torch_load_ckpt(checkpoint: str) -> dict:
+    """``torch.load`` a DETRPose ``.pth``, stubbing training-repo pickles."""
+    try:
+        ckpt = torch.load(
+            checkpoint, map_location='cpu', weights_only=False)
+    except ModuleNotFoundError as e:
+        if 'src' not in str(e):
+            raise
+        ckpt = torch.load(
+            checkpoint,
+            map_location='cpu',
+            weights_only=False,
+            pickle_module=_src_remap_pickle)
+    if not isinstance(ckpt, dict):
+        raise RuntimeError(
+            f'Unexpected DETRPose checkpoint type {type(ckpt)} in {checkpoint}')
+    return ckpt
+
+
 def _load_detrpose_state_dict(checkpoint: str) -> dict:
     """Load a DETRPose ``.pth`` / HF-style dict into a flat state_dict."""
     if not os.path.isfile(checkpoint):
@@ -72,11 +152,8 @@ def _load_detrpose_state_dict(checkpoint: str) -> dict:
             'https://github.com/SebastianJanampa/DETRPose/releases '
             'or Hugging Face SebasJanampa/DETRPose_* and place under '
             'data/models/.')
-    ckpt = torch.load(checkpoint, map_location='cpu', weights_only=False)
-    if not isinstance(ckpt, dict):
-        raise RuntimeError(
-            f'Unexpected DETRPose checkpoint type {type(ckpt)} in {checkpoint}')
-    if 'ema' in ckpt:
+    ckpt = _torch_load_ckpt(checkpoint)
+    if 'ema' in ckpt and ckpt['ema'] is not None:
         state = ckpt['ema']
         if isinstance(state, dict) and 'module' in state:
             state = state['module']
@@ -115,6 +192,14 @@ class DETRPoseEstimator(BaseModel):
         img_size (int | tuple): Square (or HxW) inference size; default 640.
         score_thr (float): Filter instance scores after PostProcess.  Use
             ``0.0`` to keep all top-k queries (official COCO eval).
+        num_keypoints (int | None): Override the loaded config's
+            ``public.num_keypoints`` before instantiate.  Needed for
+            PoseTrack21 (15) because the inference_only package only ships
+            COCO-17 and CrowdPose-14 configs.  ``None`` keeps the config
+            value.
+        map_to_coco (bool): Reproject PoseTrack21's native 15-keypoint
+            output onto COCO-17 (see module docstring).  Defaults to
+            ``False`` so COCO / CrowdPose configs are unchanged.
         device (str): Unused at build time; weights stay CPU until
             ``.to(device)`` from ``init_model``.  Accepted for
             ``CUSTOM_POSE_WRAPPER_TYPES`` compatibility.
@@ -130,6 +215,8 @@ class DETRPoseEstimator(BaseModel):
         detrpose_root: str = _DETRpose_ROOT,
         img_size: Union[int, Tuple[int, int]] = 640,
         score_thr: float = 0.0,
+        num_keypoints: Optional[int] = None,
+        map_to_coco: bool = False,
         device: str = 'cuda:0',
         data_preprocessor: Optional[dict] = None,
         init_cfg=None,
@@ -158,6 +245,12 @@ class DETRPoseEstimator(BaseModel):
 
         config_path = _resolve_config_path(model_name)
         cfg = LazyConfig.load(config_path)
+        if num_keypoints is not None:
+            # CrowdPose configs do the same assignment in-file
+            # (``public.num_keypoints = 14``).  PoseTrack21 has no
+            # inference_only config, so we patch the COCO skeleton here
+            # before interpolations are resolved.
+            cfg.public.num_keypoints = int(num_keypoints)
 
         def _replace_type_by_name(x):
             if '_target_' in x and callable(x._target_):
@@ -173,6 +266,12 @@ class DETRPoseEstimator(BaseModel):
             'postprocessor':
             OmegaConf.to_container(cfg_copy.postprocessor, resolve=True),
         }
+        if num_keypoints is not None:
+            # Interpolations may already have been baked to 17 at load;
+            # force the pose head / postprocessor to the requested width.
+            n_kpt = int(num_keypoints)
+            hf_config['model']['transformer']['num_keypoints'] = n_kpt
+            hf_config['postprocessor']['num_keypoints'] = n_kpt
 
         hf_model = HFModel(hf_config)
         if checkpoint is None:
@@ -200,6 +299,14 @@ class DETRPoseEstimator(BaseModel):
                 self.detrpose_model.model.transformer.num_keypoints)
         except AttributeError:
             self.num_keypoints = 17
+
+        self.map_to_coco = bool(map_to_coco)
+        if self.map_to_coco and self.num_keypoints != 15:
+            raise ValueError(
+                'DETRPoseEstimator map_to_coco=True is the PoseTrack21 '
+                '15-keypoint (ears dropped) -> COCO-17 remap. This model '
+                f'reports num_keypoints={self.num_keypoints}. For COCO-17 '
+                'or CrowdPose-14 checkpoints leave map_to_coco=False.')
 
     def forward(self, inputs, data_samples=None, mode='tensor'):
         if mode == 'predict':
@@ -257,18 +364,26 @@ class DETRPoseEstimator(BaseModel):
             keypoints = keypoints[keep]
 
             n = int(scores.shape[0])
-            k = self.num_keypoints
+            k = 17 if self.map_to_coco else self.num_keypoints
             if n == 0:
                 kpts = np.zeros((0, k, 2), dtype=np.float32)
                 kpt_scores = np.zeros((0, k), dtype=np.float32)
                 bboxes = np.zeros((0, 4), dtype=np.float32)
                 bbox_scores = np.zeros((0, ), dtype=np.float32)
             else:
-                kpts = keypoints[:, :, :2].astype(np.float32)
+                native_kpts = keypoints[:, :, :2].astype(np.float32)
                 # Upstream hard-codes visibility to 1 in non-deploy eval.
-                kpt_scores = np.ones((n, k), dtype=np.float32)
-                bboxes = _bboxes_from_keypoints(kpts)
+                native_scores = np.ones(
+                    (n, self.num_keypoints), dtype=np.float32)
+                # Boxes from native joints (head_bottom/head_top included)
+                # before the COCO remap zeros eyes/ears.
+                bboxes = _bboxes_from_keypoints(native_kpts)
                 bbox_scores = scores.astype(np.float32)
+                if self.map_to_coco:
+                    kpts, kpt_scores = self._to_coco(native_kpts,
+                                                     native_scores)
+                else:
+                    kpts, kpt_scores = native_kpts, native_scores
 
             pred = InstanceData()
             pred.keypoints = kpts
@@ -279,3 +394,24 @@ class DETRPoseEstimator(BaseModel):
             data_samples[i].pred_instances = pred
 
         return data_samples
+
+    def _to_coco(self, keypoints: np.ndarray, scores: np.ndarray):
+        """Reproject PoseTrack21's native 15-keypoint layout onto COCO-17.
+
+        Args:
+            keypoints (np.ndarray): Native keypoints, shape (N, 15, 2).
+            scores (np.ndarray): Native keypoint scores, shape (N, 15).
+
+        Returns:
+            tuple[np.ndarray, np.ndarray]: COCO-17 ``(keypoints, scores)``,
+            shapes ``(N, 17, 2)`` and ``(N, 17)``. ``left_eye`` /
+            ``right_eye`` / ``left_ear`` / ``right_ear`` have zero score
+            (no counterpart in the 15-joint PoseTrack21 layout).
+        """
+        n = keypoints.shape[0]
+        coco_keypoints = np.zeros((n, 17, 2), dtype=np.float32)
+        coco_scores = np.zeros((n, 17), dtype=np.float32)
+        for src_idx, dst_idx in _PT21_15_TO_COCO:
+            coco_keypoints[:, dst_idx] = keypoints[:, src_idx]
+            coco_scores[:, dst_idx] = scores[:, src_idx]
+        return coco_keypoints, coco_scores
