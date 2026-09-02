@@ -1,0 +1,7 @@
+Config,Checkpoint,Name,Variant,Mode
+configs/body_2d_keypoint/detrpose/coco/detrpose_hgnetv2_m_coco.py,data/models/detrpose_hgnetv2_m.pth,DETRPose,m,bottomup
+configs/body_2d_keypoint/detrpose/coco/detrpose_hgnetv2_l_coco.py,data/models/detrpose_hgnetv2_l.pth,DETRPose,l,bottomup
+configs/body_2d_keypoint/tarvitpose/tarvitpose_vith-t5_posetrack17-288x384.py,data/models/tarvitpose/tarvitpose_h_17.pt,TAR-ViTPose,vith-posetrack17,topdown
+configs/body_2d_keypoint/topdown_regression/coco/td-reg_pct-huge_coco-256x256.py,external/PCT/weights/pct/swin_huge.pth,PCT,huge,topdown
+configs/body_2d_keypoint/topdown_regression/coco/td-reg_pct-base_coco-256x256.py,external/PCT/weights/pct/swin_base.pth,PCT,base,topdown
+configs/body_2d_keypoint/topdown_heatmap/coco/td-hm_ViTPose-large-simple_8xb64-210e_coco-256x192.py,https://download.openmmlab.com/mmpose/v1/body_2d_keypoint/topdown_heatmap/coco/td-hm_ViTPose-large-simple_8xb64-210e_coco-256x192-3a7ee9e1_20230314.pth,ViTPose,large,topdown

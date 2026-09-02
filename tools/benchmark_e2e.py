@@ -96,6 +96,13 @@ BBoxItem = collections.namedtuple(
     ['frame_id', 'img_id', 'img', 'clip_imgs', 'bbox_xyxy', 'det_score',
      'n_bboxes_in_frame', 'frame_start_wall'],
 )
+# Zero-detection marker: same FIFO as BBoxItem, so an online post-processor
+# sees every frame in dataset order (including empty ones) without the
+# producer pinning pixels in an unbounded dict.
+ZeroDetItem = collections.namedtuple(
+    'ZeroDetItem',
+    ['frame_id', 'img_id', 'ori_shape', 'img_path', 'img'],
+)
 _SENTINEL = object()   # signals producer is done
 
 
@@ -601,78 +608,112 @@ def _pose_dicts_from_unifiedsample(sample: UnifiedSample) -> List[dict]:
     return result
 
 
-# ── Post-processing helper ────────────────────────────────────────────────
+# ── Post-processing helpers ───────────────────────────────────────────────
 
-def _run_post_processing(
+def _apply_online_postproc(
     pipeline: PostProcessingPipeline,
-    samples: List[UnifiedSample],
-    pred_by_img_id: Dict[int, PoseDataSample],
-) -> Tuple[Dict[int, PoseDataSample], dict]:
-    """Apply a post-processing pipeline to per-image predictions.
+    ds: PoseDataSample,
+    image: Optional[np.ndarray] = None,
+) -> PoseDataSample:
+    """Run one online-pipeline frame, optionally attaching pixels as ``ds.img``.
 
-    Iterates *samples* in order (preserving sequence order for temporal
-    filters), feeds prediction-only :class:`PoseDataSample`s into the
-    pipeline, and returns the post-processed map plus a timing perf dict.
-
-    For an **online** pipeline each :meth:`~PostProcessingPipeline.process`
-    call is individually timed; for an **offline** pipeline a single
-    :meth:`~PostProcessingPipeline.evaluate` call is timed.
-
-    Args:
-        pipeline: Built :class:`PostProcessingPipeline`.
-        samples: Ordered unified samples (same order as inference run).
-        pred_by_img_id: Mapping ``img_id → PoseDataSample`` from inference.
-
-    Returns:
-        Tuple of the post-processed ``img_id → PoseDataSample`` mapping and
-        a flat perf dict.
+    ``image`` is the frame in prediction coordinate space (matching
+    ``metainfo['ori_shape']``). It is left unset when the pipeline does not
+    need images, or when the decode failed — filters must already tolerate
+    a missing ``ds.img``.
     """
-    pipeline.reset()
+    if pipeline.needs_images and image is not None:
+        ds.img = image
+    result = pipeline.process(ds)
+    return result if result is not None else ds
 
-    postproc_by_img_id: Dict[int, PoseDataSample] = {}
 
-    if pipeline.is_online:
-        for sample in samples:
-            img_id = sample.img_id
-            ds = pred_by_img_id.get(img_id)
-            if ds is None:
-                continue
-            result = pipeline.process(ds)
-            if result is not None:
-                postproc_by_img_id[img_id] = result
+def _postproc_perf_dict(total_s: float, n_frames: int) -> dict:
+    """Flat ``postproc/*`` perf dict from an accumulated timed total."""
+    return {
+        'postproc/latency_ms_per_frame': (
+            1000.0 * total_s / n_frames if n_frames > 0 else 0.0),
+        'postproc/total_s': total_s,
+        'postproc/fps': n_frames / total_s if total_s > 0 else 0.0,
+    }
 
-        n = len(pipeline._frame_times)
-        perf = {
-            'postproc/latency_ms_per_frame': pipeline.per_frame_ms,
-            'postproc/total_s': pipeline.total_s,
-            'postproc/fps': n / pipeline.total_s if pipeline.total_s > 0 else 0.0,
-        }
+
+def _enqueue_zero_det_frame(
+    frame_id: int,
+    img_id: int,
+    ori_shape: Tuple[int, int],
+    img_path: Optional[str],
+    img: Optional[np.ndarray],
+    bbox_queue: queue.Queue,
+    zero_det_frames: dict,
+    frame_end_times: dict,
+    post_pipeline: Optional[PostProcessingPipeline],
+    wall_after: float,
+) -> None:
+    """Record a zero-detection frame, queuing a marker when post-processing.
+
+    Without a pipeline the producer records ``frame_end_times`` immediately,
+    matching the historical topdown path. With a pipeline a :class:`ZeroDetItem`
+    goes through the same bounded queue as detections so the consumer can
+    run the tracker on the empty frame in dataset order (and so pixel
+    lifetime stays bounded by the queue).
+    """
+    zero_det_frames[frame_id] = (img_id, ori_shape)
+    if post_pipeline is not None:
+        bbox_queue.put(ZeroDetItem(
+            frame_id=frame_id,
+            img_id=img_id,
+            ori_shape=ori_shape,
+            img_path=img_path,
+            img=(img if post_pipeline.needs_images else None),
+        ))
     else:
-        for sample in samples:
-            img_id = sample.img_id
-            ds = pred_by_img_id.get(img_id)
-            if ds is None:
-                continue
-            pipeline.process(ds)
+        frame_end_times[frame_id] = wall_after
 
-        results = pipeline.evaluate()
-        # Reassociate processed frames with img_ids in insertion order
-        img_ids_ordered = [
-            s.img_id for s in samples if s.img_id in pred_by_img_id
-        ]
-        for img_id, processed_ds in zip(img_ids_ordered, results):
-            postproc_by_img_id[img_id] = processed_ds
 
-        n = len(results)
-        total_s = pipeline.total_s
-        perf = {
-            'postproc/latency_ms_per_frame': (
-                1000.0 * total_s / n if n > 0 else 0.0),
-            'postproc/total_s': total_s,
-            'postproc/fps': n / total_s if total_s > 0 else 0.0,
-        }
+def _emit_postprocessed_frame(
+    fid: int,
+    img_id: int,
+    img: Optional[np.ndarray],
+    samples: List[UnifiedSample],
+    frame_results: dict,
+    det_predictions: dict,
+    post_pipeline: PostProcessingPipeline,
+    pred_by_img_id: Dict[int, PoseDataSample],
+    frame_end_times: dict,
+    postproc_times: list,
+) -> None:
+    """Assemble one frame, run the online pipeline, store the result."""
+    sample = samples[fid]
+    h, w = sample.ori_shape
+    if fid in frame_results:
+        res_scores = frame_results[fid]
+        pred_ds = _merge_pose_predictions_to_posedatasample(
+            img_id,
+            [r for r, _ in res_scores],
+            [s for _, s in res_scores],
+            (h, w),
+            img_path=sample.img_path,
+        )
+    else:
+        pred_ds = _merge_pose_predictions_to_posedatasample(
+            img_id, [], [], (h, w), img_path=sample.img_path)
 
-    return postproc_by_img_id, perf
+    det_bb, det_sc = det_predictions.get(
+        fid,
+        (np.zeros((0, 4), dtype=np.float32),
+         np.zeros(0, dtype=np.float32)),
+    )
+
+    with _CudaTimer() as timer:
+        result = _apply_online_postproc(post_pipeline, pred_ds, img)
+
+    if len(det_bb) > 0:
+        result.set_metainfo({'det_bboxes': det_bb, 'det_scores': det_sc})
+
+    pred_by_img_id[img_id] = result
+    frame_end_times[fid] = time.perf_counter()
+    postproc_times.append(timer.elapsed_s)
 
 
 # ── Bottomup pipeline ──────────────────────────────────────────────────────
@@ -688,6 +729,7 @@ def run_bottomup(
     warmup_batches: int = 3,
     log_interval: int = 100,
     num_input_frames: int = 1,
+    post_pipeline: Optional[PostProcessingPipeline] = None,
 ) -> Tuple[Dict[int, PoseDataSample], dict]:
     """Run bottomup inference on unified samples.
 
@@ -720,15 +762,27 @@ def run_bottomup(
             ``num_input_frames`` whole-frame images (the model's own
             ``data_preprocessor``/wrapper is responsible for stacking and
             normalising the clip).
+        post_pipeline: Optional online :class:`PostProcessingPipeline` run
+            on each frame, in dataset order, immediately after that
+            frame's ``test_step`` result is available. Timed inside the
+            same region as inference (so ``e2e/*`` includes it). Must be
+            fully online; ``needs_images`` pipelines receive the centre
+            frame's pixels as ``ds.img``.
 
     Returns:
-        pred_by_img_id: Mapping ``img_id → PoseDataSample`` (prediction only).
+        pred_by_img_id: Mapping ``img_id → PoseDataSample`` (prediction only;
+            post-processed when ``post_pipeline`` is set).
         perf: Performance-metric dict.
     """
     n = len(samples)
     n_batches = (n + kp_batch_size - 1) // kp_batch_size
 
+    if post_pipeline is not None:
+        post_pipeline.reset()
+
     batch_latencies: List[Tuple[float, int]] = []
+    pose_latencies: List[Tuple[float, int]] = []
+    postproc_latencies: List[Tuple[float, int]] = []
     pred_by_img_id: Dict[int, PoseDataSample] = {}
 
     for i, batch_samples in enumerate(
@@ -765,11 +819,26 @@ def run_bottomup(
         del batch
 
         with torch.no_grad():
-            with _CudaTimer() as timer:
+            with _CudaTimer() as model_timer:
                 results = model.test_step(gpu_batch)
 
+        postproc_s = 0.0
+        if post_pipeline is not None:
+            with _CudaTimer() as pp_timer:
+                processed = []
+                for ds, item in zip(results, batch_samples):
+                    processed.append(_apply_online_postproc(
+                        post_pipeline, ds, item.image))
+            postproc_s = pp_timer.elapsed_s
+            del results
+            results = processed
+
+        n_out = len(results)
         if i >= warmup_batches:
-            batch_latencies.append((timer.elapsed_s, len(results)))
+            batch_latencies.append((model_timer.elapsed_s + postproc_s, n_out))
+            if post_pipeline is not None:
+                pose_latencies.append((model_timer.elapsed_s, n_out))
+                postproc_latencies.append((postproc_s, n_out))
 
         for ds, img_id in zip(results, img_ids):
             pred_by_img_id[img_id] = ds
@@ -800,6 +869,18 @@ def run_bottomup(
         ),
         'dataload/stall_s': sample_stream.stall_s,
     }
+    if post_pipeline is not None:
+        pose_time = sum(t for t, _ in pose_latencies)
+        pose_frames = sum(k for _, k in pose_latencies)
+        pose_per_frame = [t / k for t, k in pose_latencies]
+        perf['pose/fps'] = (
+            pose_frames / pose_time if pose_time > 0 else 0.0)
+        perf['pose/latency_ms_per_frame'] = (
+            1000.0 * sum(pose_per_frame) / len(pose_per_frame)
+            if pose_per_frame else 0.0)
+        pp_time = sum(t for t, _ in postproc_latencies)
+        pp_frames = sum(k for _, k in postproc_latencies)
+        perf.update(_postproc_perf_dict(pp_time, pp_frames))
     return pred_by_img_id, perf
 
 
@@ -815,6 +896,7 @@ def _mock_detector_producer(
     frame_end_times: dict,
     zero_det_frames: dict,
     det_predictions: dict,
+    post_pipeline: Optional[PostProcessingPipeline] = None,
 ) -> None:
     """Producer: push GT BBoxItems into bbox_queue without running a detector.
 
@@ -866,8 +948,10 @@ def _mock_detector_producer(
                 if clip is not None else None)
 
             if n_bboxes == 0:
-                zero_det_frames[frame_id] = (img_id, (h, w))
-                frame_end_times[frame_id] = wall_after
+                _enqueue_zero_det_frame(
+                    frame_id, img_id, (h, w), sample.img_path, img,
+                    bbox_queue, zero_det_frames, frame_end_times,
+                    post_pipeline, wall_after)
             else:
                 for bbox, score in zip(bboxes_xyxy, scores):
                     bbox_queue.put(BBoxItem(
@@ -900,6 +984,7 @@ def _detector_producer(
     frame_end_times: dict,
     zero_det_frames: dict,
     det_predictions: dict,
+    post_pipeline: Optional[PostProcessingPipeline] = None,
 ) -> None:
     """Producer: run detector and push BBoxItems into bbox_queue.
 
@@ -974,8 +1059,10 @@ def _detector_producer(
                 if clip is not None else None)
 
             if n_bboxes == 0:
-                zero_det_frames[frame_id] = (img_id, (h, w))
-                frame_end_times[frame_id] = wall_after_det
+                _enqueue_zero_det_frame(
+                    frame_id, img_id, (h, w), sample.img_path, orig_img,
+                    bbox_queue, zero_det_frames, frame_end_times,
+                    post_pipeline, wall_after_det)
             else:
                 for bbox, score in zip(bboxes_xyxy, scores):
                     bbox_queue.put(BBoxItem(
@@ -1005,9 +1092,64 @@ def _keypoint_consumer(
     frame_end_times: dict,
     frame_counts: dict,
     dataset_meta: dict,
+    post_pipeline: Optional[PostProcessingPipeline] = None,
+    samples: Optional[List[UnifiedSample]] = None,
+    pred_by_img_id: Optional[Dict[int, PoseDataSample]] = None,
+    det_predictions: Optional[dict] = None,
+    postproc_times: Optional[list] = None,
 ) -> None:
-    """Consumer: collect BBoxItems, run keypoint model, record timings."""
+    """Consumer: collect BBoxItems, run keypoint model, record timings.
+
+    When ``post_pipeline`` is set, completed frames (and :class:`ZeroDetItem`
+    markers) are assembled and post-processed in dataset order before
+    ``frame_end_times`` is recorded, so e2e wall-clock includes the
+    pipeline. ``ZeroDetItem``s are never batched into the keypoint model.
+    """
     batch_counter = 0
+    buffer: List[BBoxItem] = []
+    done = False
+
+    def emit_completed(
+        completed_items: List[Tuple[int, int, Optional[np.ndarray]]],
+        t_end: float,
+    ) -> None:
+        if post_pipeline is None:
+            for fid, _, _ in completed_items:
+                frame_end_times[fid] = t_end
+            return
+        for fid, img_id, img in sorted(completed_items, key=lambda x: x[0]):
+            _emit_postprocessed_frame(
+                fid, img_id, img, samples, frame_results,
+                det_predictions, post_pipeline, pred_by_img_id,
+                frame_end_times, postproc_times)
+
+    def emit_zero(item: ZeroDetItem) -> None:
+        if post_pipeline is None:
+            frame_end_times[item.frame_id] = time.perf_counter()
+            return
+        _emit_postprocessed_frame(
+            item.frame_id, item.img_id, item.img, samples, frame_results,
+            det_predictions, post_pipeline, pred_by_img_id,
+            frame_end_times, postproc_times)
+
+    def handle_special(item) -> str:
+        """Handle sentinel / zero-det markers.
+
+        Returns ``'sentinel'``, ``'zero'``, or ``'bbox'`` (caller should
+        append the item to the keypoint buffer). A zero-det marker flushes
+        any pending boxes first so earlier frames complete before it.
+        """
+        nonlocal done
+        if item is _SENTINEL:
+            done = True
+            return 'sentinel'
+        if isinstance(item, ZeroDetItem):
+            if buffer:
+                flush(list(buffer))
+                buffer.clear()
+            emit_zero(item)
+            return 'zero'
+        return 'bbox'
 
     def flush(buf: list) -> None:
         nonlocal batch_counter
@@ -1044,7 +1186,7 @@ def _keypoint_consumer(
                   f'| running FPS: {fps_so_far:.1f}')
 
         t_end = time.perf_counter()
-
+        completed = []
         for item, result in zip(buf, results):
             fid = item.frame_id
             if fid not in frame_results:
@@ -1052,40 +1194,47 @@ def _keypoint_consumer(
                 frame_counts[fid] = item.n_bboxes_in_frame
             frame_results[fid].append((result, item.det_score))
             if len(frame_results[fid]) >= frame_counts[fid]:
-                frame_end_times[fid] = t_end
-
-    buffer: List[BBoxItem] = []
-    done = False
+                completed.append((fid, item.img_id, item.img))
+        emit_completed(completed, t_end)
 
     while not done:
         if not buffer:
             item = bbox_queue.get()
-            if item is _SENTINEL:
+            kind = handle_special(item)
+            if kind == 'sentinel':
                 break
+            if kind == 'zero':
+                continue
             buffer.append(item)
 
         if queue_strategy == 'full_batch':
             while len(buffer) < kp_batch_size:
                 item = bbox_queue.get()
-                if item is _SENTINEL:
-                    done = True
+                kind = handle_special(item)
+                if kind == 'sentinel':
+                    break
+                if kind == 'zero':
                     break
                 buffer.append(item)
-            flush(buffer[:kp_batch_size])
-            buffer = buffer[kp_batch_size:]
+            if buffer:
+                flush(buffer[:kp_batch_size])
+                buffer = buffer[kp_batch_size:]
 
         elif queue_strategy == 'any':
             while len(buffer) < kp_batch_size:
                 try:
                     item = bbox_queue.get_nowait()
-                    if item is _SENTINEL:
-                        done = True
+                    kind = handle_special(item)
+                    if kind == 'sentinel':
+                        break
+                    if kind == 'zero':
                         break
                     buffer.append(item)
                 except queue.Empty:
                     break
-            flush(buffer[:kp_batch_size])
-            buffer = buffer[kp_batch_size:]
+            if buffer:
+                flush(buffer[:kp_batch_size])
+                buffer = buffer[kp_batch_size:]
 
         elif queue_strategy == 'same_frame':
             current_fid = buffer[0].frame_id
@@ -1094,8 +1243,10 @@ def _keypoint_consumer(
             while len(buffer) < kp_batch_size:
                 try:
                     item = bbox_queue.get_nowait()
-                    if item is _SENTINEL:
-                        done = True
+                    kind = handle_special(item)
+                    if kind == 'sentinel':
+                        break
+                    if kind == 'zero':
                         break
                     if item.frame_id == current_fid:
                         buffer.append(item)
@@ -1105,8 +1256,9 @@ def _keypoint_consumer(
                 except queue.Empty:
                     break
 
-            flush(buffer[:kp_batch_size])
-            buffer = buffer[kp_batch_size:]
+            if buffer:
+                flush(buffer[:kp_batch_size])
+                buffer = buffer[kp_batch_size:]
 
             if pending is not None:
                 buffer.append(pending)
@@ -1131,6 +1283,7 @@ def run_topdown(
     log_interval: int = 100,
     use_mock_detector: bool = False,
     num_input_frames: int = 1,
+    post_pipeline: Optional[PostProcessingPipeline] = None,
 ) -> Tuple[Dict[int, PoseDataSample], dict]:
     """Run topdown async producer/consumer benchmark on unified samples.
 
@@ -1169,9 +1322,15 @@ def run_topdown(
             instead carries a list of ``num_input_frames`` crops (the same
             bbox applied to every frame in the window around it) for the
             keypoint pipeline/wrapper to stack into a clip tensor.
+        post_pipeline: Optional online :class:`PostProcessingPipeline` run
+            on each assembled frame in dataset order inside the consumer
+            thread. Timed as part of e2e wall-clock. Zero-detection frames
+            are queued as :class:`ZeroDetItem` markers so the pipeline
+            still sees every frame (with pixels when ``needs_images``).
 
     Returns:
-        pred_by_img_id: Mapping ``img_id → PoseDataSample`` (prediction only).
+        pred_by_img_id: Mapping ``img_id → PoseDataSample`` (prediction only;
+            post-processed when ``post_pipeline`` is set).
         perf: Performance-metric dict.
     """
     _init_scope(pose_cfg)
@@ -1199,6 +1358,11 @@ def run_topdown(
     frame_counts: dict = {}
     zero_det_frames: dict = {}
     det_predictions: dict = {}
+    pred_by_img_id: Dict[int, PoseDataSample] = {}
+    postproc_times: list = []
+
+    if post_pipeline is not None:
+        post_pipeline.reset()
 
     if use_mock_detector:
         producer = threading.Thread(
@@ -1206,7 +1370,7 @@ def run_topdown(
             args=(sample_batches, n_images, det_batch_size,
                   bbox_queue, log_interval,
                   frame_start_times, frame_end_times, zero_det_frames,
-                  det_predictions),
+                  det_predictions, post_pipeline),
             daemon=True,
         )
     else:
@@ -1215,7 +1379,8 @@ def run_topdown(
             args=(det_model, sample_batches, n_images, det_batch_size,
                   bbox_thr, nms_thr, det_cat_id, bbox_queue, warmup_batches,
                   log_interval, det_timings, frame_start_times,
-                  frame_end_times, zero_det_frames, det_predictions),
+                  frame_end_times, zero_det_frames, det_predictions,
+                  post_pipeline),
             daemon=True,
         )
 
@@ -1223,7 +1388,9 @@ def run_topdown(
         target=_keypoint_consumer,
         args=(kp_model, kp_pipeline, kp_batch_size, queue_strategy,
               bbox_queue, warmup_batches, log_interval, kp_timings,
-              frame_results, frame_end_times, frame_counts, dataset_meta),
+              frame_results, frame_end_times, frame_counts, dataset_meta,
+              post_pipeline, samples, pred_by_img_id, det_predictions,
+              postproc_times),
         daemon=True,
     )
 
@@ -1292,38 +1459,45 @@ def run_topdown(
         ),
         'dataload/stall_s': sample_stream.stall_s,
     }
+    if post_pipeline is not None:
+        perf.update(_postproc_perf_dict(
+            sum(postproc_times), len(postproc_times)))
 
     # ── Assemble one PoseDataSample per image ─────────────────────────────
-    # Store raw detector output in metainfo so build_frame_record can pick it
-    # up without needing separate det_bboxes / det_scores arguments.
-    pred_by_img_id: Dict[int, PoseDataSample] = {}
-    for fid, sample in enumerate(samples):
-        img_id = sample.img_id
-        h, w = sample.ori_shape
+    # When a post-processing pipeline ran, the consumer already filled
+    # pred_by_img_id. Otherwise assemble from per-bbox keypoint results
+    # here. Store raw detector output in metainfo so build_frame_record
+    # can pick it up without needing separate det_bboxes / det_scores
+    # arguments.
+    if post_pipeline is None:
+        for fid, sample in enumerate(samples):
+            img_id = sample.img_id
+            h, w = sample.ori_shape
 
-        det_bb, det_sc = det_predictions.get(
-            fid,
-            (np.zeros((0, 4), dtype=np.float32),
-             np.zeros(0, dtype=np.float32)),
-        )
-
-        if fid in frame_results:
-            res_scores = frame_results[fid]
-            pred_ds = _merge_pose_predictions_to_posedatasample(
-                img_id,
-                [r for r, _ in res_scores],
-                [s for _, s in res_scores],
-                (h, w),
-                img_path=sample.img_path,
+            det_bb, det_sc = det_predictions.get(
+                fid,
+                (np.zeros((0, 4), dtype=np.float32),
+                 np.zeros(0, dtype=np.float32)),
             )
-        else:
-            pred_ds = _merge_pose_predictions_to_posedatasample(
-                img_id, [], [], (h, w), img_path=sample.img_path)
 
-        if len(det_bb) > 0:
-            pred_ds.set_metainfo({'det_bboxes': det_bb, 'det_scores': det_sc})
+            if fid in frame_results:
+                res_scores = frame_results[fid]
+                pred_ds = _merge_pose_predictions_to_posedatasample(
+                    img_id,
+                    [r for r, _ in res_scores],
+                    [s for _, s in res_scores],
+                    (h, w),
+                    img_path=sample.img_path,
+                )
+            else:
+                pred_ds = _merge_pose_predictions_to_posedatasample(
+                    img_id, [], [], (h, w), img_path=sample.img_path)
 
-        pred_by_img_id[img_id] = pred_ds
+            if len(det_bb) > 0:
+                pred_ds.set_metainfo(
+                    {'det_bboxes': det_bb, 'det_scores': det_sc})
+
+            pred_by_img_id[img_id] = pred_ds
 
     return pred_by_img_id, perf
 
@@ -1631,7 +1805,6 @@ def _save_out(
     perf: dict,
     mode: str,
     args,
-    pp_quality: Optional[dict] = None,
     n_eval: Optional[int] = None,
     n_images: Optional[int] = None,
 ) -> None:
@@ -1660,8 +1833,6 @@ def _save_out(
         payload['num_eval_frames'] = int(n_eval)
     if n_images is not None:
         payload['num_frames'] = int(n_images)
-    if pp_quality is not None:
-        payload['post_processed_quality'] = pp_quality
     out_dir = osp.dirname(osp.abspath(args.out))
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
@@ -1845,7 +2016,6 @@ def _append_to_results_file(
     quality: dict,
     perf: dict,
     args,
-    pp_quality: Optional[dict] = None,
 ) -> None:
     results_file = args.results_file
     if osp.isfile(results_file):
@@ -1855,39 +2025,24 @@ def _append_to_results_file(
         data = {}
 
     metrics = {**quality, **{f'perf/{k}': v for k, v in perf.items()}}
+    post_config = getattr(args, 'post_config', None)
     entry = {
         'timestamp': datetime.now().isoformat(timespec='seconds'),
         'config': osp.abspath(args.pose_config),
         'checkpoint': osp.abspath(args.pose_checkpoint),
         'test_dataset': args.test_dataset,
-        'post_processed': False,
-        'post_config': None,
+        'post_processed': bool(post_config),
+        'post_config': osp.abspath(post_config) if post_config else None,
         'metrics': metrics,
     }
     entries = data.setdefault(args.model_name, {}).setdefault(
         args.model_variant, [])
     entries.append(entry)
 
-    # Append a second entry for post-processed results in the same call when
-    # both raw and pp quality are available (avoids a second file read/write).
-    post_config = getattr(args, 'post_config', None)
-    if pp_quality is not None:
-        pp_metrics = {**pp_quality, **{f'perf/{k}': v for k, v in perf.items()}}
-        pp_entry = {
-            'timestamp': entry['timestamp'],
-            'config': entry['config'],
-            'checkpoint': entry['checkpoint'],
-            'test_dataset': entry['test_dataset'],
-            'post_processed': True,
-            'post_config': osp.abspath(post_config) if post_config else None,
-            'metrics': pp_metrics,
-        }
-        entries.append(pp_entry)
-
     os.makedirs(osp.dirname(osp.abspath(results_file)), exist_ok=True)
     with open(results_file, 'w') as f:
         json.dump(data, f, indent=2)
-    suffix = ' + post-processed' if pp_quality is not None else ''
+    suffix = ' [post-processed]' if post_config else ''
     print(f'Results appended to {results_file} '
           f'({args.model_name} / {args.model_variant}){suffix}')
 
@@ -2008,8 +2163,11 @@ def _parse_args():
         '--post-config', default=None,
         help='Path to a post-processing pipeline config '
              '(e.g. configs/post_processing/oks_track_one_euro.py). '
-             'When provided both raw and post-processed outputs are '
-             'evaluated and saved separately.')
+             'When provided, the pipeline runs inside the timed inference '
+             'loop (so e2e FPS includes it) and only post-processed '
+             'outputs are evaluated and saved. The pipeline must be '
+             'fully online; offline filters are not supported here '
+             '(use tools/postprocess_predictions.py instead).')
     p.add_argument(
         '--postproc-name', default=None,
         help='Name of this post-processing run (e.g. "smoothnetw8"). '
@@ -2055,17 +2213,15 @@ def main():
     if getattr(args, 'post_config', None):
         print(f'\nBuilding post-processing pipeline from: {args.post_config}')
         post_pipeline = build_post_processor(args.post_config)
-        if post_pipeline.needs_images:
+        if not post_pipeline.is_online:
             raise ValueError(
-                f'The post-processing config {args.post_config!r} declares '
-                f'needs_images=True, but --post-config in benchmark_e2e '
-                f'does not supply frame images (chunked prefetch releases '
-                f'the pixels before post-processing runs). This includes '
-                f'hybrid online-image + offline pipelines. Save the '
-                f'predictions first and run tools/postprocess_predictions.py '
-                f'on the bundle instead.')
-        mode_label = 'online' if post_pipeline.is_online else 'offline'
-        print(f'  Pipeline mode : {mode_label}')
+                f'The post-processing config {args.post_config!r} contains '
+                f'an offline filter. An offline stage needs the whole '
+                f'sequence, so it cannot run inside the timed loop. Save '
+                f'the predictions first and run '
+                f'tools/postprocess_predictions.py on the bundle instead.')
+        print('  Pipeline mode : online')
+        print(f'  Needs images  : {post_pipeline.needs_images}')
         print(f'  Filters       : {[type(f).__name__ for f in post_pipeline.filters]}')
 
     use_real_detector = bool(args.det_config and args.det_checkpoint)
@@ -2214,7 +2370,9 @@ def main():
         kp_model = init_model(
             args.pose_config, args.pose_checkpoint, device=args.device)
         dataset_meta = kp_model.dataset_meta
-        evaluator = build_evaluator(pose_cfg, dataset_meta, args.test_dataset)
+        evaluator = build_evaluator(
+            pose_cfg, dataset_meta, args.test_dataset,
+            include_tracking_metrics=post_pipeline is not None)
 
         t_infer_start = time.perf_counter()
         pred_by_img_id, perf = run_topdown(
@@ -2233,6 +2391,7 @@ def main():
             log_interval=args.log_interval,
             use_mock_detector=args.mock_detector,
             num_input_frames=num_input_frames,
+            post_pipeline=post_pipeline,
         )
         infer_wall_s = time.perf_counter() - t_infer_start
 
@@ -2247,7 +2406,9 @@ def main():
         model = init_model(
             args.pose_config, args.pose_checkpoint, device=args.device)
         dataset_meta = model.dataset_meta
-        evaluator = build_evaluator(pose_cfg, dataset_meta, args.test_dataset)
+        evaluator = build_evaluator(
+            pose_cfg, dataset_meta, args.test_dataset,
+            include_tracking_metrics=post_pipeline is not None)
 
         val_pipeline = Compose(pipeline_cfg)
 
@@ -2263,6 +2424,7 @@ def main():
             warmup_batches=args.warmup_batches,
             log_interval=args.log_interval,
             num_input_frames=num_input_frames,
+            post_pipeline=post_pipeline,
         )
         infer_wall_s = time.perf_counter() - t_infer_start
 
@@ -2279,23 +2441,7 @@ def main():
             f'--prefetch-chunk-size, --prefetch-workers, or '
             f'--prefetch-queue-chunks.')
 
-    # ── Post-processing (both modes) ────────────────────────────────────────
-    postproc_by_img_id: Optional[Dict[int, PoseDataSample]] = None
-    if post_pipeline is not None:
-        postproc_by_img_id, pp_perf = _run_post_processing(
-            post_pipeline, samples, pred_by_img_id)
-        perf.update(pp_perf)
-
     # ── Unified evaluation (both modes) ────────────────────────────────────
-    frame_records_pp: Optional[List[dict]] = (
-        [] if (args.model_name and postproc_by_img_id is not None) else None
-    )
-    pp_evaluator = (
-        build_evaluator(pose_cfg, dataset_meta, args.test_dataset,
-                        include_tracking_metrics=True)
-        if postproc_by_img_id is not None else None
-    )
-
     eval_good_only = bool(getattr(args, 'eval_good_frames_only', False))
     if eval_good_only and args.test_dataset not in BAD_FRAME_DATASETS:
         print(
@@ -2312,7 +2458,6 @@ def main():
         if include_in_eval:
             n_eval += 1
 
-        # ── Regular predictions ────────────────────────────────────────
         pred_ds = pred_by_img_id.get(img_id)
         if pred_ds is not None:
             ds = _attach_gt_to_posedatasample(pred_ds, sample)
@@ -2332,29 +2477,6 @@ def main():
                     good_frame=sample.good_frame,
                 ))
 
-        # ── Post-processed predictions ─────────────────────────────────
-        if postproc_by_img_id is not None:
-            pp_ds = postproc_by_img_id.get(img_id)
-            if pp_ds is not None:
-                pp_ds_gt = _attach_gt_to_posedatasample(pp_ds, sample)
-                if include_in_eval:
-                    pp_evaluator.process(
-                        data_samples=[pp_ds_gt], data_batch=None)
-
-                if frame_records_pp is not None:
-                    pp_ds_save = _filter_pred_for_saving(
-                        pp_ds_gt, args.save_score_thr)
-                    frame_records_pp.append(build_frame_record(
-                        img_id=int(img_id),
-                        frame_id=fid,
-                        img_path=sample.img_path,
-                        data_root=data_root,
-                        pred_ds=pp_ds_save,
-                        gt_instances=gt_dicts,
-                        dataset_meta=dataset_meta,
-                        good_frame=sample.good_frame,
-                    ))
-
     n_bad = n_images - n_eval
     if eval_good_only:
         print(f'\nEvaluating on {n_eval}/{n_images} frames '
@@ -2363,9 +2485,6 @@ def main():
         n_eval = n_images
 
     quality = evaluator.evaluate(n_eval)
-    pp_quality: Optional[dict] = None
-    if pp_evaluator is not None:
-        pp_quality = pp_evaluator.evaluate(n_eval)
 
     # Optional detection AP/AR (topdown only — reads from pred_ds.metainfo).
     # Built here (after inference) rather than up front, since in chunked
@@ -2404,33 +2523,32 @@ def main():
         quality = {**quality, **det_quality}
 
     # ── Output ─────────────────────────────────────────────────────────────
-    _print_results(quality, perf, mode)
-    if pp_quality is not None:
-        _print_results(pp_quality, perf, f'{mode} [post-processed]')
+    result_mode = (
+        f'{mode} [post-processed]' if post_pipeline is not None else mode)
+    _print_results(quality, perf, result_mode)
 
     if args.out:
         _save_out(
-            quality, perf, mode, args, pp_quality=pp_quality,
+            quality, perf, result_mode, args,
             n_eval=n_eval, n_images=n_images)
 
     if args.results_file:
         assert args.model_name and args.model_variant, (
             '--model-name and --model-variant are required when '
             '--results-file is specified')
-        _append_to_results_file(quality, perf, args, pp_quality=pp_quality)
+        _append_to_results_file(quality, perf, args)
 
     if args.model_name and frame_records is not None:
-        _save_predictions(
-            args, data_root, mode, is_topdown, quality, perf,
-            frame_records, dataset_meta, run_date, n_eval=n_eval)
-
-    # ── Post-processed bundle ───────────────────────────────────────────
-    if args.model_name and frame_records_pp is not None and pp_quality is not None:
-        _save_predictions_postproc(
-            args, data_root, mode, is_topdown, pp_quality, perf,
-            frame_records_pp, dataset_meta, run_date,
-            post_config=getattr(args, 'post_config', None),
-            n_eval=n_eval)
+        if post_pipeline is not None:
+            _save_predictions_postproc(
+                args, data_root, mode, is_topdown, quality, perf,
+                frame_records, dataset_meta, run_date,
+                post_config=getattr(args, 'post_config', None),
+                n_eval=n_eval)
+        else:
+            _save_predictions(
+                args, data_root, mode, is_topdown, quality, perf,
+                frame_records, dataset_meta, run_date, n_eval=n_eval)
 
 
 if __name__ == '__main__':
