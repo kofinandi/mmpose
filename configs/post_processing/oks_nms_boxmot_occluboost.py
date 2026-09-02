@@ -20,6 +20,12 @@ post_processor = dict(
     needs_images=True,
     filters=[
         dict(
+            type='OKSNMS',
+            score_thr=0.3,
+            oks_thr=0.9,
+            score_mode='auto',
+        ),
+        dict(
             type='BoxMOTTracker',
             tracker='occluboost',
             reid_weights='data/models/boxmot/lmbn_n_duke.pt',  # or osnet_x0_25_msmt17.pt
