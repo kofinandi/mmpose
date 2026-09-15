@@ -135,3 +135,6 @@ docs/**/modelzoo.md
 
 /benchmark
 *.tsv
+
+.claude
+.cursor
