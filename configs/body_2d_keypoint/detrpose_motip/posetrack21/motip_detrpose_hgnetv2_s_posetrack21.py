@@ -27,7 +27,7 @@ _base_ = '../../../_base_/default_runtime.py'
 # evaluate_motip reports.  Do not compare these numbers to published
 # PoseTrack21 tables or to train_motip.py --eval output.
 #
-# Requires omegaconf / cloudpickle / iopath (present in the mmpose-new env).
+# Requires omegaconf / cloudpickle / iopath.
 #
 # Canonical run (tracker sees every frame, metrics on labeled frames only):
 #   python tools/benchmark_e2e.py \
