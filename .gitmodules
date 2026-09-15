@@ -41,3 +41,6 @@
 [submodule "external/QueryPose"]
 	path = external/QueryPose
 	url = https://github.com/buptxyb666/QueryPose.git
+[submodule "external/detrpose-motip"]
+	path = external/detrpose-motip
+	url = git@github.com:kofinandi/detrpose-motip.git

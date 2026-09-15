@@ -29,6 +29,9 @@ CUSTOM_POSE_WRAPPER_TYPES = frozenset({
     # DETRPose release checkpoints are trainer dicts (`model` / `ema`), loaded
     # inside DETRPoseEstimator rather than via MMEngine load_checkpoint.
     'DETRPoseEstimator',
+    # DETRPose-MOTIP trainer dicts (`model`; ema is typically None) are
+    # loaded inside DETRPoseMOTIPEstimator.
+    'DETRPoseMOTIPEstimator',
     'GroupPosePoseEstimator',
     'QueryPosePoseEstimator',
 })
@@ -37,6 +40,7 @@ _POSE_WRAPPER_CHECKPOINT_FIELDS = {
     'RFDETRPoseEstimator': 'pretrain_weights',
     'OpenPifPafPoseEstimator': 'checkpoint',
     'DETRPoseEstimator': 'checkpoint',
+    'DETRPoseMOTIPEstimator': 'checkpoint',
     'GroupPosePoseEstimator': 'checkpoint',
     'QueryPosePoseEstimator': 'checkpoint',
 }
