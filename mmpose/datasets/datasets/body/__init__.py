@@ -13,6 +13,7 @@ from .ochuman_dataset import OCHumanDataset
 from .posetrack18_dataset import PoseTrack18Dataset
 from .posetrack18_video_dataset import PoseTrack18VideoDataset
 from .posetrack21_dataset import PoseTrack21Dataset
+from .dancetrack_dataset import DanceTrackPoseDataset
 from .emdb_dataset import EmdbDataset
 from .threedpw_dataset import ThreeDPWDataset, ThreeDPWVideoDataset
 
@@ -22,4 +23,5 @@ __all__ = [
     'JhmdbDataset', 'PoseTrack18VideoDataset', 'HumanArtDataset',
     'HumanArt21Dataset', 'ExlposeDataset', 'ThreeDPWDataset',
     'ThreeDPWVideoDataset', 'EmdbDataset', 'PoseTrack21Dataset',
+    'DanceTrackPoseDataset',
 ]

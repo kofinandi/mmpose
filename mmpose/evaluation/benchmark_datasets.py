@@ -2,8 +2,8 @@
 """Registry and helpers for cross-dataset benchmark evaluation.
 
 Maps standard COCO-trained model configs onto alternate test datasets
-(CrowdPose, MPII, AIC, OCHuman, EMDB, 3DPW, PoseTrack21) without duplicating
-per-model config files.  Swap ``test_dataloader.dataset``, insert
+(CrowdPose, MPII, AIC, OCHuman, EMDB, 3DPW, PoseTrack21, DanceTrack)
+without duplicating per-model config files.  Swap ``test_dataloader.dataset``, insert
 ``KeypointConverter`` before ``PackPoseInputs``, and use
 ``CocoMetric(gt_from_samples=True)`` unless
 ``preserve_evaluator`` is set on the dataset spec (e.g. EMDB temporal metrics).
@@ -29,7 +29,7 @@ EXTENDED_PACK_META_KEYS = (
 
 BENCHMARK_TEST_DATASET_NAMES = (
     'coco', 'crowdpose', 'mpii', 'aic', 'ochuman', 'emdb', 'emdb-mini',
-    '3dpw', 'posetrack21')
+    '3dpw', 'posetrack21', 'dancetrack')
 
 
 @dataclass(frozen=True)
@@ -162,6 +162,26 @@ BENCHMARK_TEST_DATASETS: Dict[str, BenchmarkTestDataset] = {
                  prefix='posetrack21'),
             dict(type='MPJAE', norm_item=['bbox', 'torso'],
                  prefix='posetrack21'),
+        ],
+    ),
+    # Pseudo pose labels (COCO-17 + head_bottom/head_top).  The benchmark
+    # loader converts them to COCO-17 by keypoint name.  Every val frame
+    # is labeled, so good_frame is uniformly True.
+    'dancetrack': BenchmarkTestDataset(
+        dataset_type='DanceTrackPoseDataset',
+        data_root='data/dancetrack/',
+        ann_file='annotations/dancetrack_pose_val.json',
+        data_prefix=dict(img=''),
+        keypoint_src='dancetrack',
+        prefetch_scale=1.0,
+        dataset_kwargs=dict(good_frame_mask=True),
+        extra_metrics=[
+            dict(type='MPJVE', prefix='dancetrack'),
+            dict(type='MPJAE', prefix='dancetrack'),
+            dict(type='MPJVE', norm_item=['bbox', 'torso'],
+                 prefix='dancetrack'),
+            dict(type='MPJAE', norm_item=['bbox', 'torso'],
+                 prefix='dancetrack'),
         ],
     ),
 }

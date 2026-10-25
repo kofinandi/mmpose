@@ -20,6 +20,7 @@ _METAINFO_FILES: Dict[str, str] = {
     'halpe26':      'configs/_base_/datasets/halpe26.py',
     'ochuman':      'configs/_base_/datasets/ochuman.py',
     'posetrack18':  'configs/_base_/datasets/posetrack18.py',
+    'dancetrack':   'configs/_base_/datasets/dancetrack.py',
     'coco_wholebody': 'configs/_base_/datasets/coco_wholebody.py',
     'threedpw': 'configs/_base_/datasets/threedpw.py',
     'emdb': 'configs/_base_/datasets/emdb.py',

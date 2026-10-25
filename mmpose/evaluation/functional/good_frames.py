@@ -1,8 +1,8 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 """Helpers for identifying evaluable ("good") frames in video benchmarks.
 
-EMDB, 3DPW, and PoseTrack21 annotate frames that lack reliable GT with an
-image-level ``good_frame=False`` flag. Inference and post-processing often
+EMDB, 3DPW, PoseTrack21, and DanceTrack annotate frames that lack reliable
+GT with an image-level ``good_frame=False`` flag. Inference and post-processing often
 still run over those frames (for temporal continuity), but detection/pose/
 tracking metrics should exclude them. This module centralises the
 good/bad decision used by ``tools/benchmark_e2e.py`` and
@@ -17,7 +17,8 @@ from typing import List, Sequence, Tuple
 # The zero-GT heuristic fallback is only safe on these datasets: COCO
 # val2017 legitimately contains images with no person annotations that must
 # stay in the evaluation set.
-BAD_FRAME_DATASETS = frozenset({'emdb', 'emdb-mini', '3dpw', 'posetrack21'})
+BAD_FRAME_DATASETS = frozenset({
+    'emdb', 'emdb-mini', '3dpw', 'posetrack21', 'dancetrack'})
 
 
 def _has_non_crowd_gt(frame: dict) -> bool:

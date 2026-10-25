@@ -29,7 +29,8 @@ from mmpose.structures.bbox import bbox_xyxy2xywh
 # Dataset types that accept a `good_frame_mask` kwarg (see EmdbDataset /
 # ThreeDPWDataset). Only these support --include-bad-frames.
 _SUPPORTS_GOOD_FRAME_MASK = {
-    'EmdbDataset', 'ThreeDPWDataset', 'PoseTrack21Dataset'}
+    'EmdbDataset', 'ThreeDPWDataset', 'PoseTrack21Dataset',
+    'DanceTrackPoseDataset'}
 
 
 # ---------------------------------------------------------------------------
@@ -197,7 +198,8 @@ def build_unified_samples(
 
     Args:
         dataset_name: One of ``'coco', 'crowdpose', 'mpii', 'aic',
-            'ochuman', 'emdb', 'emdb-mini', '3dpw', 'posetrack21'``.
+            'ochuman', 'emdb', 'emdb-mini', '3dpw', 'posetrack21',
+            'dancetrack'``.
         num_frames: If set, cap the number of unique images loaded.
         include_bad_frames: Only meaningful for datasets whose loader
             supports a ``good_frame_mask`` kwarg (EMDB, 3DPW, PoseTrack21).
