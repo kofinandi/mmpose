@@ -16,7 +16,9 @@
 #
 # The scope notes in pgpt.py (no SiamFC propagation; oks_filter/create_id
 # read the detection's existing keypoints rather than re-running the pose
-# network) apply here too.
+# network) apply here too. Detection admission is aligned with MOTIP's
+# det_thresh=0.5 and OKS-NMS is effectively disabled with oks_thr=1.0 for
+# the tracker comparison.
 #
 # Usage:
 #   python tools/postprocess_predictions.py PRED_DIR \
@@ -28,8 +30,8 @@ post_processor = dict(
     filters=[
         dict(
             type='OKSNMS',
-            score_thr=0.3,
-            oks_thr=0.9,
+            score_thr=0.5,
+            oks_thr=1.0,
             score_mode='auto',
         ),
         dict(

@@ -135,6 +135,20 @@ class _CudaTimer:
 
 # ── Helpers ───────────────────────────────────────────────────────────────
 
+def _select_cuda_device(device: str) -> None:
+    """Make ``device`` the process CUDA device.
+
+    ``--device cuda:N`` places tensors on that GPU, but leaves
+    ``torch.cuda.current_device()`` at 0 until something calls
+    ``set_device``. The CUDA timer syncs the current device, and custom
+    ops that launch on ``getCurrentCUDAStream()`` (GroupPose's
+    MultiScaleDeformableAttention) fault if that stream is a different
+    GPU from the tensors.
+    """
+    if device.startswith('cuda') and torch.cuda.is_available():
+        torch.cuda.set_device(device)
+
+
 def _init_scope(cfg: Config) -> None:
     scope = cfg.get('default_scope', 'mmpose')
     if scope:
@@ -373,12 +387,10 @@ def build_evaluator(
             pipeline), so it is safe to enable whenever post-processed
             (potentially tracked) predictions are being evaluated.
         full_tracking_metrics: When ``True``, additionally appends
-            :class:`MOTA`, :class:`IDF1` and :class:`HOTA`.  Used for models
-            that assign track IDs during inference (``emits_track_ids``),
-            where the run would otherwise produce no association metrics at
-            all -- the post-processing path can still reach these via
-            ``tools/postprocess_predictions.py --metrics``.  Kept off by
-            default so existing runs' metric sets are unchanged.
+            :class:`MOTA`, :class:`IDF1` and :class:`HOTA`.  Self-tracking
+            models (``emits_track_ids``) and runs that pass ``--post-config``
+            both set this, so a detector-plus-tracker comparison reports
+            the same association metrics.
     """
     _init_scope(pose_cfg)
     ev_cfg = pose_cfg.test_evaluator
@@ -2081,6 +2093,11 @@ def _parse_args():
     p.add_argument('--num-frames', type=int, default=None,
                    help='Cap number of images evaluated (default: full val set)')
     p.add_argument(
+        '--sequence', default=None,
+        help='Keep only images whose path contains this substring '
+             '(e.g. dancetrack0017). Frames stay in dataset order, so a '
+             'tracker still sees that sequence from the start.')
+    p.add_argument(
         '--num-input-frames', type=int, default=None,
         help='Temporal clip window size (number of consecutive frames) fed '
              'to the pose model per prediction, for multi-frame video '
@@ -2184,6 +2201,7 @@ def _parse_args():
 
 def main():
     args = _parse_args()
+    _select_cuda_device(args.device)
     run_date = datetime.now().strftime('%Y%m%d')
     frame_records: Optional[List[dict]] = [] if args.model_name else None
 
@@ -2286,6 +2304,25 @@ def main():
             args.test_dataset, args.num_frames,
             include_bad_frames=args.include_bad_frames)
         sample_stream = SampleImageStream(samples)
+    if getattr(args, 'sequence', None):
+        needle = args.sequence
+        samples = [s for s in samples if needle in (s.img_path or '')]
+        if not samples:
+            raise ValueError(
+                f'--sequence {needle!r} matched no images in '
+                f'{args.test_dataset}.')
+        print(f'  Sequence filter {needle!r}: {len(samples)} images')
+        prefetch_scale = BENCHMARK_TEST_DATASETS[args.test_dataset].prefetch_scale
+        if args.prefetch_chunk_size > 0:
+            sample_stream = SampleImageStream(
+                samples,
+                prefetch_scale=prefetch_scale,
+                chunk_size=args.prefetch_chunk_size,
+                queue_chunks=args.prefetch_queue_chunks,
+                workers=args.prefetch_workers,
+            )
+        else:
+            sample_stream = SampleImageStream(samples)
     n_images = len(samples)
     data_root = _data_root_for_dataset(args.test_dataset)
 
@@ -2321,7 +2358,8 @@ def main():
         print(f'  Model    : {args.pose_config}\n')
 
         model = init_model(
-            args.pose_config, args.pose_checkpoint, device=args.device)
+            args.pose_config, args.pose_checkpoint, device=args.device,
+            cfg_options=args.cfg_options or None)
         dataset_meta = model.dataset_meta
         evaluator = build_evaluator(
             pose_cfg, dataset_meta, args.test_dataset,
@@ -2368,11 +2406,13 @@ def main():
                 args.det_config, args.det_checkpoint, device=args.device)
 
         kp_model = init_model(
-            args.pose_config, args.pose_checkpoint, device=args.device)
+            args.pose_config, args.pose_checkpoint, device=args.device,
+            cfg_options=args.cfg_options or None)
         dataset_meta = kp_model.dataset_meta
         evaluator = build_evaluator(
             pose_cfg, dataset_meta, args.test_dataset,
-            include_tracking_metrics=post_pipeline is not None)
+            include_tracking_metrics=post_pipeline is not None,
+            full_tracking_metrics=post_pipeline is not None)
 
         t_infer_start = time.perf_counter()
         pred_by_img_id, perf = run_topdown(
@@ -2404,11 +2444,13 @@ def main():
         print(f'  Model : {args.pose_config}\n')
 
         model = init_model(
-            args.pose_config, args.pose_checkpoint, device=args.device)
+            args.pose_config, args.pose_checkpoint, device=args.device,
+            cfg_options=args.cfg_options or None)
         dataset_meta = model.dataset_meta
         evaluator = build_evaluator(
             pose_cfg, dataset_meta, args.test_dataset,
-            include_tracking_metrics=post_pipeline is not None)
+            include_tracking_metrics=post_pipeline is not None,
+            full_tracking_metrics=post_pipeline is not None)
 
         val_pipeline = Compose(pipeline_cfg)
 

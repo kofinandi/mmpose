@@ -8,7 +8,11 @@
 # pose confidence and OKS-NMS them, Hungarian-match to live tracks on box
 # IoU, fall back to the learned appearance embedding for the leftovers,
 # then apply the create_id admission rule and delete unmatched tracks.
-# All thresholds are upstream's class defaults on Track_And_Detect.
+#
+# For the DETRPose-MOTIP tracker comparison, detection admission is aligned
+# with MOTIP's det_thresh=0.5 and OKS-NMS is effectively disabled with
+# oks_thr=1.0. This keeps the external tracker from gaining a different
+# score threshold or duplicate-suppression stage before association.
 #
 # The PoseGCN network is imported unmodified from the submodule and loaded
 # with the published pose_gcn.pth.tar. Fetch it once with:
@@ -55,8 +59,8 @@ post_processor = dict(
     filters=[
         dict(
             type='OKSNMS',
-            score_thr=0.3,
-            oks_thr=0.9,
+            score_thr=0.5,
+            oks_thr=1.0,
             score_mode='auto',
         ),
         dict(

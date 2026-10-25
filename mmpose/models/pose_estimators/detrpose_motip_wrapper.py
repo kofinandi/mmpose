@@ -39,7 +39,20 @@ wrapper must set ``emits_track_ids = True`` so the driver calls
 - Detection filtering is ``PoseRuntimeTracker``'s ``det_thresh`` /
   ``newborn_thresh`` / ``id_thresh`` / ``area_thresh``, not a wrapper
   score cut.  ``score_thr`` is accepted for API compatibility and is
-  not applied.
+  not applied.  ``tracker_miss_tolerance`` comes from the LazyConfig.
+  When that config sets ``sample_stride_schedule``, the tracker attends
+  only at those frames-ago distances (``history_frames_ago``), matching
+  ``evaluate_motip``.
+- When the LazyConfig sets ``instance_embed_head``, ``predict()`` runs
+  ``apply_instance_embed_head`` on the detector outputs before
+  ``TrackPostProcess``, matching ``evaluate_motip``.  Checkouts without
+  that function (plain MOTIP) skip it.
+- ``detector_only=True`` still loads the full checkpoint (the detector
+  weights are the ones trained inside MOTIP) but ``predict()`` stops
+  after ``part='detr'`` and ``TrackPostProcess``.  The trajectory model
+  and ID decoder are not executed, and no ``track_ids`` are written.
+  Pair that config with ``emits_track_ids = False`` and a
+  ``--post-config`` tracker.
 - Resize in the MMPose pipeline is OpenCV bilinear 640x640
   (``BottomupRandomChoiceResize``, ``keep_ratio=False``).  Upstream eval
   uses torchvision/PIL bilinear.  Pixel-level keypoints can differ
@@ -68,6 +81,7 @@ Usage::
 from __future__ import annotations
 
 import os
+import pickle
 import sys
 from typing import Any, Dict, Optional, Sequence
 
@@ -205,7 +219,48 @@ def _tracker_kwargs_from_cfg(cfg: Any,
     kwargs['assignment_protocol'] = str(kwargs['assignment_protocol'])
     for key in ('det_thresh', 'newborn_thresh', 'id_thresh', 'area_thresh'):
         kwargs[key] = float(kwargs[key])
+    # Exponential-stride checkpoints attend only at the trained frames-ago
+    # distances. evaluate_motip builds the same list from
+    # training_params.sample_stride_schedule. Uniform-stride configs leave
+    # it unset, so the tracker keeps every stored frame.
+    schedule = _cfg_get(params, 'sample_stride_schedule', None)
+    if schedule:
+        from src.data.stride_schedule import frames_ago_from_schedule
+        kwargs['history_frames_ago'] = frames_ago_from_schedule(schedule)
     return kwargs
+
+
+class _MotipPickleStub:
+    """Stand-in for checkpoint objects the vendored MOTIP tree cannot import.
+
+    ``train_motip.py`` pickles the whole trainer blob, including ``args``
+    that reference dataset-specific evaluators (for example
+    ``src.data.dancetrack_eval``).  Inference only needs ``ck['model']``.
+    """
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def __setstate__(self, state):
+        self._state = state
+
+
+class _MotipTolerantUnpickler(pickle.Unpickler):
+    """Unpickler that stubs classes missing from this checkout."""
+
+    def find_class(self, mod_name, name):
+        try:
+            return super().find_class(mod_name, name)
+        except (AttributeError, ModuleNotFoundError):
+            return type(name, (_MotipPickleStub, ), {'__module__': mod_name})
+
+
+class _MotipTolerantPickle:
+    Unpickler = _MotipTolerantUnpickler
+
+    @staticmethod
+    def load(*args, **kwargs):
+        return pickle.load(*args, **kwargs)
 
 
 def _load_motip_state_dict(checkpoint: str, use_ema: bool) -> dict:
@@ -218,7 +273,11 @@ def _load_motip_state_dict(checkpoint: str, use_ema: bool) -> dict:
     if not os.path.isfile(checkpoint):
         raise FileNotFoundError(
             f'MOTIP checkpoint not found: {checkpoint}.')
-    ckpt = torch.load(checkpoint, map_location='cpu', weights_only=False)
+    ckpt = torch.load(
+        checkpoint,
+        map_location='cpu',
+        weights_only=False,
+        pickle_module=_MotipTolerantPickle)
     if not isinstance(ckpt, dict):
         raise RuntimeError(
             f'Unexpected MOTIP checkpoint type {type(ckpt)} in {checkpoint}')
@@ -269,6 +328,10 @@ class DETRPoseMOTIPEstimator(BaseModel):
         score_thr (float): Unused.  Filtering is ``PoseRuntimeTracker``'s
             ``det_thresh``.  Kept so configs can share a field with
             :class:`DETRPoseEstimator`.
+        detector_only (bool): Run the detector and ``TrackPostProcess``
+            only.  The tracking head is loaded with the checkpoint but
+            never called, and predictions carry no ``track_ids``.
+            Default ``False``.
         device (str): Unused at build time; weights stay CPU until
             ``.to(device)`` from ``init_model``.
         data_preprocessor (dict | None): ``PoseDataPreprocessor`` config.
@@ -285,6 +348,7 @@ class DETRPoseMOTIPEstimator(BaseModel):
         use_ema: bool = False,
         map_to_coco: bool = True,
         score_thr: float = 0.0,
+        detector_only: bool = False,
         device: str = 'cuda:0',
         data_preprocessor: Optional[dict] = None,
         init_cfg=None,
@@ -296,6 +360,7 @@ class DETRPoseMOTIPEstimator(BaseModel):
             data_preprocessor=data_preprocessor, init_cfg=init_cfg)
 
         self.score_thr = float(score_thr)
+        self.detector_only = bool(detector_only)
         self._device_hint = device
         self.use_ema = bool(use_ema)
 
@@ -342,6 +407,19 @@ class DETRPoseMOTIPEstimator(BaseModel):
         self.motip.eval()
         self.postprocessor.eval()
 
+        try:
+            from src.models.motip.motip import apply_instance_embed_head
+        except ImportError:
+            apply_instance_embed_head = None
+        if (getattr(self.motip, 'instance_embed_head', None) is not None
+                and apply_instance_embed_head is None):
+            raise RuntimeError(
+                'This MOTIP config builds an instance_embed_head, but '
+                f'{motip_root} has no apply_instance_embed_head. Point '
+                'motip_root at the training checkout that defines '
+                'InstanceEmbedHead.')
+        self._apply_instance_embed_head = apply_instance_embed_head
+
         self.map_to_coco = bool(map_to_coco)
         if self.map_to_coco and self.num_body_points != 15:
             raise ValueError(
@@ -358,7 +436,12 @@ class DETRPoseMOTIPEstimator(BaseModel):
         Constructs a fresh :class:`PoseRuntimeTracker` on the current
         device.  Must not run in ``__init__``: ``init_model`` only calls
         ``.to(device)`` afterwards, and the tracker caches GPU tensors.
+
+        A no-op when ``detector_only`` is set: there is no tracker to reset.
         """
+        if self.detector_only:
+            self.tracker = None
+            return
         device = next(self.motip.parameters()).device
         self.tracker = self._PoseRuntimeTracker(
             self.motip,
@@ -388,12 +471,14 @@ class DETRPoseMOTIPEstimator(BaseModel):
         return torch.tensor(
             orig_list, dtype=torch.float32, device=inputs.device)
 
-    def _pack_frame(self, track_result: dict):
-        scores = track_result['scores'].detach().float().cpu().numpy()
-        keypoints = track_result['keypoints'].detach().float().cpu().numpy()
-        track_ids = track_result['track_ids'].detach().cpu().numpy()
+    def _pack_pose(self, scores: np.ndarray, keypoints: np.ndarray):
+        """Map detector keypoints onto the benchmark layout.
 
-        n = int(scores.shape[0])
+        Per-joint scores are ``1`` on the native joints.  Upstream does
+        not predict a per-joint confidence; ``map_to_coco`` leaves the
+        four COCO face joints that have no native source at score ``0``.
+        """
+        n = int(np.asarray(scores).shape[0])
         out_k = 17 if self.map_to_coco else self.num_body_points
         if n == 0:
             return (
@@ -401,50 +486,71 @@ class DETRPoseMOTIPEstimator(BaseModel):
                 np.zeros((0, out_k), dtype=np.float32),
                 np.zeros((0, 4), dtype=np.float32),
                 np.zeros((0, ), dtype=np.float32),
-                np.zeros((0, ), dtype=np.int32),
             )
 
-        native = keypoints.reshape(n, self.num_body_points, 3)
+        native = np.asarray(keypoints).reshape(n, self.num_body_points, 3)
         native_kpts = native[:, :, :2].astype(np.float32)
         native_scores = np.ones((n, self.num_body_points), dtype=np.float32)
         bboxes = _bboxes_from_keypoints(native_kpts)
-        bbox_scores = scores.astype(np.float32)
+        bbox_scores = np.asarray(scores, dtype=np.float32).reshape(-1)
         if self.map_to_coco:
             kpts, kpt_scores = _pt21_15_to_coco(native_kpts, native_scores)
         else:
             kpts, kpt_scores = native_kpts, native_scores
-        return (
-            kpts, kpt_scores, bboxes, bbox_scores,
-            np.asarray(track_ids, dtype=np.int32).reshape(-1),
-        )
+        return kpts, kpt_scores, bboxes, bbox_scores
+
+    def _assign_pose(self, pred: InstanceData, packed) -> None:
+        kpts, kpt_scores, bboxes, bbox_scores = packed
+        pred.keypoints = kpts
+        pred.keypoint_scores = kpt_scores
+        pred.keypoints_visible = kpt_scores
+        pred.bboxes = bboxes
+        pred.bbox_scores = bbox_scores
+
+    def _pack_frame(self, track_result: dict):
+        scores = track_result['scores'].detach().float().cpu().numpy()
+        keypoints = track_result['keypoints'].detach().float().cpu().numpy()
+        track_ids = track_result['track_ids'].detach().cpu().numpy()
+        packed = self._pack_pose(scores, keypoints)
+        n = packed[0].shape[0]
+        ids = (np.zeros((0, ), dtype=np.int32) if n == 0 else
+               np.asarray(track_ids, dtype=np.int32).reshape(-1))
+        return (*packed, ids)
 
     def predict(self, inputs: torch.Tensor,
                 data_samples: SampleList) -> SampleList:
-        """Run detector + MOTIP tracker and pack ``pred_instances``."""
+        """Run the detector, and the MOTIP tracker unless ``detector_only``."""
         if isinstance(inputs, (list, tuple)):
             inputs = torch.stack(list(inputs), dim=0)
-        if self.tracker is None:
+        if not self.detector_only and self.tracker is None:
             self.reset_tracking()
 
         orig_sizes = self._orig_sizes(inputs, data_samples)
         with torch.no_grad():
             outputs = self.motip(part='detr', samples=inputs)
+            # evaluate_motip replaces instance_embeds with the head output
+            # before TrackPostProcess gathers them for the tracker.
+            # The detector-only path never reads those embeddings.
+            if (not self.detector_only
+                    and self._apply_instance_embed_head is not None):
+                self._apply_instance_embed_head(self.motip, outputs)
             results: Sequence[dict] = self.postprocessor(outputs, orig_sizes)
 
         for i, result in enumerate(results):
-            track_result = self.tracker.update(
-                result['scores'], result['keypoints'],
-                result['instance_embeds'])
-            kpts, kpt_scores, bboxes, bbox_scores, track_ids = \
-                self._pack_frame(track_result)
-
             pred = InstanceData()
-            pred.keypoints = kpts
-            pred.keypoint_scores = kpt_scores
-            pred.keypoints_visible = kpt_scores
-            pred.bboxes = bboxes
-            pred.bbox_scores = bbox_scores
-            pred.track_ids = track_ids
+            if self.detector_only:
+                scores = result['scores'].detach().float().cpu().numpy()
+                keypoints = result['keypoints'].detach().float().cpu().numpy()
+                self._assign_pose(pred, self._pack_pose(scores, keypoints))
+            else:
+                track_result = self.tracker.update(
+                    result['scores'], result['keypoints'],
+                    result['instance_embeds'])
+                kpts, kpt_scores, bboxes, bbox_scores, track_ids = \
+                    self._pack_frame(track_result)
+                self._assign_pose(
+                    pred, (kpts, kpt_scores, bboxes, bbox_scores))
+                pred.track_ids = track_ids
             data_samples[i].pred_instances = pred
 
         return data_samples
