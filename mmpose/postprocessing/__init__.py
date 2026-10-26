@@ -18,8 +18,8 @@ Example usage::
 """
 
 from .base import BaseFilter, sequence_key_from_path
-from .filters import (BoxMOTTracker, DetectAndTrackLinker, GPKalmanSmoother,
-                       LightTrackTracker, OKSNMS, OKSTracker,
+from .filters import (BoxMOTTracker, DetectAndTrackLinker, EMASmoother,
+                       GPKalmanSmoother, LightTrackTracker, OKSNMS, OKSTracker,
                        OneEuroSmoother, PGPTTracker, PredictiveTracker,
                        SmoothNetSmoother)
 from .matchers import (BaseAppearanceEmbedder, BasePoseMatcher,
@@ -37,6 +37,7 @@ from .registry import (POST_PROCESS_APPEARANCE_EMBEDDERS,
 __all__ = [
     'BaseFilter',
     'sequence_key_from_path',
+    'EMASmoother',
     'GPKalmanSmoother',
     'OKSNMS',
     'OKSTracker',
