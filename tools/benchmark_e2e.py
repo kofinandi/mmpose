@@ -103,7 +103,7 @@ except (ImportError, ModuleNotFoundError):
 BBoxItem = collections.namedtuple(
     'BBoxItem',
     ['frame_id', 'img_id', 'img', 'clip_imgs', 'bbox_xyxy', 'det_score',
-     'n_bboxes_in_frame', 'frame_start_wall'],
+     'n_bboxes_in_frame', 'frame_start_wall', 'track_id'],
 )
 # Zero-detection marker: same FIFO as BBoxItem, so an online post-processor
 # sees every frame in dataset order (including empty ones) without the
@@ -496,12 +496,79 @@ def build_det_evaluator(
 
 # ── Sample → PoseDataSample helpers ──────────────────────────────────────
 
+def _track_ids_from_box_results(res_scores):
+    """Return ``int32`` ids when every box result carries one.
+
+    Results are ``(pose, det_score)`` or ``(pose, det_score, track_id)``.
+    ``track_id is None`` means the detector did not assign identities.
+    A mixture of assigned and missing ids is a producer bug.
+    """
+    if not res_scores:
+        return None
+    track_ids = [
+        item[2] if len(item) > 2 else None for item in res_scores
+    ]
+    if all(track_id is None for track_id in track_ids):
+        return None
+    if any(track_id is None for track_id in track_ids):
+        raise RuntimeError(
+            'Some boxes in a frame have detector track ids and some do '
+            'not. The producer must attach an id to every box from a '
+            'tracking detector.')
+    return np.asarray(track_ids, dtype=np.int32)
+
+
+def _filter_detections(
+    pred,
+    det_cat_id: int,
+    bbox_thr: float,
+    nms_thr: float,
+    *,
+    apply_nms: bool,
+):
+    """Keep person boxes above ``bbox_thr``, optionally NMS them.
+
+    When ``pred`` carries ``track_ids``, the same index mask is applied
+    so identities stay aligned with the boxes that remain. ``apply_nms``
+    is false for a detector that already associated those boxes: NMS
+    would drop overlapping people that tracker kept.
+    """
+    labels = np.asarray(pred.labels).reshape(-1)
+    scores = np.asarray(pred.scores, dtype=np.float32).reshape(-1)
+    bboxes = np.asarray(pred.bboxes, dtype=np.float32).reshape(-1, 4)
+    mask = np.logical_and(labels == det_cat_id, scores > bbox_thr)
+    bboxes = bboxes[mask]
+    scores = scores[mask]
+    track_ids = None
+    if 'track_ids' in pred:
+        track_ids = np.asarray(pred.track_ids).reshape(-1)[mask]
+    if apply_nms and bboxes.shape[0] > 0:
+        packed = np.concatenate([bboxes, scores[:, None]], axis=1)
+        keep = nms(packed, nms_thr)
+        bboxes = packed[keep, :4]
+        scores = packed[keep, 4]
+        if track_ids is not None:
+            track_ids = np.asarray(track_ids)[keep]
+    if bboxes.shape[0] == 0:
+        bboxes = np.zeros((0, 4), dtype=np.float32)
+        scores = np.zeros((0, ), dtype=np.float32)
+        if track_ids is not None:
+            track_ids = np.zeros((0, ), dtype=np.int32)
+    else:
+        bboxes = np.ascontiguousarray(bboxes, dtype=np.float32)
+        scores = np.ascontiguousarray(scores, dtype=np.float32)
+        if track_ids is not None:
+            track_ids = np.ascontiguousarray(track_ids, dtype=np.int32)
+    return bboxes, scores, track_ids
+
+
 def _merge_pose_predictions_to_posedatasample(
     img_id: int,
     bbox_results: list,
     det_scores: List[float],
     ori_shape: Tuple[int, int],
     img_path: Optional[str] = None,
+    track_ids: Optional[np.ndarray] = None,
 ) -> PoseDataSample:
     """Merge per-bbox keypoint results into a single per-image PoseDataSample.
 
@@ -526,6 +593,9 @@ def _merge_pose_predictions_to_posedatasample(
         pred_inst.keypoint_scores = np.zeros((0, num_kpts), dtype=np.float32)
         pred_inst.bboxes = np.zeros((0, 4), dtype=np.float32)
         pred_inst.bbox_scores = np.zeros(0, dtype=np.float32)
+        if track_ids is not None:
+            pred_inst.track_ids = np.asarray(
+                track_ids, dtype=np.int32).reshape(-1)
         ds.pred_instances = pred_inst
         return ds
 
@@ -536,6 +606,9 @@ def _merge_pose_predictions_to_posedatasample(
 
     merged = merge_data_samples(bbox_results)
     merged.pred_instances.bbox_scores = np.array(det_scores, dtype=np.float32)
+    if track_ids is not None:
+        merged.pred_instances.track_ids = np.asarray(
+            track_ids, dtype=np.int32).reshape(-1)
 
     # Use a list of unique synthetic IDs to trigger the bottomup code path
     # inside CocoMetric._sort_and_unique_bboxes (which early-returns when
@@ -713,10 +786,11 @@ def _emit_postprocessed_frame(
         res_scores = frame_results[fid]
         pred_ds = _merge_pose_predictions_to_posedatasample(
             img_id,
-            [r for r, _ in res_scores],
-            [s for _, s in res_scores],
+            [r for r, *_ in res_scores],
+            [s for _, s, *_ in res_scores],
             (h, w),
             img_path=sample.img_path,
+            track_ids=_track_ids_from_box_results(res_scores),
         )
     else:
         pred_ds = _merge_pose_predictions_to_posedatasample(
@@ -986,6 +1060,7 @@ def _mock_detector_producer(
                         det_score=float(score),
                         n_bboxes_in_frame=n_bboxes,
                         frame_start_wall=wall_start,
+                        track_id=None,
                     ))
 
     bbox_queue.put(_SENTINEL)
@@ -1012,12 +1087,23 @@ def _detector_producer(
     """Producer: run detector and push BBoxItems into bbox_queue.
 
     A sample whose image failed to decode (``image is None``, only
-    possible in chunked-prefetch mode) is fed to the detector as a blank
-    placeholder (to keep batch construction simple) but its result is
-    always forced to a zero-detection frame, since there is no real image
-    to run the keypoint model on either way.
+    possible in chunked-prefetch mode) is fed to a stateless detector as
+    a blank placeholder (to keep batch construction simple) but its
+    result is always forced to a zero-detection frame, since there is no
+    real image to run the keypoint model on either way.
+
+    A detector with ``emits_track_ids`` is stepped on one real frame at
+    a time, in dataset order. ``reset_tracking()`` runs when
+    :func:`_clip_seq_key` changes. A failed decode is not passed in,
+    because a blank image would be tracked as a real observation.
+    ``--det-batch-size`` still groups the stream for logging, but it
+    does not batch the tracker forward. NMS is skipped so overlapping
+    people the tracker kept are not deleted. ``bbox_thr`` still applies,
+    and the same mask indexes ``track_ids``.
     """
     n_batches = -(-n_images // det_batch_size)
+    stateful = bool(getattr(detector, 'emits_track_ids', False))
+    tracker_seq = None
 
     for batch_idx, batch in enumerate(sample_batches):
         batch_start = batch[0].frame_id
@@ -1027,14 +1113,27 @@ def _detector_producer(
         for item in batch:
             frame_start_times[item.frame_id] = wall_start
 
-        imgs = [
-            item.image if item.image is not None
-            else _blank_image(item.sample.ori_shape)
-            for item in batch
-        ]
         with torch.no_grad():
             with _CudaTimer() as timer:
-                det_results = inference_det_model(detector, imgs)
+                if not stateful:
+                    imgs = [
+                        item.image if item.image is not None
+                        else _blank_image(item.sample.ori_shape)
+                        for item in batch
+                    ]
+                    det_results = inference_det_model(detector, imgs)
+                else:
+                    det_results = []
+                    for item in batch:
+                        if item.image is None:
+                            det_results.append(None)
+                            continue
+                        seq_key = _clip_seq_key(item.sample)
+                        if seq_key != tracker_seq:
+                            detector.reset_tracking()
+                            tracker_seq = seq_key
+                        det_results.append(
+                            inference_det_model(detector, [item.image])[0])
 
         wall_after_det = time.perf_counter()
 
@@ -1049,8 +1148,8 @@ def _detector_producer(
                   f'| frames processed: {batch_end} '
                   f'| running FPS: {fps_so_far:.1f}')
 
-        for (frame_id, sample, orig_img, clip), img, det_result in zip(
-                batch, imgs, det_results):
+        for (frame_id, sample, orig_img, clip), det_result in zip(
+                batch, det_results):
             img_id = sample.img_id
             h, w = sample.ori_shape
             decode_failed = orig_img is None
@@ -1058,21 +1157,18 @@ def _detector_producer(
             if decode_failed:
                 bboxes_xyxy = np.zeros((0, 4), dtype=np.float32)
                 scores = np.zeros(0, dtype=np.float32)
+                track_ids = None
             else:
                 pred = det_result.pred_instances.cpu().numpy()
-
-                mask = np.logical_and(pred.labels == det_cat_id,
-                                      pred.scores > bbox_thr)
-                bboxes_s = np.concatenate(
-                    [pred.bboxes[mask], pred.scores[mask, None]], axis=1)
-
-                if bboxes_s.shape[0] > 0:
-                    keep = nms(bboxes_s, nms_thr)
-                    bboxes_xyxy = bboxes_s[keep, :4]
-                    scores = bboxes_s[keep, 4]
-                else:
-                    bboxes_xyxy = bboxes_s[:, :4]
-                    scores = np.array([], dtype=np.float32)
+                bboxes_xyxy, scores, track_ids = _filter_detections(
+                    pred, det_cat_id, bbox_thr, nms_thr,
+                    apply_nms=not stateful)
+                if (stateful and len(bboxes_xyxy) > 0
+                        and track_ids is None):
+                    raise RuntimeError(
+                        f'{type(detector).__name__} declares '
+                        'emits_track_ids but returned boxes without '
+                        'pred_instances.track_ids.')
 
             det_predictions[frame_id] = (bboxes_xyxy, scores)
             n_bboxes = 0 if decode_failed else len(bboxes_xyxy)
@@ -1080,6 +1176,7 @@ def _detector_producer(
             clip_imgs = (
                 _fill_blank_clip(clip, sample.ori_shape)
                 if clip is not None else None)
+            img = orig_img if orig_img is not None else _blank_image((h, w))
 
             if n_bboxes == 0:
                 _enqueue_zero_det_frame(
@@ -1087,7 +1184,12 @@ def _detector_producer(
                     bbox_queue, zero_det_frames, frame_end_times,
                     post_pipeline, wall_after_det)
             else:
-                for bbox, score in zip(bboxes_xyxy, scores):
+                if track_ids is None:
+                    id_iter = [None] * len(scores)
+                else:
+                    id_iter = [int(track_id) for track_id in track_ids]
+                for bbox, score, track_id in zip(
+                        bboxes_xyxy, scores, id_iter):
                     bbox_queue.put(BBoxItem(
                         frame_id=frame_id,
                         img_id=img_id,
@@ -1097,6 +1199,7 @@ def _detector_producer(
                         det_score=float(score),
                         n_bboxes_in_frame=n_bboxes,
                         frame_start_wall=wall_start,
+                        track_id=track_id,
                     ))
 
     bbox_queue.put(_SENTINEL)
@@ -1215,7 +1318,8 @@ def _keypoint_consumer(
             if fid not in frame_results:
                 frame_results[fid] = []
                 frame_counts[fid] = item.n_bboxes_in_frame
-            frame_results[fid].append((result, item.det_score))
+            frame_results[fid].append(
+                (result, item.det_score, item.track_id))
             if len(frame_results[fid]) >= frame_counts[fid]:
                 completed.append((fid, item.img_id, item.img))
         emit_completed(completed, t_end)
@@ -1507,10 +1611,11 @@ def run_topdown(
                 res_scores = frame_results[fid]
                 pred_ds = _merge_pose_predictions_to_posedatasample(
                     img_id,
-                    [r for r, _ in res_scores],
-                    [s for _, s in res_scores],
+                    [r for r, *_ in res_scores],
+                    [s for _, s, *_ in res_scores],
                     (h, w),
                     img_path=sample.img_path,
+                    track_ids=_track_ids_from_box_results(res_scores),
                 )
             else:
                 pred_ds = _merge_pose_predictions_to_posedatasample(
@@ -2322,6 +2427,23 @@ def main():
             f'own tracking, or benchmark a non-tracking pose config with '
             f'--post-config to compare against it.')
 
+    det_emits_track_ids = False
+    if use_real_detector:
+        det_cfg = Config.fromfile(args.det_config)
+        det_emits_track_ids = bool(det_cfg.get('emits_track_ids', False))
+    if det_emits_track_ids and emits_track_ids:
+        raise ValueError(
+            f'{args.det_config} and {args.pose_config} both declare '
+            f'emits_track_ids=True. The pose model would assign its own IDs '
+            f'and the reported association would not be the detector\'s. '
+            f'Use a pose config that does not emit track IDs.')
+    if det_emits_track_ids and getattr(args, 'post_config', None):
+        raise ValueError(
+            f'{args.det_config} declares emits_track_ids=True, so the '
+            f'detector assigns track IDs during inference. Adding a '
+            f'post-processing tracker via --post-config would overwrite '
+            f'them. Drop --post-config to score the detector\'s association.')
+
     # ── Unified data loading ───────────────────────────────────────────────
     print(f'\nLoading dataset: {args.test_dataset}')
     if args.prefetch_chunk_size > 0:
@@ -2456,15 +2578,26 @@ def main():
             print(f'  KP model : {args.pose_config}\n')
             detector = init_det_model(
                 args.det_config, args.det_checkpoint, device=args.device)
+            if bool(getattr(detector, 'emits_track_ids', False)):
+                if post_pipeline is not None:
+                    raise ValueError(
+                        f'{type(detector).__name__} emits track IDs. '
+                        '--post-config would overwrite them.')
+                print('  Detector assigns track IDs. Frames are stepped '
+                      'one at a time and NMS is not applied.')
 
         kp_model = init_model(
             args.pose_config, args.pose_checkpoint, device=args.device,
             cfg_options=args.cfg_options or None)
         dataset_meta = kp_model.dataset_meta
+        det_tracks = bool(
+            detector is not None and getattr(detector, 'emits_track_ids', False))
         evaluator = build_evaluator(
             pose_cfg, eval_meta, args.test_dataset,
-            include_tracking_metrics=post_pipeline is not None,
-            full_tracking_metrics=post_pipeline is not None)
+            include_tracking_metrics=(
+                post_pipeline is not None or det_tracks),
+            full_tracking_metrics=(
+                post_pipeline is not None or det_tracks))
         pose_model = kp_model
 
         t_infer_start = time.perf_counter()
@@ -2489,6 +2622,8 @@ def main():
         infer_wall_s = time.perf_counter() - t_infer_start
 
         mode_suffix = 'mock-detector' if args.mock_detector else args.queue_strategy
+        if detector is not None and getattr(detector, 'emits_track_ids', False):
+            mode_suffix = f'{mode_suffix}, detector-tracks'
         mode = f'topdown (strategy={mode_suffix})'
 
     # ── Bottomup mode ──────────────────────────────────────────────────────

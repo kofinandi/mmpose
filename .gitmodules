@@ -44,3 +44,6 @@
 [submodule "external/detrpose-motip"]
 	path = external/detrpose-motip
 	url = git@github.com:kofinandi/detrpose-motip.git
+[submodule "external/MOTIP"]
+	path = external/MOTIP
+	url = https://github.com/MCG-NJU/MOTIP.git

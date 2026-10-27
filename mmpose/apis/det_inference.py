@@ -24,11 +24,13 @@ except (ImportError, ModuleNotFoundError):
 CUSTOM_DETECTOR_TYPES = frozenset({
     'UltralyticsYOLODetector',
     'RFDETRDetector',
+    'MOTIPDetector',
 })
 
 _CHECKPOINT_FIELDS = {
     'UltralyticsYOLODetector': 'weights',
     'RFDETRDetector': 'pretrain_weights',
+    'MOTIPDetector': 'checkpoint',
 }
 
 
@@ -40,8 +42,8 @@ def init_det_model(
     """Initialize a detector from a config file.
 
     For custom detector configs (``UltralyticsYOLODetector``,
-    ``RFDETRDetector``), builds the wrapper directly.  Otherwise delegates
-    to MMDetection's ``init_detector``.
+    ``RFDETRDetector``, ``MOTIPDetector``), builds the wrapper directly.
+    Otherwise delegates to MMDetection's ``init_detector``.
     """
     if not HAS_MMDET:
         raise ImportError(
