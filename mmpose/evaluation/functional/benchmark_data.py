@@ -21,9 +21,10 @@ from typing import Dict, Iterator, List, Optional, Tuple
 
 import mmcv
 import numpy as np
-from mmengine.registry import DATASETS, TRANSFORMS, init_default_scope
+from mmengine.registry import DATASETS, init_default_scope
 
 from mmpose.evaluation.benchmark_datasets import BENCHMARK_TEST_DATASETS
+from mmpose.evaluation.functional.keypoint_space import make_gt_converter
 from mmpose.structures.bbox import bbox_xyxy2xywh
 
 # Dataset types that accept a `good_frame_mask` kwarg (see EmdbDataset /
@@ -39,7 +40,11 @@ _SUPPORTS_GOOD_FRAME_MASK = {
 
 @dataclass
 class GTInstance:
-    """Per-instance ground-truth annotation in COCO-17 keypoint format."""
+    """Per-instance ground-truth annotation in the benchmark keypoint layout.
+
+    That layout is COCO-17 when ``keypoint_space='coco'`` (the default) and
+    the dataset's own convention when ``keypoint_space='dataset'``.
+    """
 
     keypoints: np.ndarray           # (K, 2) float32
     keypoints_visible: np.ndarray   # (K,)   float32, binary 0/1
@@ -48,7 +53,7 @@ class GTInstance:
     id: int
     category_id: int = 1
     iscrowd: int = 0
-    num_keypoints: int = 0          # visible kps in COCO-17 space
+    num_keypoints: int = 0          # visible keypoints in the eval layout
     # Raw COCO visibility (0=unlabeled, 1=occluded, 2=visible), when
     # available from raw_ann_info. None for non-COCO / converted datasets.
     keypoints_visible_coco: Optional[np.ndarray] = None
@@ -179,12 +184,16 @@ def build_unified_samples(
     dataset_name: str,
     num_frames: Optional[int] = None,
     include_bad_frames: bool = False,
+    keypoint_space: str = 'coco',
 ) -> List[UnifiedSample]:
     """Load GT annotations (metadata only, no pixel data) for all datasets.
 
     Returns one :class:`UnifiedSample` per unique image (including images
     with zero annotations so the denominator for recall is correct), with
-    ``image=None``. Keypoints are always converted to COCO-17 format.
+    ``image=None``. ``keypoint_space='coco'`` converts ground truth to
+    COCO-17 by joint name. ``keypoint_space='dataset'`` keeps the dataset
+    convention. Joints that do not exist on both sides are dropped; none
+    are invented.
 
     The raw annotation data is obtained via
     :meth:`BaseCocoStyleDataset._load_annotations` **without** any
@@ -214,6 +223,8 @@ def build_unified_samples(
             (MPJVE/MPJAE) exclude them regardless, via frame_id-gap
             masking. Ignored (with a warning) for datasets that don't
             support the kwarg. Default: ``False``.
+        keypoint_space: ``'coco'`` (default) or ``'dataset'``. See
+            :func:`mmpose.evaluation.functional.keypoint_space.eval_convention`.
 
     Returns:
         List of :class:`UnifiedSample` (``image=None``) in dataset order.
@@ -249,6 +260,7 @@ def build_unified_samples(
                 f'{dataset_name!r} ({spec.dataset_type!r} has no '
                 f'good_frame_mask concept); ignoring.')
     keypoint_src = spec.keypoint_src
+    kp_converter = make_gt_converter(keypoint_src, keypoint_space)
 
     # Build dataset with lazy_init=True so full_init (which calls
     # _get_topdown_data_infos filtering) is never triggered.
@@ -294,12 +306,6 @@ def build_unified_samples(
         iid = int(inst['img_id'])
         if iid in img_to_instances:
             img_to_instances[iid].append(inst)
-
-    # ── Keypoint converter ────────────────────────────────────────────────
-    kp_converter = None
-    if keypoint_src != 'coco':
-        kp_converter = TRANSFORMS.build(
-            dict(type='KeypointConverter', src=keypoint_src, dst='coco'))
 
     def _parse_instance(inst: dict) -> GTInstance:
         """Convert a raw dataset instance dict into a :class:`GTInstance`."""
@@ -473,6 +479,7 @@ def load_unified_samples(
     dataset_name: str,
     num_frames: Optional[int] = None,
     include_bad_frames: bool = False,
+    keypoint_space: str = 'coco',
 ) -> List[UnifiedSample]:
     """Load GT annotations and eagerly prefetch every image up front.
 
@@ -490,7 +497,8 @@ def load_unified_samples(
     prefetch_scale = spec.prefetch_scale
 
     samples = build_unified_samples(
-        dataset_name, num_frames, include_bad_frames=include_bad_frames)
+        dataset_name, num_frames, include_bad_frames=include_bad_frames,
+        keypoint_space=keypoint_space)
 
     if prefetch_scale is not None and prefetch_scale != 1.0:
         print(f'Prefetching {len(samples)} images '

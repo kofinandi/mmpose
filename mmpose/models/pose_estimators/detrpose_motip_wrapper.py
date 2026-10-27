@@ -33,7 +33,9 @@ wrapper must set ``emits_track_ids = True`` so the driver calls
   ``head_top`` have no COCO counterpart and are dropped.
 - Bounding boxes stored on ``pred_instances`` are **derived** as
   axis-aligned min/max over the native keypoints (upstream has no box
-  head).
+  head).  ``expand_boxes=True`` grows that extent by the fractions
+  fitted on PoseTrack21 train (17% of width each side, 3% of height
+  above, 11% below).  Default ``False`` leaves the bare extent.
 - Per-keypoint visibility is hard-coded to ``1.0`` upstream; we mirror
   that.
 - Detection filtering is ``PoseRuntimeTracker``'s ``det_thresh`` /
@@ -120,6 +122,17 @@ _PT21_15_TO_COCO = [
     (14, 16),  # right_ankle
 ]
 
+# Native 15-joint order: PoseTrack-17 with ears (indices 3 and 4) removed.
+# Index 0 is nose, 1 head_bottom, 2 head_top, then the 12 body joints.
+# ``_PT21_15_TO_COCO`` starts at native index 3 for the shoulders, so the
+# two head joints are the ones that mapping drops.
+PT21_15_KEYPOINT_NAMES = (
+    'nose', 'head_bottom', 'head_top',
+    'left_shoulder', 'right_shoulder', 'left_elbow', 'right_elbow',
+    'left_wrist', 'right_wrist', 'left_hip', 'right_hip',
+    'left_knee', 'right_knee', 'left_ankle', 'right_ankle',
+)
+
 _TRACKER_CFG_KEYS = (
     ('tracker_det_thresh', 'det_thresh', 0.3),
     ('tracker_newborn_thresh', 'newborn_thresh', 0.6),
@@ -138,6 +151,32 @@ def _bboxes_from_keypoints(keypoints: np.ndarray) -> np.ndarray:
     xy_min = keypoints.min(axis=1)
     xy_max = keypoints.max(axis=1)
     return np.concatenate([xy_min, xy_max], axis=1).astype(np.float32)
+
+
+# PoseTrack21 train, 34,242 persons with all 15 joints labeled.  Coordinate
+# ascent on a 0.01 grid (three passes) maximises mean IoU with the annotated
+# person box: bare extent 0.63 IoU, expanded 0.85.  ``left_right`` is a
+# fraction of the extent width, applied on both sides; ``top`` and
+# ``bottom`` are fractions of the extent height.
+_PT21_BOX_EXPAND = (0.17, 0.03, 0.11)
+
+
+def _expand_keypoint_boxes(boxes: np.ndarray,
+                           left_right: float,
+                           top: float,
+                           bottom: float) -> np.ndarray:
+    """Grow ``(N, 4)`` xyxy keypoint extents. Empty input stays ``(0, 4)``."""
+    boxes = np.asarray(boxes, dtype=np.float32)
+    if boxes.size == 0:
+        return np.zeros((0, 4), dtype=np.float32)
+    width = boxes[:, 2] - boxes[:, 0]
+    height = boxes[:, 3] - boxes[:, 1]
+    out = boxes.copy()
+    out[:, 0] -= left_right * width
+    out[:, 2] += left_right * width
+    out[:, 1] -= top * height
+    out[:, 3] += bottom * height
+    return out
 
 
 def _pt21_15_to_coco(keypoints: np.ndarray, scores: np.ndarray):
@@ -325,6 +364,10 @@ class DETRPoseMOTIPEstimator(BaseModel):
             (MOTIP-S checkpoints store ``ema=None``).
         map_to_coco (bool): Reproject the native 15-keypoint output onto
             COCO-17.  Default ``True``.
+        expand_boxes (bool): Grow the keypoint-extent box by the
+            PoseTrack21-train fit (:data:`_PT21_BOX_EXPAND`).  The box is
+            still taken from the native 15 joints, before
+            ``map_to_coco`` drops the head joints.  Default ``False``.
         score_thr (float): Unused.  Filtering is ``PoseRuntimeTracker``'s
             ``det_thresh``.  Kept so configs can share a field with
             :class:`DETRPoseEstimator`.
@@ -347,6 +390,7 @@ class DETRPoseMOTIPEstimator(BaseModel):
         tracker_cfg: Optional[dict] = None,
         use_ema: bool = False,
         map_to_coco: bool = True,
+        expand_boxes: bool = False,
         score_thr: float = 0.0,
         detector_only: bool = False,
         device: str = 'cuda:0',
@@ -421,11 +465,13 @@ class DETRPoseMOTIPEstimator(BaseModel):
         self._apply_instance_embed_head = apply_instance_embed_head
 
         self.map_to_coco = bool(map_to_coco)
-        if self.map_to_coco and self.num_body_points != 15:
+        self.expand_boxes = bool(expand_boxes)
+        if self.num_body_points != 15:
             raise ValueError(
-                'DETRPoseMOTIPEstimator map_to_coco=True is the PoseTrack21 '
-                '15-keypoint (ears dropped) -> COCO-17 remap. This model '
-                f'reports num_body_points={self.num_body_points}.')
+                'DETRPoseMOTIPEstimator emits either COCO-17 '
+                '(map_to_coco=True) or the native 15-joint PoseTrack layout '
+                '(ears dropped). This model reports '
+                f'num_body_points={self.num_body_points}.')
 
         # Built in reset_tracking() after init_model() moves weights to GPU.
         self.tracker = None
@@ -471,6 +517,22 @@ class DETRPoseMOTIPEstimator(BaseModel):
         return torch.tensor(
             orig_list, dtype=torch.float32, device=inputs.device)
 
+    @property
+    def output_keypoint_names(self):
+        """Joint names of the tensors ``test_step`` writes.
+
+        ``map_to_coco=True`` emits COCO-17 (eyes and ears left at score 0,
+        head joints dropped). ``map_to_coco=False`` emits
+        :data:`PT21_15_KEYPOINT_NAMES`, which still includes
+        ``head_bottom`` and ``head_top``. The benchmark uses this so it
+        does not remap a layout the wrapper already produced.
+        """
+        if self.map_to_coco:
+            from mmpose.datasets.transforms.keypoint_registry import \
+                get_keypoints
+            return list(get_keypoints('coco'))
+        return list(PT21_15_KEYPOINT_NAMES)
+
     def _pack_pose(self, scores: np.ndarray, keypoints: np.ndarray):
         """Map detector keypoints onto the benchmark layout.
 
@@ -492,6 +554,8 @@ class DETRPoseMOTIPEstimator(BaseModel):
         native_kpts = native[:, :, :2].astype(np.float32)
         native_scores = np.ones((n, self.num_body_points), dtype=np.float32)
         bboxes = _bboxes_from_keypoints(native_kpts)
+        if self.expand_boxes:
+            bboxes = _expand_keypoint_boxes(bboxes, *_PT21_BOX_EXPAND)
         bbox_scores = np.asarray(scores, dtype=np.float32).reshape(-1)
         if self.map_to_coco:
             kpts, kpt_scores = _pt21_15_to_coco(native_kpts, native_scores)

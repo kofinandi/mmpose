@@ -12,7 +12,10 @@ whole-pipeline and per-stage granularity.
 
 Data loading is unified: all datasets (coco, crowdpose, mpii, aic, ochuman,
 emdb, 3dpw, posetrack21) go through one code path that loads every
-annotation unfiltered and converts keypoints to COCO-17 format.  EMDB and
+annotation unfiltered and, by default, converts keypoints to COCO-17
+format (``--keypoint-space dataset`` keeps the dataset convention and
+only remaps a model whose joint names differ, dropping joints that do
+not match).  EMDB and
 3DPW downscale images (default ~0.33x) to reduce RAM; GT annotations are
 scaled to match.  GT is never read from the model pipeline; it is assembled
 from :class:`~mmpose.evaluation.functional.benchmark_data.UnifiedSample` and
@@ -74,6 +77,12 @@ from mmpose.evaluation.functional.benchmark_data import (
     build_unified_samples,
     is_valid_instance,
     load_unified_samples,
+)
+from mmpose.evaluation.functional.keypoint_space import (
+    align_prediction_keypoints,
+    evaluation_metainfo,
+    model_output_keypoint_names,
+    names_from_metainfo,
 )
 from mmpose.evaluation.functional.frame_metrics import (
     build_frame_record,
@@ -597,6 +606,8 @@ def _attach_gt_to_posedatasample(
     meta_update: dict = {'id': gt_ids}
     if sample.crowd_index is not None:
         meta_update['crowd_index'] = float(sample.crowd_index)
+    if sample.seq_id is not None:
+        meta_update['seq_id'] = sample.seq_id
     ds.set_metainfo(meta_update)
     return ds
 
@@ -2133,11 +2144,41 @@ def _parse_args():
     p.add_argument(
         '--eval-good-frames-only', action='store_true',
         help='Exclude frames without reliable GT (EMDB/3DPW/PoseTrack21 '
-             '``good_frame=False``) from all metric computation. Inference, '
-             'post-processing, and prediction-bundle export still run over '
-             'every loaded frame. Intended for use with '
-             '--include-bad-frames. Warns (no-op) on datasets without a '
-             'good_frame concept.')
+             '``good_frame=False``) from metric computation. Metrics with '
+             'requires_all_frames (PoseTrack21OfficialMetric) still see '
+             'those frames, because the official box scorer counts '
+             'predictions there. Inference, post-processing, and '
+             'prediction-bundle export still run over every loaded frame. '
+             'Intended for use with --include-bad-frames. Warns (no-op) on '
+             'datasets without a good_frame concept.')
+    p.add_argument(
+        '--keypoint-space', choices=['coco', 'dataset'], default='coco',
+        help='coco (default): score every dataset as COCO-17, dropping '
+             'joints that have no COCO name. dataset: score in the target '
+             'dataset\'s own joint layout, and remap predictions only when '
+             'the model emits a different name list. Unmatched joints are '
+             'left at score 0; none are invented.')
+    p.add_argument(
+        '--official-posetrack21', action='store_true',
+        help='Also score PoseTrack21 with the official eval kit: keypoint '
+             'HOTA, mAP and MOTA, plus box MOTA/IDF1/HOTA under the '
+             'official ignore-region test and the CoMotion/DETRAM fix. '
+             'Only valid with --test-dataset posetrack21.')
+    p.add_argument(
+        '--pt21-eval-root', default=None,
+        help='PoseTrack21 eval/ directory (contains posetrack21/ and mot/). '
+             'Default: $POSETRACK21_EVAL_ROOT, else a known checkout.')
+    p.add_argument(
+        '--pt21-gt-pose', default=None,
+        help='Official per-sequence keypoint JSON directory. Default: '
+             'data/posetrack21/PoseTrack21/posetrack_data/val')
+    p.add_argument(
+        '--pt21-gt-mot', default=None,
+        help='Official MOT sequence directory. Default: '
+             'data/posetrack21/PoseTrack21/posetrack_mot/mot/val')
+    p.add_argument(
+        '--pt21-num-cores', type=int, default=8,
+        help='CPU cores for the official PoseTrack21 kit (default: 8).')
     p.add_argument('--warmup-batches', type=int, default=3,
                    help='Leading batches excluded from timing (default: 3)')
     p.add_argument('--bbox-thr', type=float, default=0.3,
@@ -2286,7 +2327,8 @@ def main():
     if args.prefetch_chunk_size > 0:
         samples = build_unified_samples(
             args.test_dataset, args.num_frames,
-            include_bad_frames=args.include_bad_frames)
+            include_bad_frames=args.include_bad_frames,
+            keypoint_space=args.keypoint_space)
         prefetch_scale = BENCHMARK_TEST_DATASETS[args.test_dataset].prefetch_scale
         print(f'  Chunked prefetch enabled: {len(samples)} images, '
               f'chunk_size={args.prefetch_chunk_size}, '
@@ -2302,7 +2344,8 @@ def main():
     else:
         samples = load_unified_samples(
             args.test_dataset, args.num_frames,
-            include_bad_frames=args.include_bad_frames)
+            include_bad_frames=args.include_bad_frames,
+            keypoint_space=args.keypoint_space)
         sample_stream = SampleImageStream(samples)
     if getattr(args, 'sequence', None):
         needle = args.sequence
@@ -2325,6 +2368,14 @@ def main():
             sample_stream = SampleImageStream(samples)
     n_images = len(samples)
     data_root = _data_root_for_dataset(args.test_dataset)
+    if args.official_posetrack21 and args.test_dataset != 'posetrack21':
+        raise ValueError(
+            '--official-posetrack21 only scores the posetrack21 dataset, '
+            f'not {args.test_dataset!r}.')
+    eval_meta = evaluation_metainfo(args.test_dataset, args.keypoint_space)
+    if args.keypoint_space == 'dataset':
+        print(f'  Keypoint space: dataset '
+              f'({eval_meta.get("dataset_name", args.test_dataset)})')
 
     # Val pipeline from config with GT-only transforms stripped.
     # We never need KeypointConverter in the inference pipeline since GT
@@ -2362,8 +2413,9 @@ def main():
             cfg_options=args.cfg_options or None)
         dataset_meta = model.dataset_meta
         evaluator = build_evaluator(
-            pose_cfg, dataset_meta, args.test_dataset,
+            pose_cfg, eval_meta, args.test_dataset,
             include_tracking_metrics=True, full_tracking_metrics=True)
+        pose_model = model
 
         t_infer_start = time.perf_counter()
         pred_by_img_id, perf = run_tracking(
@@ -2410,9 +2462,10 @@ def main():
             cfg_options=args.cfg_options or None)
         dataset_meta = kp_model.dataset_meta
         evaluator = build_evaluator(
-            pose_cfg, dataset_meta, args.test_dataset,
+            pose_cfg, eval_meta, args.test_dataset,
             include_tracking_metrics=post_pipeline is not None,
             full_tracking_metrics=post_pipeline is not None)
+        pose_model = kp_model
 
         t_infer_start = time.perf_counter()
         pred_by_img_id, perf = run_topdown(
@@ -2448,9 +2501,10 @@ def main():
             cfg_options=args.cfg_options or None)
         dataset_meta = model.dataset_meta
         evaluator = build_evaluator(
-            pose_cfg, dataset_meta, args.test_dataset,
+            pose_cfg, eval_meta, args.test_dataset,
             include_tracking_metrics=post_pipeline is not None,
             full_tracking_metrics=post_pipeline is not None)
+        pose_model = model
 
         val_pipeline = Compose(pipeline_cfg)
 
@@ -2483,6 +2537,29 @@ def main():
             f'--prefetch-chunk-size, --prefetch-workers, or '
             f'--prefetch-queue-chunks.')
 
+    # Predictions are converted once, after inference, so every metric and
+    # the saved bundle share the evaluation layout. Inference itself still
+    # used the model's own metainfo.
+    src_names = model_output_keypoint_names(pose_model)
+    dst_names = names_from_metainfo(eval_meta)
+    if src_names != dst_names:
+        print(f'  Mapping {len(src_names)} model joints -> '
+              f'{len(dst_names)} eval joints '
+              f'(name intersection, unmatched joints dropped)')
+    align_prediction_keypoints(pred_by_img_id, src_names, dst_names)
+    dataset_meta = eval_meta
+    if args.official_posetrack21:
+        official = METRICS.build(dict(
+            type='PoseTrack21OfficialMetric',
+            gt_pose_dir=args.pt21_gt_pose,
+            gt_mot_dir=args.pt21_gt_mot,
+            eval_root=args.pt21_eval_root,
+            num_cores=args.pt21_num_cores,
+        ))
+        official.dataset_meta = eval_meta
+        evaluator.metrics.append(official)
+        print('  Official PoseTrack21 kit: enabled')
+
     # ── Unified evaluation (both modes) ────────────────────────────────────
     eval_good_only = bool(getattr(args, 'eval_good_frames_only', False))
     if eval_good_only and args.test_dataset not in BAD_FRAME_DATASETS:
@@ -2505,6 +2582,10 @@ def main():
             ds = _attach_gt_to_posedatasample(pred_ds, sample)
             if include_in_eval:
                 evaluator.process(data_samples=[ds], data_batch=None)
+            else:
+                for metric in evaluator.metrics:
+                    if getattr(metric, 'requires_all_frames', False):
+                        metric.process(None, [ds])
 
             if frame_records is not None:
                 pred_ds_save = _filter_pred_for_saving(ds, args.save_score_thr)

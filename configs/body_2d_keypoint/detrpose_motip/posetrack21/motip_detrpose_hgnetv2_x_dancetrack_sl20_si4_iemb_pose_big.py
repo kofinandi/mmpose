@@ -29,10 +29,15 @@ _base_ = '../../../_base_/default_runtime.py'
 #
 # Boxes are derived from keypoint min/max (upstream has no box head).
 #
-# Metrics are mmpose CocoMetric + MPJVE/MPJAE + IDSwitch/MOTA/IDF1/HOTA,
-# NOT the official PoseTrack21 evaluator (pose mAP + TrackEval HOTA) that
-# evaluate_motip reports.  Do not compare these numbers to published
-# PoseTrack21 tables or to train_motip.py --eval output.
+# Default metrics are mmpose CocoMetric + MPJVE/MPJAE +
+# IDSwitch/MOTA/IDF1/HOTA.  Those are not the official PoseTrack21
+# evaluator.  --official-posetrack21 adds the kit (keypoint HOTA, mAP,
+# keypoint MOTA, and box MOTA/IDF1/HOTA with the CoMotion/DETRAM
+# ignore-region fix).  --keypoint-space dataset keeps the dataset joint
+# layout; joints the model does not predict stay unscored.  With
+# map_to_coco=True the emitted layout is COCO-17, so head_bottom /
+# head_top are still dropped.  Set map_to_coco=False to pass the native
+# head joints through.
 #
 # Requires omegaconf / cloudpickle / iopath.
 #

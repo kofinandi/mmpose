@@ -11,12 +11,12 @@ from mmengine.logging import MMLogger
 from mmpose.registry import METRICS
 from ..functional import keypoint_mpjae, keypoint_mpjve
 from ..functional.frame_metrics import match_instances_oks
+from ..functional.keypoint_space import torso_index_pairs
 
-# COCO-17 keypoint indices used for torso-diameter normalisation.
-# Torso diameter is the mean of the two cross-torso diagonals:
-#   ||left_shoulder (5)  - right_hip (12)||
-#   ||right_shoulder (6) - left_hip  (11)||
-_TORSO_KP_PAIRS = [(5, 12), (6, 11)]
+# Fallback torso diagonals when the metainfo has no joint names:
+# left_shoulder-right_hip and right_shoulder-left_hip on COCO-17.
+# :func:`torso_index_pairs` resolves the same joints by name so CrowdPose
+# and other layouts do not reuse these indices.
 
 # Mapping from norm_item name to the metric-name prefix used in results.
 _METRIC_PREFIX = {
@@ -188,6 +188,8 @@ class _TemporalBaseMetric(BaseMetric):
         if len(sigmas) == 0:
             return  # no keypoint metadata → skip silently
 
+        torso_pairs = torso_index_pairs(self.dataset_meta)
+
         for data_sample in data_samples:
             pred = data_sample['pred_instances']
             gt = data_sample['gt_instances']
@@ -276,14 +278,19 @@ class _TemporalBaseMetric(BaseMetric):
                     result['head_size'] = float(gt['head_size'])
 
                 if 'torso' in self.norm_item:
+                    k_joints = int(mask.shape[0])
+                    pairs = [
+                        pair for pair in torso_pairs
+                        if pair[0] < k_joints and pair[1] < k_joints
+                    ]
                     sizes = []
-                    for i_idx, j_idx in _TORSO_KP_PAIRS:
+                    for i_idx, j_idx in pairs:
                         if mask[i_idx] and mask[j_idx]:
                             sizes.append(
                                 float(np.linalg.norm(
                                     gt_coords[i_idx] - gt_coords[j_idx])))
                     if not sizes:
-                        for i_idx, j_idx in _TORSO_KP_PAIRS:
+                        for i_idx, j_idx in pairs:
                             sizes.append(
                                 float(np.linalg.norm(
                                     pred_coords[i_idx] - pred_coords[j_idx])))

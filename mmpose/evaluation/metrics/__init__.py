@@ -9,6 +9,7 @@ from .keypoint_3d_metrics import MPJPE
 from .keypoint_partition_metric import KeypointPartitionMetric
 from .mot_metrics import HOTA, IDF1, MOTA
 from .posetrack18_metric import PoseTrack18Metric
+from .posetrack21_official_metric import PoseTrack21OfficialMetric
 from .simple_keypoint_3d_metrics import SimpleMPJPE
 from .temporal_keypoint_metrics import MPJAE, MPJVE
 from .tracking_metrics import IDSwitch
@@ -17,5 +18,6 @@ __all__ = [
     'CocoMetric', 'PCKAccuracy', 'MpiiPCKAccuracy', 'JhmdbPCKAccuracy', 'AUC',
     'EPE', 'NME', 'PoseTrack18Metric', 'CocoWholeBodyMetric',
     'KeypointPartitionMetric', 'MPJPE', 'InterHandMetric', 'SimpleMPJPE',
-    'MPJVE', 'MPJAE', 'FPS', 'IDSwitch', 'MOTA', 'IDF1', 'HOTA'
+    'MPJVE', 'MPJAE', 'FPS', 'IDSwitch', 'MOTA', 'IDF1', 'HOTA',
+    'PoseTrack21OfficialMetric',
 ]

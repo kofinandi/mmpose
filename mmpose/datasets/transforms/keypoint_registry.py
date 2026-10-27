@@ -65,6 +65,31 @@ def get_keypoints(convention: str) -> List[str]:
     return names
 
 
+def get_metainfo(convention: str) -> dict:
+    """Return the parsed pose metainfo for *convention*.
+
+    This is the sigmas, names, and flip indices
+    :func:`mmpose.datasets.datasets.utils.parse_pose_metainfo` produces
+    from the file registered in :data:`_METAINFO_FILES`.
+
+    Args:
+        convention (str): A key in :data:`_METAINFO_FILES`.
+
+    Returns:
+        dict: Parsed metainfo (``num_keypoints``, ``sigmas``,
+        ``keypoint_id2name``, ...).
+
+    Raises:
+        KeyError: If *convention* is not registered.
+    """
+    if convention not in _METAINFO_FILES:
+        raise KeyError(
+            f'Unknown keypoint convention {convention!r}. '
+            f'Registered conventions: {sorted(_METAINFO_FILES)}.')
+    from mmpose.datasets.datasets.utils import parse_pose_metainfo
+    return parse_pose_metainfo(dict(from_file=_METAINFO_FILES[convention]))
+
+
 def get_flip_indices(convention: str) -> Optional[List[int]]:
     """Return the flip index list for *convention*, or ``None`` if unavailable.
 
