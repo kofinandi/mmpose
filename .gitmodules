@@ -47,3 +47,6 @@
 [submodule "external/MOTIP"]
 	path = external/MOTIP
 	url = https://github.com/MCG-NJU/MOTIP.git
+[submodule "external/ml-comotion"]
+	path = external/ml-comotion
+	url = https://github.com/apple-aiml-research/ml-comotion.git

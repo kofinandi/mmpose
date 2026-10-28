@@ -1,6 +1,7 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 from .alphapose_wrapper import AlphaPosePoseEstimator
 from .bottomup import BottomupPoseEstimator
+from .comotion_wrapper import CoMotionPoseEstimator
 from .detrpose_motip_wrapper import DETRPoseMOTIPEstimator
 from .detrpose_wrapper import DETRPoseEstimator
 from .grouppose_wrapper import GroupPosePoseEstimator
@@ -25,5 +26,5 @@ __all__ = [
     'PAVENetPoseEstimator', 'AlphaPosePoseEstimator',
     'OpenPifPafPoseEstimator', 'DETRPoseEstimator',
     'DETRPoseMOTIPEstimator', 'GroupPosePoseEstimator',
-    'QueryPosePoseEstimator'
+    'QueryPosePoseEstimator', 'CoMotionPoseEstimator'
 ]

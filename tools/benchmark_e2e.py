@@ -1729,8 +1729,12 @@ def run_tracking(
     * in topdown mode, runs the detector on that frame inline and hands the
       model **all** of the frame's boxes in a single ``test_step`` call, so
       the model's own association step sees the complete frame;
-    * calls ``model.reset_tracking()`` whenever :func:`_clip_seq_key`
-      changes, i.e. at every video boundary.
+    * calls ``model.finalize_sequence()`` (when the model defines it)
+      at every video boundary and after the last frame, then
+      ``model.reset_tracking()``.  CoMotion uses the first call to run
+      its whole-clip ``cleanup_tracks`` and rewrite the samples already
+      stored for that clip.  ``reset_tracking`` only clears the live
+      tracker.
 
     The model is expected to return one :class:`PoseDataSample` per input
     element with ``pred_instances.track_ids`` already set (``np.int32``,
@@ -1792,6 +1796,8 @@ def run_tracking(
 
         seq_key = _clip_seq_key(sample)
         if seq_key != current_seq:
+            if current_seq is not None and hasattr(model, 'finalize_sequence'):
+                model.finalize_sequence()
             model.reset_tracking()
             current_seq = seq_key
 
@@ -1881,14 +1887,28 @@ def run_tracking(
             print(f'  [tracking] frame {n_done}/{n_images} '
                   f'| running FPS: {fps_so_far:.1f}')
 
+    if current_seq is not None and hasattr(model, 'finalize_sequence'):
+        model.finalize_sequence()
+
     total_s = sum(frame_latencies)
+    cleanup_s = float(getattr(model, 'cleanup_seconds', 0.0) or 0.0)
+    n_timed = len(frame_latencies)
+    # Sequence-level work (CoMotion's cleanup_tracks) is not inside the
+    # per-frame timer.  Spread it across the timed frames so e2e FPS
+    # includes it, in proportion to how much of the run was timed.
+    if n_done > 0 and n_timed > 0 and cleanup_s > 0:
+        timed_s = total_s + cleanup_s * (n_timed / n_done)
+    else:
+        timed_s = total_s
     perf = {
-        'e2e/fps': len(frame_latencies) / total_s if total_s > 0 else 0.0,
+        'e2e/fps': n_timed / timed_s if timed_s > 0 else 0.0,
         'e2e/latency_ms_per_frame': (
-            1000.0 * total_s / len(frame_latencies) if frame_latencies else 0.0
+            1000.0 * timed_s / n_timed if n_timed else 0.0
         ),
         'dataload/stall_s': sample_stream.stall_s,
     }
+    if cleanup_s > 0:
+        perf['tracking/cleanup_s'] = cleanup_s
     timed_det = [t for t in det_timings if t > 0]
     if timed_det:
         perf['detector/fps'] = len(timed_det) / sum(timed_det)
@@ -2533,6 +2553,9 @@ def main():
         model = init_model(
             args.pose_config, args.pose_checkpoint, device=args.device,
             cfg_options=args.cfg_options or None)
+        if hasattr(model, 'finalize_sequence'):
+            print('  Sequence-end finalize_sequence() rewrites each clip '
+                  'before metrics (CoMotion cleanup_tracks).')
         dataset_meta = model.dataset_meta
         evaluator = build_evaluator(
             pose_cfg, eval_meta, args.test_dataset,

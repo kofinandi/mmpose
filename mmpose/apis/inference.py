@@ -32,6 +32,9 @@ CUSTOM_POSE_WRAPPER_TYPES = frozenset({
     # DETRPose-MOTIP trainer dicts (`model`; ema is typically None) are
     # loaded inside DETRPoseMOTIPEstimator.
     'DETRPoseMOTIPEstimator',
+    # CoMotion loads detection and refine checkpoints itself from
+    # external/ml-comotion/src/comotion_demo/data/.
+    'CoMotionPoseEstimator',
     'GroupPosePoseEstimator',
     'QueryPosePoseEstimator',
 })
@@ -41,6 +44,7 @@ _POSE_WRAPPER_CHECKPOINT_FIELDS = {
     'OpenPifPafPoseEstimator': 'checkpoint',
     'DETRPoseEstimator': 'checkpoint',
     'DETRPoseMOTIPEstimator': 'checkpoint',
+    'CoMotionPoseEstimator': 'checkpoint',
     'GroupPosePoseEstimator': 'checkpoint',
     'QueryPosePoseEstimator': 'checkpoint',
 }
