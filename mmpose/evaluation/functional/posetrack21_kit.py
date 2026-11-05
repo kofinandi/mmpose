@@ -679,12 +679,58 @@ def keypoint_map(pose_dir: Path, gt_dir: Path, eval_root: Path,
     return {f'kp_mAP_{part}': float(pose_map[part]) for part in POSE_PARTS}
 
 
+def _is_posetrack_poseval(module) -> bool:
+    """True when ``module`` is the PoseTrack package, not another ``poseval``.
+
+    PGPT ships ``lib/poseval`` with an empty ``__init__.py`` and its code
+    under ``poseval.py``. Putting that ``lib`` directory on ``sys.path``
+    makes ``import poseval`` bind the wrong package. The PoseTrack package
+    has ``eval_helpers.py`` next to its ``__init__.py``.
+    """
+    init = getattr(module, '__file__', None)
+    if not init:
+        return False
+    return Path(init).resolve().parent.joinpath('eval_helpers.py').is_file()
+
+
+def _poseval_root_with_helpers() -> Optional[Path]:
+    """A ``sys.path`` entry whose ``poseval`` package is the PoseTrack one."""
+    seen = set()
+    candidates = [Path(entry) for entry in sys.path if entry]
+    candidates.append(_FALLBACK_POSEVAL)
+    for root in candidates:
+        key = str(root)
+        if key in seen:
+            continue
+        seen.add(key)
+        if (root / 'poseval' / 'eval_helpers.py').is_file():
+            return root
+    return None
+
+
+def _unload_poseval() -> None:
+    for key in list(sys.modules):
+        if key == 'poseval' or key.startswith('poseval.'):
+            del sys.modules[key]
+
+
+def _prefer_sys_path(root: Path) -> None:
+    root_s = str(root)
+    while root_s in sys.path:
+        sys.path.remove(root_s)
+    sys.path.insert(0, root_s)
+
+
 def _import_poseval():
     """``poseval.evaluateTracking``. Its MOTA accumulator imports ``motmetrics``.
 
     The mmpose env often has neither package. The fallback is the known
     poseval checkout, and the kit's own ``motmetrics`` (it still provides
     ``MOTAccumulator``) is placed on the path so that import succeeds.
+
+    A wrong ``poseval`` already in ``sys.modules`` (PGPT's empty package)
+    is dropped first. Otherwise the failed import stays cached and the
+    fallback path never takes effect.
     """
     ensure_numpy_aliases()
 
@@ -692,6 +738,15 @@ def _import_poseval():
         from poseval import eval_helpers
         from poseval.evaluateTracking import evaluateTracking
         return eval_helpers, evaluateTracking
+
+    loaded = sys.modules.get('poseval')
+    if loaded is not None and not _is_posetrack_poseval(loaded):
+        _unload_poseval()
+        loaded = None
+    if loaded is None:
+        root = _poseval_root_with_helpers()
+        if root is not None:
+            _prefer_sys_path(root)
 
     try:
         return _load()
@@ -701,8 +756,12 @@ def _import_poseval():
         import_kit_motmetrics(resolve_eval_root(None))
     except ImportError:
         pass
-    if _FALLBACK_POSEVAL.is_dir() and str(_FALLBACK_POSEVAL) not in sys.path:
-        sys.path.insert(0, str(_FALLBACK_POSEVAL))
+    root = _poseval_root_with_helpers()
+    if root is not None:
+        _prefer_sys_path(root)
+    loaded = sys.modules.get('poseval')
+    if loaded is not None and not _is_posetrack_poseval(loaded):
+        _unload_poseval()
     try:
         return _load()
     except ImportError as exc:

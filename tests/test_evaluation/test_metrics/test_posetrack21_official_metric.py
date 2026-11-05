@@ -7,6 +7,8 @@ kit's raw-17 JSON without invented joints.
 """
 
 import json
+import sys
+import tempfile
 from pathlib import Path
 from unittest import TestCase
 
@@ -19,10 +21,11 @@ from mmengine.structures import InstanceData
 
 from mmpose.datasets.transforms.keypoint_registry import get_keypoints
 from mmpose.evaluation.functional.keypoint_space import evaluation_metainfo
+from mmpose.evaluation.functional import posetrack21_kit
 from mmpose.evaluation.functional.posetrack21_kit import (
-    POSETRACK_RAW_NAMES, VARIANTS, _compact_track_ids, hota_remove_indices,
-    instances_to_raw17, prediction_counts_as_fp, region_overlap,
-    write_sequence_files)
+    POSETRACK_RAW_NAMES, VARIANTS, _compact_track_ids, _import_poseval,
+    hota_remove_indices, instances_to_raw17, prediction_counts_as_fp,
+    region_overlap, write_sequence_files)
 from mmpose.evaluation.metrics.posetrack21_official_metric import (
     PoseTrack21OfficialMetric)
 from mmpose.structures import PoseDataSample
@@ -235,3 +238,50 @@ class TestKitTranslation(TestCase):
         (mot / 'gt.txt').write_text(
             '1,3,0,0,10,20,1,-1,-1,-1\n'
             '2,3,1,1,10,20,1,-1,-1,-1\n')
+
+
+class TestPosevalImport(TestCase):
+    """PGPT's ``lib/poseval`` must not hide the PoseTrack package."""
+
+    def test_shadowed_poseval_is_replaced(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            good = root / 'good'
+            bad = root / 'bad'
+            (good / 'poseval').mkdir(parents=True)
+            (bad / 'poseval').mkdir(parents=True)
+            (good / 'poseval' / '__init__.py').write_text('')
+            (good / 'poseval' / 'eval_helpers.py').write_text(
+                'MARKER = "posetrack"\n')
+            (good / 'poseval' / 'evaluateTracking.py').write_text(
+                'def evaluateTracking(*args, **kwargs):\n'
+                '    return "ok"\n')
+            (bad / 'poseval' / '__init__.py').write_text('')
+
+            saved_path = sys.path[:]
+            saved_modules = {
+                key: sys.modules[key]
+                for key in list(sys.modules)
+                if key == 'poseval' or key.startswith('poseval.')
+            }
+            saved_fallback = posetrack21_kit._FALLBACK_POSEVAL
+            try:
+                for key in list(saved_modules):
+                    del sys.modules[key]
+                sys.path.insert(0, str(bad))
+                import poseval  # noqa: F401  PGPT-style empty package
+                self.assertFalse(
+                    (Path(poseval.__file__).parent / 'eval_helpers.py').is_file())
+                sys.path[:] = [str(bad)]
+                posetrack21_kit._FALLBACK_POSEVAL = good
+                helpers, evaluate = _import_poseval()
+                self.assertEqual(helpers.MARKER, 'posetrack')
+                self.assertEqual(evaluate(), 'ok')
+                self.assertTrue(str(good) in sys.path[:1] or sys.path[0] == str(good))
+            finally:
+                posetrack21_kit._FALLBACK_POSEVAL = saved_fallback
+                sys.path[:] = saved_path
+                for key in list(sys.modules):
+                    if key == 'poseval' or key.startswith('poseval.'):
+                        del sys.modules[key]
+                sys.modules.update(saved_modules)

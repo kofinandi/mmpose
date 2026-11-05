@@ -1,0 +1,66 @@
+Config,Checkpoint,Name,Variant,Mode,KpBatchSize,DetConfig,DetCheckpoint,DetCatId,DetBatchSize,NmsThr,PostConfig,PostprocName,KeypointSpace,OfficialPT21
+# CoMotion assigns track ids itself. KeypointSpace is empty, so joints are
+# scored as COCO-17. PoseTrack21 runs also use the official kit; set
+# KeypointSpace=dataset to include the synthesised PoseTrack head joints.
+configs/body_2d_keypoint/comotion/posetrack21/comotion_posetrack21.py,external/ml-comotion/src/comotion_demo/data/comotion_detection_checkpoint.pt,CoMotion,published,tracker,1,,,,,,,,,
+# MOTIP (DanceTrack ResNet-50) boxes + ViTPose-huge simple head, the
+# ViTPose/huge entry in benchmark_configs_topdown.csv. MOTIP is a
+# single-class tracker, so DetCatId is 0. SportsMOT is
+# demo/mmdetection_cfg/motip_r50_sportsmot.py with
+# data/models/r50_deformable_detr_motip_sportsmot.pth.
+configs/body_2d_keypoint/topdown_heatmap/coco/td-hm_ViTPose-huge-simple_8xb64-210e_coco-256x192.py,https://download.openmmlab.com/mmpose/v1/body_2d_keypoint/topdown_heatmap/coco/td-hm_ViTPose-huge-simple_8xb64-210e_coco-256x192-ffd48c05_20230314.pth,ViTPose,huge-motip-dancetrack,topdown,32,demo/mmdetection_cfg/motip_r50_dancetrack.py,data/models/r50_deformable_detr_motip_dancetrack.pth,0,1,,,,,
+# RF-DETR-medium (COCO person id 1) + ViTPose-huge, then one external tracker.
+# PGPT is configs/post_processing/pgpt.py (PoseGCN, cuda:0). PGPT geometric
+# is pgpt_geom.py. ByteTrack is boxmot_bytetrack.py. Deep OC-SORT is
+# boxmot_deepocsort.py (OSNet ReID, needs frames). BoT-SORT is
+# boxmot_botsort.py (OSNet ReID, needs frames). GP-Kalman SORT is
+# gp_kalman_sort.py.
+configs/body_2d_keypoint/topdown_heatmap/coco/td-hm_ViTPose-huge-simple_8xb64-210e_coco-256x192.py,https://download.openmmlab.com/mmpose/v1/body_2d_keypoint/topdown_heatmap/coco/td-hm_ViTPose-huge-simple_8xb64-210e_coco-256x192-ffd48c05_20230314.pth,ViTPose,huge-rfdetr-medium-pgpt,topdown,32,demo/mmdetection_cfg/rfdetr_medium_coco-person.py,rf-detr-medium.pth,1,1,0.95,configs/post_processing/pgpt.py,pgpt,,
+configs/body_2d_keypoint/topdown_heatmap/coco/td-hm_ViTPose-huge-simple_8xb64-210e_coco-256x192.py,https://download.openmmlab.com/mmpose/v1/body_2d_keypoint/topdown_heatmap/coco/td-hm_ViTPose-huge-simple_8xb64-210e_coco-256x192-ffd48c05_20230314.pth,ViTPose,huge-rfdetr-medium-pgpt-geom,topdown,32,demo/mmdetection_cfg/rfdetr_medium_coco-person.py,rf-detr-medium.pth,1,1,0.95,configs/post_processing/pgpt_geom.py,pgpt_geom,,
+configs/body_2d_keypoint/topdown_heatmap/coco/td-hm_ViTPose-huge-simple_8xb64-210e_coco-256x192.py,https://download.openmmlab.com/mmpose/v1/body_2d_keypoint/topdown_heatmap/coco/td-hm_ViTPose-huge-simple_8xb64-210e_coco-256x192-ffd48c05_20230314.pth,ViTPose,huge-rfdetr-medium-bytetrack,topdown,32,demo/mmdetection_cfg/rfdetr_medium_coco-person.py,rf-detr-medium.pth,1,1,0.95,configs/post_processing/boxmot_bytetrack.py,bytetrack,,
+configs/body_2d_keypoint/topdown_heatmap/coco/td-hm_ViTPose-huge-simple_8xb64-210e_coco-256x192.py,https://download.openmmlab.com/mmpose/v1/body_2d_keypoint/topdown_heatmap/coco/td-hm_ViTPose-huge-simple_8xb64-210e_coco-256x192-ffd48c05_20230314.pth,ViTPose,huge-rfdetr-medium-deepocsort,topdown,32,demo/mmdetection_cfg/rfdetr_medium_coco-person.py,rf-detr-medium.pth,1,1,0.95,configs/post_processing/boxmot_deepocsort.py,deepocsort,,
+configs/body_2d_keypoint/topdown_heatmap/coco/td-hm_ViTPose-huge-simple_8xb64-210e_coco-256x192.py,https://download.openmmlab.com/mmpose/v1/body_2d_keypoint/topdown_heatmap/coco/td-hm_ViTPose-huge-simple_8xb64-210e_coco-256x192-ffd48c05_20230314.pth,ViTPose,huge-rfdetr-medium-botsort,topdown,32,demo/mmdetection_cfg/rfdetr_medium_coco-person.py,rf-detr-medium.pth,1,1,0.95,configs/post_processing/boxmot_botsort.py,botsort,,
+configs/body_2d_keypoint/topdown_heatmap/coco/td-hm_ViTPose-huge-simple_8xb64-210e_coco-256x192.py,https://download.openmmlab.com/mmpose/v1/body_2d_keypoint/topdown_heatmap/coco/td-hm_ViTPose-huge-simple_8xb64-210e_coco-256x192-ffd48c05_20230314.pth,ViTPose,huge-rfdetr-medium-gp-kalman-sort,topdown,32,demo/mmdetection_cfg/rfdetr_medium_coco-person.py,rf-detr-medium.pth,1,1,0.95,configs/post_processing/gp_kalman_sort.py,gp_kalman_sort,,
+# DETRPose HGNetv2 n/s/m/l/x, COCO weights, each with the same six trackers.
+configs/body_2d_keypoint/detrpose/coco/detrpose_hgnetv2_n_coco.py,data/models/detrpose_hgnetv2_n.pth,DETRPose,n-pgpt,bottomup,1,,,,,,configs/post_processing/pgpt.py,pgpt,,
+configs/body_2d_keypoint/detrpose/coco/detrpose_hgnetv2_n_coco.py,data/models/detrpose_hgnetv2_n.pth,DETRPose,n-pgpt-geom,bottomup,1,,,,,,configs/post_processing/pgpt_geom.py,pgpt_geom,,
+configs/body_2d_keypoint/detrpose/coco/detrpose_hgnetv2_n_coco.py,data/models/detrpose_hgnetv2_n.pth,DETRPose,n-bytetrack,bottomup,1,,,,,,configs/post_processing/boxmot_bytetrack.py,bytetrack,,
+configs/body_2d_keypoint/detrpose/coco/detrpose_hgnetv2_n_coco.py,data/models/detrpose_hgnetv2_n.pth,DETRPose,n-deepocsort,bottomup,1,,,,,,configs/post_processing/boxmot_deepocsort.py,deepocsort,,
+configs/body_2d_keypoint/detrpose/coco/detrpose_hgnetv2_n_coco.py,data/models/detrpose_hgnetv2_n.pth,DETRPose,n-botsort,bottomup,1,,,,,,configs/post_processing/boxmot_botsort.py,botsort,,
+configs/body_2d_keypoint/detrpose/coco/detrpose_hgnetv2_n_coco.py,data/models/detrpose_hgnetv2_n.pth,DETRPose,n-gp-kalman-sort,bottomup,1,,,,,,configs/post_processing/gp_kalman_sort.py,gp_kalman_sort,,
+configs/body_2d_keypoint/detrpose/coco/detrpose_hgnetv2_s_coco.py,data/models/detrpose_hgnetv2_s.pth,DETRPose,s-pgpt,bottomup,1,,,,,,configs/post_processing/pgpt.py,pgpt,,
+configs/body_2d_keypoint/detrpose/coco/detrpose_hgnetv2_s_coco.py,data/models/detrpose_hgnetv2_s.pth,DETRPose,s-pgpt-geom,bottomup,1,,,,,,configs/post_processing/pgpt_geom.py,pgpt_geom,,
+configs/body_2d_keypoint/detrpose/coco/detrpose_hgnetv2_s_coco.py,data/models/detrpose_hgnetv2_s.pth,DETRPose,s-bytetrack,bottomup,1,,,,,,configs/post_processing/boxmot_bytetrack.py,bytetrack,,
+configs/body_2d_keypoint/detrpose/coco/detrpose_hgnetv2_s_coco.py,data/models/detrpose_hgnetv2_s.pth,DETRPose,s-deepocsort,bottomup,1,,,,,,configs/post_processing/boxmot_deepocsort.py,deepocsort,,
+configs/body_2d_keypoint/detrpose/coco/detrpose_hgnetv2_s_coco.py,data/models/detrpose_hgnetv2_s.pth,DETRPose,s-botsort,bottomup,1,,,,,,configs/post_processing/boxmot_botsort.py,botsort,,
+configs/body_2d_keypoint/detrpose/coco/detrpose_hgnetv2_s_coco.py,data/models/detrpose_hgnetv2_s.pth,DETRPose,s-gp-kalman-sort,bottomup,1,,,,,,configs/post_processing/gp_kalman_sort.py,gp_kalman_sort,,
+configs/body_2d_keypoint/detrpose/coco/detrpose_hgnetv2_m_coco.py,data/models/detrpose_hgnetv2_m.pth,DETRPose,m-pgpt,bottomup,1,,,,,,configs/post_processing/pgpt.py,pgpt,,
+configs/body_2d_keypoint/detrpose/coco/detrpose_hgnetv2_m_coco.py,data/models/detrpose_hgnetv2_m.pth,DETRPose,m-pgpt-geom,bottomup,1,,,,,,configs/post_processing/pgpt_geom.py,pgpt_geom,,
+configs/body_2d_keypoint/detrpose/coco/detrpose_hgnetv2_m_coco.py,data/models/detrpose_hgnetv2_m.pth,DETRPose,m-bytetrack,bottomup,1,,,,,,configs/post_processing/boxmot_bytetrack.py,bytetrack,,
+configs/body_2d_keypoint/detrpose/coco/detrpose_hgnetv2_m_coco.py,data/models/detrpose_hgnetv2_m.pth,DETRPose,m-deepocsort,bottomup,1,,,,,,configs/post_processing/boxmot_deepocsort.py,deepocsort,,
+configs/body_2d_keypoint/detrpose/coco/detrpose_hgnetv2_m_coco.py,data/models/detrpose_hgnetv2_m.pth,DETRPose,m-botsort,bottomup,1,,,,,,configs/post_processing/boxmot_botsort.py,botsort,,
+configs/body_2d_keypoint/detrpose/coco/detrpose_hgnetv2_m_coco.py,data/models/detrpose_hgnetv2_m.pth,DETRPose,m-gp-kalman-sort,bottomup,1,,,,,,configs/post_processing/gp_kalman_sort.py,gp_kalman_sort,,
+configs/body_2d_keypoint/detrpose/coco/detrpose_hgnetv2_l_coco.py,data/models/detrpose_hgnetv2_l.pth,DETRPose,l-pgpt,bottomup,1,,,,,,configs/post_processing/pgpt.py,pgpt,,
+configs/body_2d_keypoint/detrpose/coco/detrpose_hgnetv2_l_coco.py,data/models/detrpose_hgnetv2_l.pth,DETRPose,l-pgpt-geom,bottomup,1,,,,,,configs/post_processing/pgpt_geom.py,pgpt_geom,,
+configs/body_2d_keypoint/detrpose/coco/detrpose_hgnetv2_l_coco.py,data/models/detrpose_hgnetv2_l.pth,DETRPose,l-bytetrack,bottomup,1,,,,,,configs/post_processing/boxmot_bytetrack.py,bytetrack,,
+configs/body_2d_keypoint/detrpose/coco/detrpose_hgnetv2_l_coco.py,data/models/detrpose_hgnetv2_l.pth,DETRPose,l-deepocsort,bottomup,1,,,,,,configs/post_processing/boxmot_deepocsort.py,deepocsort,,
+configs/body_2d_keypoint/detrpose/coco/detrpose_hgnetv2_l_coco.py,data/models/detrpose_hgnetv2_l.pth,DETRPose,l-botsort,bottomup,1,,,,,,configs/post_processing/boxmot_botsort.py,botsort,,
+configs/body_2d_keypoint/detrpose/coco/detrpose_hgnetv2_l_coco.py,data/models/detrpose_hgnetv2_l.pth,DETRPose,l-gp-kalman-sort,bottomup,1,,,,,,configs/post_processing/gp_kalman_sort.py,gp_kalman_sort,,
+configs/body_2d_keypoint/detrpose/coco/detrpose_hgnetv2_x_coco.py,data/models/detrpose_hgnetv2_x.pth,DETRPose,x-pgpt,bottomup,1,,,,,,configs/post_processing/pgpt.py,pgpt,,
+configs/body_2d_keypoint/detrpose/coco/detrpose_hgnetv2_x_coco.py,data/models/detrpose_hgnetv2_x.pth,DETRPose,x-pgpt-geom,bottomup,1,,,,,,configs/post_processing/pgpt_geom.py,pgpt_geom,,
+configs/body_2d_keypoint/detrpose/coco/detrpose_hgnetv2_x_coco.py,data/models/detrpose_hgnetv2_x.pth,DETRPose,x-bytetrack,bottomup,1,,,,,,configs/post_processing/boxmot_bytetrack.py,bytetrack,,
+configs/body_2d_keypoint/detrpose/coco/detrpose_hgnetv2_x_coco.py,data/models/detrpose_hgnetv2_x.pth,DETRPose,x-deepocsort,bottomup,1,,,,,,configs/post_processing/boxmot_deepocsort.py,deepocsort,,
+configs/body_2d_keypoint/detrpose/coco/detrpose_hgnetv2_x_coco.py,data/models/detrpose_hgnetv2_x.pth,DETRPose,x-botsort,bottomup,1,,,,,,configs/post_processing/boxmot_botsort.py,botsort,,
+configs/body_2d_keypoint/detrpose/coco/detrpose_hgnetv2_x_coco.py,data/models/detrpose_hgnetv2_x.pth,DETRPose,x-gp-kalman-sort,bottomup,1,,,,,,configs/post_processing/gp_kalman_sort.py,gp_kalman_sort,,
+# AlphaPose FastPose / HRNet. Each assigns track ids with the released OSNet
+# re-ID tracker, so there is no PostConfig. Boxes are RF-DETR-medium
+# (person id 1), the same detector as the ViTPose rows.
+configs/body_2d_keypoint/alphapose/alphapose_fastpose-res50_coco-256x192.py,data/models/alphapose/fast_res50_256x192.pth,AlphaPose,fastpose-res50-rfdetr-medium,topdown,32,demo/mmdetection_cfg/rfdetr_medium_coco-person.py,rf-detr-medium.pth,1,1,0.95,,,,
+configs/body_2d_keypoint/alphapose/alphapose_fastpose-duc-res50_coco-256x192.py,data/models/alphapose/fast_421_res50-shuffle_256x192.pth,AlphaPose,fastpose-duc-res50-rfdetr-medium,topdown,32,demo/mmdetection_cfg/rfdetr_medium_coco-person.py,rf-detr-medium.pth,1,1,0.95,,,,
+configs/body_2d_keypoint/alphapose/alphapose_fastpose-duc-res152_coco-256x192.py,data/models/alphapose/fast_421_res152_256x192.pth,AlphaPose,fastpose-duc-res152-rfdetr-medium,topdown,32,demo/mmdetection_cfg/rfdetr_medium_coco-person.py,rf-detr-medium.pth,1,1,0.95,,,,
+configs/body_2d_keypoint/alphapose/alphapose_fastpose-dcn-res50_coco-256x192.py,data/models/alphapose/fast_dcn_res50_256x192.pth,AlphaPose,fastpose-dcn-res50-rfdetr-medium,topdown,32,demo/mmdetection_cfg/rfdetr_medium_coco-person.py,rf-detr-medium.pth,1,1,0.95,,,,
+configs/body_2d_keypoint/alphapose/alphapose_hrnet-w32_coco-256x192.py,data/models/alphapose/pose_hrnet_w32_256x192.pth,AlphaPose,hrnet-w32-rfdetr-medium,topdown,32,demo/mmdetection_cfg/rfdetr_medium_coco-person.py,rf-detr-medium.pth,1,1,0.95,,,,
+# OpenPifPaf. trackingpose and posesimilarity assign ids from the same
+# tshufflenetv2k30 checkpoint
+configs/body_2d_keypoint/openpifpaf/openpifpaf_tshufflenetv2k30-trackingpose_posetrack2018.py,data/models/openpifpaf/tshufflenetv2k30-210628-075118-posetrack2018-cocokpst-slurm668247-o25-3d734bb8.pkl,OpenPifPaf,tshufflenetv2k30-trackingpose,tracker,1,,,,,,,,,
+configs/body_2d_keypoint/openpifpaf/openpifpaf_tshufflenetv2k30-posesimilarity_posetrack2018.py,data/models/openpifpaf/tshufflenetv2k30-210628-075118-posetrack2018-cocokpst-slurm668247-o25-3d734bb8.pkl,OpenPifPaf,tshufflenetv2k30-posesimilarity,tracker,1,,,,,,,,,
