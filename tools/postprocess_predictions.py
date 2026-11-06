@@ -282,7 +282,11 @@ def _build_metric(metric_type: str, dataset_meta: dict) -> object:
         cfg['type'] = 'CocoMetric'
     elif metric_type in ('MPJVE', 'MPJAE'):
         cfg = {'type': metric_type, 'norm_item': [None, 'bbox', 'torso']}
-    elif metric_type in ('IDSwitch', 'MOTA', 'IDF1', 'HOTA'):
+    elif metric_type in ('IDSwitch', 'MOTA', 'IDF1', 'HOTA',
+                         'PoseTrack21OfficialMetric'):
+        # PoseTrack21OfficialMetric does not take gt_from_samples; ground
+        # truth comes from the official kit, and these tracking metrics
+        # read the instances already attached to each sample.
         cfg = {'type': metric_type}
     else:
         cfg['type'] = metric_type
@@ -573,6 +577,13 @@ def main() -> None:
     print(f'\nLoading prediction bundle from: {args.pred_dir}')
     manifest, frames = load_bundle(args.pred_dir)
     dataset_meta: dict = dict(manifest.get('dataset_meta', {}))
+    # JSON object keys are strings. Keypoint-name lookup indexes this map
+    # with ints (names_from_metainfo, the official PoseTrack21 kit).
+    id2name = dataset_meta.get('keypoint_id2name')
+    if isinstance(id2name, dict):
+        dataset_meta['keypoint_id2name'] = {
+            int(k): v for k, v in id2name.items()
+        }
     # JSON serialises numpy arrays as lists; restore numeric arrays so
     # metrics that pass them directly to numpy ops (e.g. oks_iou) work.
     for _key in ('sigmas', 'keypoint_colors', 'skeleton_link_colors',
