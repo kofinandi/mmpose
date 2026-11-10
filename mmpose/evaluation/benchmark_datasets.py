@@ -65,7 +65,7 @@ BENCHMARK_TEST_DATASETS: Dict[str, BenchmarkTestDataset] = {
     'crowdpose': BenchmarkTestDataset(
         dataset_type='CrowdPoseDataset',
         data_root='data/',
-        ann_file='crowdpose/annotations/mmpose_crowdpose_trainval.json',
+        ann_file='crowdpose/annotations/mmpose_crowdpose_val.json',
         data_prefix=dict(img='crowdpose/images/'),
         keypoint_src='crowdpose',
     ),
